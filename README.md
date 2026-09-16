@@ -94,6 +94,36 @@ The desktop and fleet interfaces also expose the MCP server and skill
 inventory. See the [standalone quickstart](https://agentdesktop.dev/docs/getting-started/standalone/)
 for prerequisites, test credentials, and a walkthrough of the local services.
 
+## Local LLM proxy
+
+For clients without an API-key helper, start the daemon's optional loopback proxy:
+
+```sh
+agentdesktop daemon --user --config examples/standalone/config.yaml \
+  --llm-proxy-listen 127.0.0.1:4000
+```
+
+Point the client's model endpoint at `http://127.0.0.1:4000/v1/chat/completions`,
+`/v1/messages`, or `/v1/responses`, according to the protocol it uses. The proxy
+streams bodies unchanged to `llmGateway.url` and adds the credential from the same
+authentication flow used by the daemon's API-key helpers. Login and refresh stay
+with the existing authentication implementation. No client API key is needed.
+Incoming authorization/API-key headers are replaced, and upstream HTTP errors and
+redirects are passed back without following redirects.
+
+The incoming path and query are appended to the gateway base URL: with
+`llmGateway.url: https://gateway.example/prefix`, `/v1/messages` goes to
+`https://gateway.example/prefix/v1/messages`. Avoid repeating `/v1` in both URLs.
+The proxy does not discover models or rewrite model IDs; configure those in the
+client. VS Code's built-in **Custom Endpoint** provider can use this endpoint
+without the experimental extension in `vscode/`.
+
+Controller JWT authentication uses client ID `vscode` by default; include it in
+`allowedClientIds`, or choose another ID with `--llm-proxy-client-id`. The listen
+address must be loopback. Local processes can use the proxy's credentials;
+browser-origin requests and CONNECT tunnels are rejected. The listener and active
+proxy connections stop with the daemon.
+
 ## Start locally, grow into a fleet
 
 Agentdesktop uses the same daemon and tool-native configuration model at every

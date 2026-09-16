@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import time
 
-SOURCE = Path(__file__).resolve().parents[1] / "run-local"
+SOURCE = Path(__file__).resolve().parents[2] / ".john/run-local"
 
 
 def exercise(fail_ui=False):
@@ -25,10 +25,29 @@ def exercise(fail_ui=False):
             path = mocks / name
             path.write_text("#!/bin/sh\nexit 0\n")
             path.chmod(0o755)
+        # Delay Dex readiness to verify native processes wait for authentication.
+        docker = mocks / "docker"
+        docker.write_text('''#!/usr/bin/env bash
+case "$*" in
+  *version*|*down*) exit 0 ;;
+esac
+[[ "$COMPOSE_MENU" == false ]] || exit 8
+if read -r -t 1 line; then exit 9; fi
+sleep 300 &
+wait
+''')
+        docker.chmod(0o755)
+        curl = mocks / "curl"
+        curl.write_text('''#!/bin/sh
+sleep 1
+touch "$TEST_ROOT/ready"
+''')
+        curl.chmod(0o755)
         for profile in ("debug", "release"):
             binary = root / f"target/{profile}/agentdesktop"
             binary.parent.mkdir(parents=True)
             binary.write_text('''#!/usr/bin/env bash
+[[ -f "$TEST_ROOT/ready" ]] || exit 10
 printf '%s\\n' "$*" >> "$TEST_ROOT/args"
 sleep 300 &
 echo "$!" >> "$TEST_ROOT/children"
@@ -38,7 +57,7 @@ wait
             binary.chmod(0o755)
         env = dict(os.environ, PATH=f"{mocks}:{os.environ['PATH']}",
                    TEST_ROOT=str(root), FAIL_UI=str(int(fail_ui)))
-        args = [str(launcher), "--user"] + ([] if fail_ui else ["--dev"])
+        args = [str(launcher), "--user", "--dex"] + ([] if fail_ui else ["--dev"])
         with (root / "output").open("w") as output:
             process = subprocess.Popen(args, env=env, stdout=output, stderr=output)
             try:

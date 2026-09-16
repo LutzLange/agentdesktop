@@ -152,7 +152,7 @@ async fn effective_config(
         })
 }
 
-fn load_effective_config(
+pub(crate) fn load_effective_config(
     config: &DaemonConfig,
     state_dir: &std::path::Path,
 ) -> anyhow::Result<DaemonConfig> {
@@ -232,13 +232,23 @@ async fn llm_gateway_credential(
             format!("read applied configuration: {error:#}"),
         )
     })?;
+    gateway_credential(&state, &effective, &query.client_id)
+        .await
+        .map(Json)
+}
+
+pub(crate) async fn gateway_credential(
+    state: &AppState,
+    effective: &DaemonConfig,
+    client_id: &str,
+) -> Result<LlmGatewayCredential, (StatusCode, String)> {
     let gateway = effective.llm_gateway.as_ref().ok_or_else(|| {
         (
             StatusCode::FAILED_DEPENDENCY,
             "daemon has no LLM gateway configured".to_owned(),
         )
     })?;
-    let uses_subscription = program_uses_subscription(&effective, &query.client_id);
+    let uses_subscription = program_uses_subscription(effective, client_id);
     let (identity, continue_in_browser) = match gateway.authentication.as_ref() {
         Some(LlmGatewayAuthentication::ControllerJwt { .. }) => {
             let controller = state.config.controller.as_ref().ok_or_else(|| {
@@ -249,7 +259,7 @@ async fn llm_gateway_credential(
             })?;
             // Local transport permissions authenticate the user, not the calling
             // process. The client ID selects an allowed policy within that boundary.
-            remote::llm_gateway_credential(controller, &state.state_dir, &query.client_id)
+            remote::llm_gateway_credential(controller, &state.state_dir, client_id)
                 .await
                 .map(|credential| (credential, false))
         }
@@ -294,7 +304,6 @@ async fn llm_gateway_credential(
     } else {
         Ok(identity)
     }
-    .map(Json)
     .map_err(|error| (StatusCode::BAD_GATEWAY, format!("{error:#}")))
 }
 

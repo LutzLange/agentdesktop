@@ -72,6 +72,14 @@ pub struct DaemonArgs {
     #[arg(long)]
     oidc_callback_listen: Option<SocketAddr>,
 
+    /// Start a loopback HTTP proxy to llmGateway, attaching the daemon's credentials.
+    #[arg(long, conflicts_with_all = ["once", "dry_run"])]
+    llm_proxy_listen: Option<SocketAddr>,
+
+    /// Credential policy client ID used by the local LLM proxy.
+    #[arg(long, default_value = "vscode")]
+    llm_proxy_client_id: String,
+
     /// Path to Claude Code's Agentdesktop-managed settings file.
     #[arg(long)]
     claude_code_settings: Option<PathBuf>,
@@ -107,6 +115,8 @@ struct ResolvedDaemonArgs {
     state_dir: PathBuf,
     socket: PathBuf,
     oidc_callback_listen: Option<SocketAddr>,
+    llm_proxy_listen: Option<SocketAddr>,
+    llm_proxy_client_id: String,
     claude_code_settings: PathBuf,
     claude_desktop_managed_settings: PathBuf,
     claude_desktop_credential_helper: PathBuf,
@@ -120,6 +130,15 @@ struct ResolvedDaemonArgs {
 
 impl DaemonArgs {
     fn resolve(self, socket: PathBuf) -> anyhow::Result<ResolvedDaemonArgs> {
+        if self
+            .llm_proxy_listen
+            .is_some_and(|address| !address.ip().is_loopback())
+        {
+            bail!("--llm-proxy-listen must be a loopback address");
+        }
+        if !config::valid_client_id(&self.llm_proxy_client_id) {
+            bail!("invalid --llm-proxy-client-id");
+        }
         if !self.user {
             return Ok(ResolvedDaemonArgs {
                 user: false,
@@ -127,6 +146,8 @@ impl DaemonArgs {
                 state_dir: self.state_dir.unwrap_or_else(|| DEFAULT_STATE_DIR.into()),
                 socket,
                 oidc_callback_listen: self.oidc_callback_listen,
+                llm_proxy_listen: Some("127.0.0.1:4001".parse().unwrap()),
+                llm_proxy_client_id: self.llm_proxy_client_id,
                 claude_code_settings: self.claude_code_settings.unwrap_or_else(|| {
                     reconcile::default_claude_code_managed_settings_dir()
                         .join("50-agentdesktop.json")
@@ -178,6 +199,8 @@ impl DaemonArgs {
             state_dir: state_dir.clone(),
             socket,
             oidc_callback_listen: self.oidc_callback_listen,
+            llm_proxy_listen: self.llm_proxy_listen,
+            llm_proxy_client_id: self.llm_proxy_client_id,
             claude_code_settings: self
                 .claude_code_settings
                 .unwrap_or_else(|| home.join(".claude/settings.json")),
@@ -372,7 +395,7 @@ where
             }
         });
     }
-    let app = api::router(api::AppState {
+    let state = api::AppState {
         config,
         daemon_info,
         discovery: inventory,
@@ -381,13 +404,35 @@ where
         oidc_callback_listen: args.oidc_callback_listen,
         telemetry,
         logout,
-    });
+    };
+    let proxy_listener = if let Some(address) = args.llm_proxy_listen {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .context("bind local LLM proxy")?;
+        tracing::info!(address = %listener.local_addr()?, "local LLM proxy listening");
+        Some(listener)
+    } else {
+        None
+    };
+    let app = api::router(state.clone());
+    let proxy = async move {
+        match proxy_listener {
+            Some(listener) => {
+                crate::llm_proxy::serve(listener, state, args.llm_proxy_client_id).await
+            }
+            None => std::future::pending::<anyhow::Result<()>>().await,
+        }
+    };
 
     tracing::info!(socket = %socket.display(), "agent daemon listening");
     #[cfg(unix)]
-    serve_unix(&socket, local_api_access()?, app, shutdown).await?;
+    let local_api = serve_unix(&socket, local_api_access()?, app, shutdown);
     #[cfg(windows)]
-    serve_named_pipe(&socket, app, shutdown).await?;
+    let local_api = serve_named_pipe(&socket, app, shutdown);
+    tokio::select! {
+        result = local_api => result?,
+        result = proxy => result?,
+    }
 
     Ok(())
 }
