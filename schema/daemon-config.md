@@ -18,6 +18,8 @@
 |`llmGateway.authentication.redirectUri`|string|Loopback redirect URI registered for the native client.|
 |`llmGateway.authentication.scopes`|[]string|Scopes requested during sign-in.|
 |`llmGateway.authentication.type`|enum|Possible values: `oidc`.|
+|`llmGateway.githubOAuth`|object|GitHub App OAuth used by the local proxy for the x-llm-token header.|
+|`llmGateway.githubOAuth.clientId`|string|GitHub App client ID. The App must enable Device Flow.|
 |`llmGateway.url`|string|Base HTTP or HTTPS URL of the LLM gateway.<br><br>The URL must include a host and cannot include credentials, a query, or a fragment.|
 |`programs`|object|Per-program settings reconciled on this device.|
 |`programs.claudeCode`|object|Claude Code managed-settings configuration. Arbitrary keys are passed through directly.|

@@ -139,6 +139,20 @@
         "address"
       ]
     },
+    "GitHubOAuthConfig": {
+      "description": "GitHub App user authorization for Copilot requests through the local proxy.",
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "description": "GitHub App client ID. The App must enable Device Flow.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "clientId"
+      ]
+    },
     "GrokConfig": {
       "description": "Settings reconciled into Grok Build's organization-managed configuration.\n\nValues under `managedConfig` are written to Grok's `managed_config.toml`.\nWhen generated LLM-gateway settings overlap with those values,\nagentdesktop's generated values take precedence.\nOnly system mode is supported. Grok can delete or replace the user-level\nmanaged file during startup, so `--user` rejects `programs.grok`.",
       "type": "object",
@@ -254,6 +268,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/LlmGatewayAuthentication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "githubOAuth": {
+          "description": "GitHub App OAuth used by the local proxy for the x-llm-token header.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitHubOAuthConfig"
             },
             {
               "type": "null"

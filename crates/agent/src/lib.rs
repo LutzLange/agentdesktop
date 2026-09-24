@@ -4,6 +4,7 @@ pub mod cli;
 pub mod daemon;
 pub mod enrollment;
 pub mod gateway_oidc;
+mod github_oauth;
 pub mod identity;
 mod llm_proxy;
 pub mod oidc;

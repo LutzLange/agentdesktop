@@ -113,8 +113,9 @@ async fn forward(
     request.headers_mut().remove(AUTHORIZATION);
     request.headers_mut().remove("x-api-key");
     request.headers_mut().remove("api-key");
+    request.headers_mut().remove("x-llm-token");
     if gateway.authentication.is_some() {
-        let credential = api::gateway_credential(state, &effective, client_id).await?;
+        let credential = api::gateway_credential(state, &effective, client_id, false).await?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credential.credential))
             .map_err(|_| {
                 (
@@ -124,6 +125,19 @@ async fn forward(
             })?;
         authorization.set_sensitive(true);
         request.headers_mut().insert(AUTHORIZATION, authorization);
+    }
+    if let Some(github) = &gateway.github_oauth {
+        let credential = crate::github_oauth::credential(&github.client_id, &state.state_dir, None)
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, format!("GitHub OAuth: {error:#}")))?;
+        let mut value = HeaderValue::from_str(&credential.credential).map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "invalid GitHub credential header".into(),
+            )
+        })?;
+        value.set_sensitive(true);
+        request.headers_mut().insert("x-llm-token", value);
     }
     request.headers_mut().insert(
         HOST,
@@ -199,6 +213,7 @@ mod tests {
                             assert_eq!(request.headers()[HOST], address.to_string());
                             assert!(!request.headers().contains_key("x-api-key"));
                             assert!(!request.headers().contains_key("x-hop"));
+                            assert_eq!(request.headers()["x-llm-token"], "ghu_test");
                             assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
                             let gate = release.lock().await.take();
                             assert_eq!(request.headers()[AUTHORIZATION],
@@ -228,7 +243,11 @@ mod tests {
                     "expiresAtUnixSeconds": 4_000_000_000u64,
                     "tokenEndpoint": "https://issuer.example/token"}).to_string()).unwrap();
             save_token("first");
-            let config = parse_daemon(&format!("llmGateway:\n  url: http://{address}/gateway\n  authentication:\n    type: oidc\n    issuer: https://issuer.example/\n    clientId: proxy-test\n")).unwrap();
+            store.set("dev.agentdesktop.github-oauth", "github-test", &serde_json::json!({
+                "accessToken": "ghu_test", "expiresAt": 4_000_000_000u64,
+                "refreshToken": null, "refreshExpiresAt": 0,
+            }).to_string()).unwrap();
+            let config = parse_daemon(&format!("llmGateway:\n  url: http://{address}/gateway\n  githubOAuth:\n    clientId: github-test\n  authentication:\n    type: oidc\n    issuer: https://issuer.example/\n    clientId: proxy-test\n")).unwrap();
             let (_, discovery) = watch::channel(Arc::new(Discovery { agents: vec![], model_runtimes: vec![] }));
             let state = AppState {
                 config,
@@ -248,6 +267,7 @@ mod tests {
                     .uri(format!("http://{proxy_address}/v1/messages?value=%2F"))
                     .header(AUTHORIZATION, "Bearer must-not-forward")
                     .header("x-api-key", "must-not-forward")
+                    .header("x-llm-token", "must-not-forward")
                     .header(CONNECTION, "x-hop").header("x-hop", "remove")
                     .header("anthropic-version", "2023-06-01")
                     .body(Full::new(Bytes::from_static(b"\xffnot-json\x00"))).unwrap();

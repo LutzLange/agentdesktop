@@ -103,6 +103,22 @@ pub struct LlmGatewayConfig {
     /// Authentication mechanism used when connecting to this gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authentication: Option<LlmGatewayAuthentication>,
+    /// GitHub App OAuth used by the local proxy for the x-llm-token header.
+    #[serde(
+        rename = "githubOAuth",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub github_oauth: Option<GitHubOAuthConfig>,
+}
+
+/// GitHub App user authorization for Copilot requests through the local proxy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitHubOAuthConfig {
+    /// GitHub App client ID. The App must enable Device Flow.
+    pub client_id: String,
 }
 
 /// Authentication mechanisms supported by an LLM gateway.
@@ -691,6 +707,14 @@ fn validate_daemon(
         }
         if gateway.url.query().is_some() || gateway.url.fragment().is_some() {
             anyhow::bail!("LLM gateway URL cannot include a query or fragment");
+        }
+        if let Some(github) = &gateway.github_oauth {
+            if github.client_id.trim().is_empty() {
+                anyhow::bail!("llmGateway.githubOAuth.clientId cannot be empty");
+            }
+            if gateway.authentication.is_none() {
+                anyhow::bail!("llmGateway.githubOAuth requires gateway authentication");
+            }
         }
         if let Some(authentication) = &gateway.authentication {
             match authentication {

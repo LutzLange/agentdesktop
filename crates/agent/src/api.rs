@@ -232,7 +232,7 @@ async fn llm_gateway_credential(
             format!("read applied configuration: {error:#}"),
         )
     })?;
-    gateway_credential(&state, &effective, &query.client_id)
+    gateway_credential(&state, &effective, &query.client_id, true)
         .await
         .map(Json)
 }
@@ -241,6 +241,7 @@ pub(crate) async fn gateway_credential(
     state: &AppState,
     effective: &DaemonConfig,
     client_id: &str,
+    include_subscription: bool,
 ) -> Result<LlmGatewayCredential, (StatusCode, String)> {
     let gateway = effective.llm_gateway.as_ref().ok_or_else(|| {
         (
@@ -248,7 +249,7 @@ pub(crate) async fn gateway_credential(
             "daemon has no LLM gateway configured".to_owned(),
         )
     })?;
-    let uses_subscription = program_uses_subscription(effective, client_id);
+    let uses_subscription = include_subscription && program_uses_subscription(effective, client_id);
     let (identity, continue_in_browser) = match gateway.authentication.as_ref() {
         Some(LlmGatewayAuthentication::ControllerJwt { .. }) => {
             let controller = state.config.controller.as_ref().ok_or_else(|| {
@@ -279,6 +280,14 @@ pub(crate) async fn gateway_credential(
             gateway_oidc::LoginOptions {
                 callback_listen: state.oidc_callback_listen,
                 subscription_available: uses_subscription,
+                github_client_id: if include_subscription {
+                    None
+                } else {
+                    gateway
+                        .github_oauth
+                        .as_ref()
+                        .map(|github| github.client_id.clone())
+                },
             },
         )
         .await

@@ -7,11 +7,15 @@ llmGateway:
     clientId: agentdesktop-local
     scopes: [openid, email, offline_access]
     allowInsecure: true
+  githubOAuth:
+    # Replace with your GitHub App's Client ID (not its numeric App ID).
+    # Enable Device Flow in the App settings; no callback URL is needed.
+    clientId: Iv23liJrjLXp6bL3WUCC
 
-programs:
-  claudeCode:
-    useLlmGateway: true
-    companyAnnouncements: ["Using the local Agentgateway through Agentdesktop"]
+programs: {}
+#  claudeCode:
+#    useLlmGateway: true
+#    companyAnnouncements: ["Using the local Agentgateway through Agentdesktop"]
 #    Claude desktop cannot run with --user. Uncomment to enable
 #  claudeDesktop:
 #    useLlmGateway: true

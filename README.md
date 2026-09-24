@@ -124,6 +124,36 @@ address must be loopback. Local processes can use the proxy's credentials;
 browser-origin requests and CONNECT tunnels are rejected. The listener and active
 proxy connections stop with the daemon.
 
+To attach the local user's GitHub App OAuth token as well, add the App's client ID
+to the gateway configuration (keep the existing `authentication` block):
+
+```yaml
+llmGateway:
+  url: https://gateway.example
+  authentication:
+    type: oidc
+    issuer: https://login.microsoftonline.com/YOUR_TENANT/v2.0
+    clientId: YOUR_ENTRA_CLIENT_ID
+  githubOAuth:
+    clientId: YOUR_GITHUB_APP_CLIENT_ID
+```
+
+Enable **Device Flow** in the GitHub App settings. With the proxy enabled, the
+daemon opens an Agentdesktop sign-in page with a copyable code and a link to
+GitHub. GitHub opens in another tab; the Agentdesktop page automatically shows
+success or failure when authorization finishes. The client ID is configurable; no App client secret is
+needed. The App's permissions and the user's Copilot access must permit the
+upstream requests. This flow currently targets GitHub.com.
+
+The proxy sends `Authorization: Bearer <gateway identity token>` and
+`x-llm-token: <GitHub access token>`. Incoming values for both are discarded.
+The GitHub access and refresh tokens are stored in the daemon's existing secret
+store, separately for each App client ID. Expiring tokens refresh automatically,
+including refresh-token rotation; expired/rejected refresh credentials trigger
+device authorization again. Non-expiring App user tokens are also supported.
+Request bodies remain untouched. The existing Claude credential-helper flow is
+unchanged; the local proxy always uses the gateway identity in `Authorization`.
+
 ## Start locally, grow into a fleet
 
 Agentdesktop uses the same daemon and tool-native configuration model at every

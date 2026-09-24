@@ -146,7 +146,7 @@ impl DaemonArgs {
                 state_dir: self.state_dir.unwrap_or_else(|| DEFAULT_STATE_DIR.into()),
                 socket,
                 oidc_callback_listen: self.oidc_callback_listen,
-                llm_proxy_listen: Some("127.0.0.1:4001".parse().unwrap()),
+                llm_proxy_listen: Some("127.0.0.1:14000".parse().unwrap()),
                 llm_proxy_client_id: self.llm_proxy_client_id,
                 claude_code_settings: self.claude_code_settings.unwrap_or_else(|| {
                     reconcile::default_claude_code_managed_settings_dir()
@@ -316,7 +316,12 @@ where
 
     let daemon_info = describe_daemon(&config, &args.config, &args.state_dir, args.user);
     secure_fs::ensure_private_dir(&args.state_dir)?;
-    start_gateway_authentication(&config, args.state_dir.clone(), args.oidc_callback_listen);
+    start_gateway_authentication(
+        &config,
+        args.state_dir.clone(),
+        args.oidc_callback_listen,
+        args.llm_proxy_listen.is_some(),
+    );
     let enrollment = EnrollmentState::new(config.controller.is_some());
     let local_config = config.clone();
     let cached_remote_path = args.state_dir.join("remote-config.yaml");
@@ -563,11 +568,13 @@ fn start_gateway_authentication(
     config: &agentdesktop_core::config::DaemonConfig,
     state_dir: PathBuf,
     callback_listen: Option<SocketAddr>,
+    proxy_enabled: bool,
 ) {
     let Some(gateway) = config.llm_gateway.as_ref() else {
         return;
     };
     let authentication = gateway.authentication.clone();
+    let github = gateway.github_oauth.clone().filter(|_| proxy_enabled);
     let subscription = config.programs.claude_code.as_ref().is_some_and(|program| {
         program.auth == Some(agentdesktop_core::config::ProgramAuthentication::Subscription)
     }) || config
@@ -602,6 +609,7 @@ fn start_gateway_authentication(
                     gateway_oidc::LoginOptions {
                         callback_listen,
                         subscription_available: subscription,
+                        github_client_id: github.as_ref().map(|github| github.client_id.clone()),
                     },
                 )
                 .await?;
@@ -617,6 +625,11 @@ fn start_gateway_authentication(
                 )
                 .await?;
                 tracing::info!("Anthropic subscription authentication ready");
+            }
+            if let Some(github) = github {
+                tracing::info!("starting GitHub App authentication");
+                crate::github_oauth::credential(&github.client_id, &state_dir, None).await?;
+                tracing::info!("GitHub App authentication ready");
             }
             Ok(())
         }
