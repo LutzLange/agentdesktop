@@ -144,13 +144,33 @@
       "type": "object",
       "properties": {
         "clientId": {
-          "description": "GitHub App client ID. The App must enable Device Flow.",
-          "type": "string"
+          "description": "GitHub App client ID. Required when `source` is `deviceFlow`, where the\nApp must also enable Device Flow. Unused when `source` is `request`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Where the GitHub credential comes from.",
+          "$ref": "#/$defs/GitHubTokenSource",
+          "default": "deviceFlow"
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "clientId"
+      "additionalProperties": false
+    },
+    "GitHubTokenSource": {
+      "description": "Where the local proxy gets the credential it puts in `x-llm-token`.",
+      "oneOf": [
+        {
+          "description": "The daemon obtains its own token through GitHub App device authorization.",
+          "type": "string",
+          "const": "deviceFlow"
+        },
+        {
+          "description": "The calling client already holds a credential and sends it; the proxy\nmoves it aside and adds the gateway identity. Used by clients such as\nVS Code Copilot that manage their own GitHub session.",
+          "type": "string",
+          "const": "request"
+        }
       ]
     },
     "GrokConfig": {

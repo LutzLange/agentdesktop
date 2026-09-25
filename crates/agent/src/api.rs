@@ -283,10 +283,16 @@ pub(crate) async fn gateway_credential(
                 github_client_id: if include_subscription {
                     None
                 } else {
-                    gateway
-                        .github_oauth
-                        .as_ref()
-                        .map(|github| github.client_id.clone())
+                    // Same reasoning as the daemon login path: a GitHub sign-in
+                    // step only makes sense for the device flow.
+                    gateway.github_oauth.as_ref().and_then(|github| {
+                        matches!(
+                            github.source,
+                            agentdesktop_core::config::GitHubTokenSource::DeviceFlow
+                        )
+                        .then(|| github.client_id.clone())
+                        .flatten()
+                    })
                 },
             },
         )

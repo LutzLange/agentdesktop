@@ -12,6 +12,7 @@ use std::{
     os::unix::fs::{FileTypeExt, PermissionsExt},
 };
 
+use agentdesktop_core::config::GitHubTokenSource;
 use agentdesktop_core::{
     DEFAULT_CONFIG_PATH, DEFAULT_SOCKET_PATH, DEFAULT_STATE_DIR, VERSION, config,
     model::{DaemonControllerInfo, DaemonInfo, DaemonScope},
@@ -609,7 +610,15 @@ fn start_gateway_authentication(
                     gateway_oidc::LoginOptions {
                         callback_listen,
                         subscription_available: subscription,
-                        github_client_id: github.as_ref().map(|github| github.client_id.clone()),
+                        // Only the device flow has anything for the user to
+                        // sign in to. With source: request the credential comes
+                        // from the client, so the sign-in page must not offer a
+                        // GitHub step that would never be used.
+                        github_client_id: github.as_ref().and_then(|github| {
+                            matches!(github.source, GitHubTokenSource::DeviceFlow)
+                                .then(|| github.client_id.clone())
+                                .flatten()
+                        }),
                     },
                 )
                 .await?;
@@ -627,9 +636,15 @@ fn start_gateway_authentication(
                 tracing::info!("Anthropic subscription authentication ready");
             }
             if let Some(github) = github {
-                tracing::info!("starting GitHub App authentication");
-                crate::github_oauth::credential(&github.client_id, &state_dir, None).await?;
-                tracing::info!("GitHub App authentication ready");
+                // source: request has no credential of its own to acquire; the
+                // client supplies one per request.
+                if let (GitHubTokenSource::DeviceFlow, Some(client_id)) =
+                    (github.source, github.client_id.as_deref())
+                {
+                    tracing::info!("starting GitHub App authentication");
+                    crate::github_oauth::credential(client_id, &state_dir, None).await?;
+                    tracing::info!("GitHub App authentication ready");
+                }
             }
             Ok(())
         }

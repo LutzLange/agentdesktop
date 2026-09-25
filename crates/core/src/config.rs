@@ -103,6 +103,15 @@ pub struct LlmGatewayConfig {
     /// Authentication mechanism used when connecting to this gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authentication: Option<LlmGatewayAuthentication>,
+    /// Base URL the local LLM proxy forwards to, when it differs from `url`.
+    ///
+    /// `url` is shared by every program that sets `useLlmGateway`, so it can
+    /// only carry one path prefix. A gateway that puts each provider behind its
+    /// own prefix therefore cannot serve both a program and the proxy from one
+    /// value. Setting this leaves `url` to the programs and gives the proxy its
+    /// own target.
+    #[serde(rename = "proxyUrl", default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<Url>,
     /// GitHub App OAuth used by the local proxy for the x-llm-token header.
     #[serde(
         rename = "githubOAuth",
@@ -117,8 +126,27 @@ pub struct LlmGatewayConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitHubOAuthConfig {
-    /// GitHub App client ID. The App must enable Device Flow.
-    pub client_id: String,
+    /// Where the GitHub credential comes from.
+    #[serde(default)]
+    pub source: GitHubTokenSource,
+    /// GitHub App client ID. Required when `source` is `deviceFlow`, where the
+    /// App must also enable Device Flow. Unused when `source` is `request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+/// Where the local proxy gets the credential it puts in `x-llm-token`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum GitHubTokenSource {
+    /// The daemon obtains its own token through GitHub App device authorization.
+    #[default]
+    DeviceFlow,
+    /// The calling client already holds a credential and sends it; the proxy
+    /// moves it aside and adds the gateway identity. Used by clients such as
+    /// VS Code Copilot that manage their own GitHub session.
+    Request,
 }
 
 /// Authentication mechanisms supported by an LLM gateway.
@@ -708,9 +736,24 @@ fn validate_daemon(
         if gateway.url.query().is_some() || gateway.url.fragment().is_some() {
             anyhow::bail!("LLM gateway URL cannot include a query or fragment");
         }
+        if let Some(proxy_url) = &gateway.proxy_url {
+            if proxy_url.query().is_some() || proxy_url.fragment().is_some() {
+                anyhow::bail!("LLM gateway proxyUrl cannot include a query or fragment");
+            }
+        }
         if let Some(github) = &gateway.github_oauth {
-            if github.client_id.trim().is_empty() {
-                anyhow::bail!("llmGateway.githubOAuth.clientId cannot be empty");
+            match github.source {
+                GitHubTokenSource::DeviceFlow => {
+                    let client_id = github.client_id.as_deref().unwrap_or_default();
+                    if client_id.trim().is_empty() {
+                        anyhow::bail!(
+                            "llmGateway.githubOAuth.clientId is required when source is deviceFlow"
+                        );
+                    }
+                }
+                // clientId is accepted and ignored here, so that switching
+                // source back and forth does not require editing two fields.
+                GitHubTokenSource::Request => {}
             }
             if gateway.authentication.is_none() {
                 anyhow::bail!("llmGateway.githubOAuth requires gateway authentication");

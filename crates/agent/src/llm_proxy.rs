@@ -16,6 +16,8 @@ use hyper_util::{
 };
 use tokio::{net::TcpListener, task::JoinSet};
 
+use agentdesktop_core::config::GitHubTokenSource;
+
 use crate::api::{self, AppState};
 
 type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Incoming>;
@@ -99,9 +101,12 @@ async fn forward(
         StatusCode::SERVICE_UNAVAILABLE,
         "no llmGateway configured".into(),
     ))?;
+    // proxyUrl wins when present, so the proxy and the credential-helper
+    // programs can target different prefixes on the same gateway.
+    let base = gateway.proxy_url.as_ref().unwrap_or(&gateway.url);
     let uri: Uri = format!(
         "{}{}",
-        gateway.url.as_str().trim_end_matches('/'),
+        base.as_str().trim_end_matches('/'),
         request
             .uri()
             .path_and_query()
@@ -109,6 +114,27 @@ async fn forward(
     )
     .parse()
     .map_err(|error: hyper::http::uri::InvalidUri| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+    // Capture the client's own credential before the headers are cleared. A
+    // client such as VS Code Copilot has already done its provider handshake and
+    // sends the resulting token; with `githubOAuth.source: request` that token is
+    // what goes upstream, and the daemon only adds the gateway identity.
+    //
+    // x-llm-token wins over Authorization so a caller can send both: its identity
+    // in one and the provider credential in the other.
+    let client_credential = request
+        .headers()
+        .get("x-llm-token")
+        .or_else(|| request.headers().get(AUTHORIZATION))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .unwrap_or(value)
+                .trim()
+                .to_owned()
+        })
+        .filter(|value| !value.is_empty());
+
     strip_hop_headers(request.headers_mut());
     request.headers_mut().remove(AUTHORIZATION);
     request.headers_mut().remove("x-api-key");
@@ -127,10 +153,31 @@ async fn forward(
         request.headers_mut().insert(AUTHORIZATION, authorization);
     }
     if let Some(github) = &gateway.github_oauth {
-        let credential = crate::github_oauth::credential(&github.client_id, &state.state_dir, None)
-            .await
-            .map_err(|error| (StatusCode::BAD_GATEWAY, format!("GitHub OAuth: {error:#}")))?;
-        let mut value = HeaderValue::from_str(&credential.credential).map_err(|_| {
+        // Both branches put a bare token in x-llm-token. The gateway is the one
+        // that re-forms the header, with `"Bearer " + request.headers['x-llm-token']`,
+        // so the prefix is added in exactly one place.
+        let credential = match github.source {
+            GitHubTokenSource::DeviceFlow => {
+                let client_id = github.client_id.as_deref().ok_or((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "githubOAuth.clientId is required for deviceFlow".to_string(),
+                ))?;
+                crate::github_oauth::credential(client_id, &state.state_dir, None)
+                    .await
+                    .map_err(|error| (StatusCode::BAD_GATEWAY, format!("GitHub OAuth: {error:#}")))?
+                    .credential
+            }
+            // Fail rather than forward a request that cannot succeed: without a
+            // client credential the gateway would swap in an empty Authorization
+            // and the provider would reject it with an error that looks like a
+            // gateway fault.
+            GitHubTokenSource::Request => client_credential.clone().ok_or((
+                StatusCode::UNAUTHORIZED,
+                "no client credential to forward; send it in Authorization or x-llm-token"
+                    .to_string(),
+            ))?,
+        };
+        let mut value = HeaderValue::from_str(&credential).map_err(|_| {
             (
                 StatusCode::BAD_GATEWAY,
                 "invalid GitHub credential header".into(),
@@ -290,5 +337,126 @@ mod tests {
             drop(client);
             upstream_task.abort();
         }).await.unwrap();
+    }
+
+    // source: request. The client's own credential is what reaches the gateway
+    // in x-llm-token, and the daemon contributes only the gateway identity.
+    // This is the VS Code Copilot shape: Copilot has already exchanged its
+    // GitHub session for a provider token and sends it in Authorization.
+    #[tokio::test]
+    async fn forwards_the_client_credential_when_source_is_request() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            // The Bearer prefix is stripped here and re-added by the
+                            // gateway, so the token travels bare.
+                            assert_eq!(request.headers()["x-llm-token"], "tid=from-client");
+                            assert_eq!(request.headers()[AUTHORIZATION], "Bearer identity");
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let (dir, state) = request_source_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, "vscode".into()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/chat/completions"))
+                .header(AUTHORIZATION, "Bearer tid=from-client")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // Without a client credential the gateway would swap in an empty
+    // Authorization and the provider would fail in a way that looks like a
+    // gateway fault, so the proxy refuses instead of forwarding.
+    #[tokio::test]
+    async fn rejects_a_request_with_no_client_credential() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let (dir, state) = request_source_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, "vscode".into()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/chat/completions"))
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn request_source_state(address: std::net::SocketAddr) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path()).unwrap();
+        let account =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(b"https://issuer.example/\0proxy-test"));
+        store
+            .set(
+                "dev.agentdesktop.gateway-oidc",
+                &account,
+                &serde_json::json!({"accessToken": "identity", "refreshToken": null,
+                "expiresAtUnixSeconds": 4_000_000_000u64,
+                "tokenEndpoint": "https://issuer.example/token"})
+                .to_string(),
+            )
+            .unwrap();
+        let config = parse_daemon(&format!(
+            "llmGateway:\n  url: http://{address}\n  githubOAuth:\n    source: request\n  authentication:\n    type: oidc\n    issuer: https://issuer.example/\n    clientId: proxy-test\n"
+        )).unwrap();
+        let (_, discovery) = watch::channel(Arc::new(Discovery {
+            agents: vec![],
+            model_runtimes: vec![],
+        }));
+        let state = AppState {
+            config,
+            daemon_info: DaemonInfo {
+                version: "test".into(),
+                scope: DaemonScope::User,
+                config_path: String::new(),
+                state_directory: String::new(),
+                inventory_interval: Duration::from_secs(60),
+                controller: None,
+            },
+            discovery,
+            enrollment: EnrollmentState::new(false),
+            state_dir: dir.path().to_owned(),
+            oidc_callback_listen: None,
+            telemetry: None,
+            logout: None,
+        };
+        (dir, state)
     }
 }
