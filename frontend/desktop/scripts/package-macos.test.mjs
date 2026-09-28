@@ -123,6 +123,21 @@ const releaseWorkflow = readFileSync(
   path.resolve(nativeDirectory, "../../.github/workflows/release.yml"),
   "utf8",
 );
+const signingImport = readFileSync(
+  path.resolve(
+    nativeDirectory,
+    "../../.github/scripts/import-macos-signing.sh",
+  ),
+  "utf8",
+);
+
+test("release workflow signs and verifies the outer PKG", () => {
+  assert.match(signingImport, /APPLE_INSTALLER_SIGNING_IDENTITY=/);
+  assert.match(signingImport, /APPLE_INSTALLER_KEYCHAIN=/);
+  assert.match(releaseWorkflow, /- name: Verify PKG signature/);
+  assert.match(releaseWorkflow, /pkgutil --check-signature/);
+});
+
 const signingCleanupSteps = [
   ...releaseWorkflow.matchAll(
     /^ {6}- name: Remove macOS signing identity\n((?: {8}[^\n]*\n|\n)*)/gm,

@@ -401,6 +401,12 @@ jobs:
           mkdir -p release
           cp "${source_path}" "release/${OUTPUT_NAME}"
 
+      - name: Verify PKG signature
+        shell: bash
+        env:
+          OUTPUT_NAME: agentdesktop-macos-${{ matrix.arch }}.pkg
+        run: pkgutil --check-signature "release/${OUTPUT_NAME}"
+
       # Production notarization placeholder: notarize and staple the signed
       # package here, before calculating its checksum or smoke-testing it.
       # - name: Notarize and staple PKG
@@ -493,7 +499,7 @@ jobs:
             security delete-keychain "${RUNNER_TEMP}/agentdesktop-signing.keychain-db"
           fi
 
-      - name: Upload PKG (self-signed application)
+      - name: Upload signed test PKG
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-installer-${{ matrix.arch }}

@@ -39,4 +39,14 @@ security list-keychains -d user -s "$keychain" "${keychains[@]}"
 # Select the exact certificate, independent of its display name.
 identity="$(openssl x509 -in "$certificate" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
 security find-identity -v -p codesigning "$keychain" | grep -F "$identity"
+installer_identity="$({
+  openssl x509 -in "$certificate" -noout -subject -nameopt multiline |
+    sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p'
+} | head -n 1)"
+if [[ -z "$installer_identity" ]]; then
+  echo "Signing certificate has no common name" >&2
+  exit 1
+fi
 echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+echo "APPLE_INSTALLER_SIGNING_IDENTITY=$installer_identity" >> "$GITHUB_ENV"
+echo "APPLE_INSTALLER_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
