@@ -12,6 +12,11 @@ llmGateway:
     # Enable Device Flow in the App settings; no callback URL is needed.
     clientId: Iv23liJrjLXp6bL3WUCC
 
+# Optional loopback proxy for clients without an API-key helper (see README, "Local LLM proxy").
+# daemon:
+#   llmProxy:
+#     listen: 127.0.0.1:4000
+
 programs: {}
 #  claudeCode:
 #    useLlmGateway: true

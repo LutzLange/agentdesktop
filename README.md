@@ -96,11 +96,20 @@ for prerequisites, test credentials, and a walkthrough of the local services.
 
 ## Local LLM proxy
 
-For clients without an API-key helper, start the daemon's optional loopback proxy:
+For clients without an API-key helper, enable the daemon's optional loopback proxy
+in the local configuration file (startup settings are local only, not delivered by
+the controller):
+
+```yaml
+daemon:
+  llmProxy:
+    listen: 127.0.0.1:4000
+```
+
+Then start the daemon as usual:
 
 ```sh
-agentdesktop daemon --user --config examples/standalone/config.yaml \
-  --llm-proxy-listen 127.0.0.1:4000
+agentdesktop daemon --user --config examples/standalone/config.yaml
 ```
 
 Point the client's model endpoint at `http://127.0.0.1:4000/v1/chat/completions`,
@@ -119,7 +128,7 @@ client. VS Code's built-in **Custom Endpoint** provider can use this endpoint
 without the experimental extension in `vscode/`.
 
 Controller JWT authentication uses client ID `vscode` by default; include it in
-`allowedClientIds`, or choose another ID with `--llm-proxy-client-id`. The listen
+`allowedClientIds`, or choose another ID with `daemon.llmProxy.clientId`. The listen
 address must be loopback. Local processes can use the proxy's credentials;
 browser-origin requests and CONNECT tunnels are rejected. The listener and active
 proxy connections stop with the daemon.

@@ -94,17 +94,14 @@ impl AuthorizationPage {
                 "Connect Agentdesktop",
                 &format!(
                     r#"<p>Agentdesktop needs your identity before it can issue credentials to configured agents.</p>
-{}
+{}{}
 <div class="actions"><a class="button" href="/continue">Continue to sign in</a></div>"#,
-                    format!(
-                        "{}{}",
-                        checklist(false, subscription_available, SubscriptionState::Pending),
-                        if github_available {
-                            "<div class=\"steps\"><div class=\"step\"><span class=\"check\" aria-hidden=\"true\"></span><div><strong>GitHub Copilot</strong><span>Connect your GitHub account after organization sign-in.</span></div></div></div>"
-                        } else {
-                            ""
-                        }
-                    )
+                    checklist(false, subscription_available, SubscriptionState::Pending),
+                    if github_available {
+                        "<div class=\"steps\"><div class=\"step\"><span class=\"check\" aria-hidden=\"true\"></span><div><strong>GitHub Copilot</strong><span>Connect your GitHub account after organization sign-in.</span></div></div></div>"
+                    } else {
+                        ""
+                    }
                 ),
             ),
             Self::Subscription => page(

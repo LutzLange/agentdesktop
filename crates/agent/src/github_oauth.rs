@@ -158,10 +158,10 @@ async fn acquire(
     }
     let (page_url, status, server) = device_page(&code.user_code, continuation.as_ref()).await?;
     println!("Open this URL to connect GitHub:\n{page_url}");
-    if continuation.is_none() {
-        if let Err(error) = open::that_detached(&page_url) {
-            tracing::warn!(%error, "could not open the Agentdesktop sign-in page; use the URL above");
-        }
+    if continuation.is_none()
+        && let Err(error) = open::that_detached(&page_url)
+    {
+        tracing::warn!(%error, "could not open the Agentdesktop sign-in page; use the URL above");
     }
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
     let mut interval = Duration::from_secs(code.interval.max(1));
