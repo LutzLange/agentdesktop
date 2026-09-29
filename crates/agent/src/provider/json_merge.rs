@@ -25,7 +25,40 @@ pub(super) fn state_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.agentdesktop"))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// An array in the managed document whose elements are identified by a key
+/// (for example `providers[].name`), so a managed element replaces the element
+/// with the same key rather than sitting next to it, and removal takes the
+/// element out even if it was edited in place.
+#[derive(Clone, Copy)]
+pub(super) struct KeyedArray {
+    pub(super) field: &'static str,
+    pub(super) keys: &'static [&'static str],
+}
+
+/// How a managed document is written into, and removed from, a user file.
+#[derive(Clone, Copy)]
+pub(super) struct MergeOptions {
+    /// Mode of the file when the merge writes it (`plan_remove` keeps the
+    /// file's current mode).
+    pub(super) mode: u32,
+    /// Arrays whose elements are identified by key. Elements of arrays not
+    /// listed here are matched by full equality.
+    pub(super) keyed_arrays: &'static [KeyedArray],
+    /// Record actions without file content, for a file that holds secrets:
+    /// the dry-run report then shows the action and the path only.
+    pub(super) redact_diff: bool,
+}
+
+impl Default for MergeOptions {
+    fn default() -> Self {
+        Self {
+            mode: 0o644,
+            keyed_arrays: &[],
+            redact_diff: false,
+        }
+    }
+}
+
 pub(super) fn plan_merge(
     path: &Path,
     state_path: &Path,
@@ -33,6 +66,40 @@ pub(super) fn plan_merge(
     legacy_owned: bool,
     description: &str,
     display_name: &str,
+    plan: &ReconcilePlan,
+) -> anyhow::Result<()> {
+    plan_merge_with(
+        path,
+        state_path,
+        managed,
+        legacy_owned,
+        description,
+        display_name,
+        MergeOptions::default(),
+        plan,
+    )
+}
+
+/// The managed values the previous merge left in the file (the sidecar's
+/// `after` snapshot, the whole merged document as last written), so a
+/// provider can tell whether an entry was written by it.
+pub(super) fn managed_after(
+    state_path: &Path,
+    display_name: &str,
+    plan: &ReconcilePlan,
+) -> anyhow::Result<Option<Value>> {
+    Ok(read_state(state_path, display_name, plan)?.map(|state| state.after))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_merge_with(
+    path: &Path,
+    state_path: &Path,
+    managed: Value,
+    legacy_owned: bool,
+    description: &str,
+    display_name: &str,
+    options: MergeOptions,
     plan: &ReconcilePlan,
 ) -> anyhow::Result<()> {
     let existing = match plan.read(path) {
@@ -44,10 +111,13 @@ pub(super) fn plan_merge(
         }
     };
     let previous = read_state(state_path, display_name, plan)?;
-    let created = previous
-        .as_ref()
-        .map(|state| state.created)
-        .unwrap_or(existing.is_none() || legacy_owned);
+    // A file that does not exist now is created by this merge, whatever an
+    // older sidecar says: the user's earlier file is gone.
+    let created = existing.is_none()
+        || previous
+            .as_ref()
+            .map(|state| state.created)
+            .unwrap_or(legacy_owned);
 
     let mut combined = match existing.as_deref() {
         Some(contents) => match serde_json::from_slice::<Value>(contents) {
@@ -65,6 +135,16 @@ pub(super) fn plan_merge(
     } else if legacy_owned {
         combined = json!({});
     }
+    // Keyed elements are owned by key: whatever the file holds under a managed
+    // key (edited or not) gives way to the managed element, and an element the
+    // previous merge added under a key that is no longer managed goes away.
+    for keyed in options.keyed_arrays {
+        if let Some(previous) = previous.as_ref() {
+            let added = keyed_added(keyed, &previous.before, &previous.after);
+            remove_keyed(&mut combined, keyed, &added);
+        }
+        remove_keyed(&mut combined, keyed, &managed);
+    }
     let before = combined.clone();
     merge_overlay(&mut combined, managed);
 
@@ -76,17 +156,19 @@ pub(super) fn plan_merge(
         Some(_) => "update",
         None => "create",
     };
-    plan.record_diff(
+    record(
+        plan,
         display_name,
         description,
         action,
         path,
         existing.as_deref(),
         Some(&contents),
+        options.redact_diff,
     );
 
     if action != "unchanged" {
-        plan.write_file(path, &contents, 0o644)?;
+        plan.write_file(path, &contents, options.mode)?;
     }
     let mut state = serde_json::to_vec_pretty(&MergeState {
         created,
@@ -105,6 +187,26 @@ pub(super) fn plan_remove(
     state_path: &Path,
     description: &str,
     display_name: &str,
+    plan: &ReconcilePlan,
+) -> anyhow::Result<bool> {
+    plan_remove_with(
+        path,
+        state_path,
+        description,
+        display_name,
+        MergeOptions::default(),
+        plan,
+    )
+}
+
+/// `plan_remove` with keyed arrays and diff redaction; the file keeps its
+/// current mode when it is rewritten.
+pub(super) fn plan_remove_with(
+    path: &Path,
+    state_path: &Path,
+    description: &str,
+    display_name: &str,
+    options: MergeOptions,
     plan: &ReconcilePlan,
 ) -> anyhow::Result<bool> {
     let Some(state) = read_state(state_path, display_name, plan)? else {
@@ -129,7 +231,27 @@ pub(super) fn plan_remove(
             return Ok(true);
         }
     };
-    let settings = rollback_overlay(&settings, &state.before, &state.after);
+    let mut settings = rollback_overlay(&settings, &state.before, &state.after);
+    // Keyed elements the last merge added are removed by key, so an element
+    // edited in place after the merge goes too.
+    for keyed in options.keyed_arrays {
+        let added = keyed_added(keyed, &state.before, &state.after);
+        remove_keyed(&mut settings, keyed, &added);
+        // An array the merge introduced (absent or empty before) and that is
+        // now empty goes with it.
+        if state
+            .before
+            .get(keyed.field)
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+            && settings
+                .get(keyed.field)
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && let Some(object) = settings.as_object_mut()
+        {
+            object.remove(keyed.field);
+        }
+    }
     let empty = settings.as_object().is_some_and(serde_json::Map::is_empty);
     let proposed = if state.created && empty {
         None
@@ -144,13 +266,15 @@ pub(super) fn plan_remove(
         Some(contents) if contents == existing => "unchanged",
         Some(_) => "update",
     };
-    plan.record_diff(
+    record(
+        plan,
         display_name,
         description,
         action,
         path,
         Some(&existing),
         proposed.as_deref(),
+        options.redact_diff,
     );
     if action == "remove" {
         plan.remove_file(path)
@@ -158,7 +282,9 @@ pub(super) fn plan_remove(
     } else if let Some(contents) = proposed
         && action == "update"
     {
-        plan.write_file(path, &contents, 0o644)?;
+        // The user's remaining content keeps the file's current mode: a file
+        // that was owner-only (it may hold the user's own keys) stays so.
+        plan.write_file(path, &contents, current_mode(path).unwrap_or(0o644))?;
     }
     remove_file(state_path, display_name, plan)?;
     debug!(provider = display_name, action, path = %path.display(), "planned removal of managed values from user settings");
@@ -282,4 +408,147 @@ fn rollback_value(
     }
 
     Some(current.clone())
+}
+
+/// The mode bits of an existing file, on platforms that have them.
+pub(super) fn current_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record(
+    plan: &ReconcilePlan,
+    display_name: &str,
+    description: &str,
+    action: &str,
+    path: &Path,
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    redact: bool,
+) {
+    if redact {
+        plan.record_diff(display_name, description, action, path, None, None);
+    } else {
+        plan.record_diff(display_name, description, action, path, before, after);
+    }
+}
+
+/// The key tuple of an array element, `None` when a key field is missing or
+/// not a string (such an element is never matched by key).
+fn element_key(keyed: &KeyedArray, element: &Value) -> Option<Vec<String>> {
+    keyed
+        .keys
+        .iter()
+        .map(|key| element.get(*key)?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Remove from `document[keyed.field]` every element whose key equals the key
+/// of an element in `managed[keyed.field]`.
+fn remove_keyed(document: &mut Value, keyed: &KeyedArray, managed: &Value) {
+    let managed_keys: Vec<Vec<String>> = managed
+        .get(keyed.field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|element| element_key(keyed, element))
+        .collect();
+    if managed_keys.is_empty() {
+        return;
+    }
+    if let Some(elements) = document.get_mut(keyed.field).and_then(Value::as_array_mut) {
+        elements.retain(|element| {
+            element_key(keyed, element).is_none_or(|key| !managed_keys.contains(&key))
+        });
+    }
+}
+
+/// The document holding only the keyed elements the last merge added
+/// (`after` minus `before`, by key).
+fn keyed_added(keyed: &KeyedArray, before: &Value, after: &Value) -> Value {
+    let before_keys: Vec<Vec<String>> = before
+        .get(keyed.field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|element| element_key(keyed, element))
+        .collect();
+    let added: Vec<Value> = after
+        .get(keyed.field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|element| {
+            element_key(keyed, element).is_some_and(|key| !before_keys.contains(&key))
+        })
+        .cloned()
+        .collect();
+    json!({ keyed.field: added })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn managed() -> Value {
+        json!({"env": {"MANAGED": "1"}})
+    }
+
+    // Default options, as Claude Code and Claude Desktop use them.
+    #[test]
+    fn removal_keeps_the_file_mode_and_a_recreated_file_counts_as_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+        // A user file that is owner-only stays owner-only after the managed
+        // values are removed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, b"{\"env\":{\"USER\":\"keep\"}}\n").unwrap();
+            let plan = ReconcilePlan::default();
+            plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+            plan.apply().unwrap();
+            // The user tightens the mode after the merge (the default merge
+            // writes 0644, as before); removal keeps what it finds.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let plan = ReconcilePlan::default();
+            assert!(plan_remove(&path, &state, "settings", "Test", &plan).unwrap());
+            plan.apply().unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let remaining: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(remaining, json!({"env": {"USER": "keep"}}));
+        }
+        // The user's file existed at the first merge (not created by us); it
+        // is then deleted and the next merge recreates it: removal deletes it.
+        std::fs::write(&path, b"{\"env\":{\"USER\":\"keep\"}}\n").unwrap();
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        plan.apply().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        plan.apply().unwrap();
+        let plan = ReconcilePlan::default();
+        assert!(plan_remove(&path, &state, "settings", "Test", &plan).unwrap());
+        plan.apply().unwrap();
+        assert!(
+            !path.exists(),
+            "a file the merge recreated is removed whole"
+        );
+    }
 }

@@ -171,6 +171,58 @@
         "address"
       ]
     },
+    "CopilotConfig": {
+      "description": "Settings reconciled into GitHub Copilot CLI's `providers.json`.\n\n`providers.json` is merged, never owned outright: the CLI has no\nmanaged-settings equivalent for providers, and users may have their own\nBYOK entries. See `provider::copilot::reconcile` in the agent crate for\nhow this is turned into the merged document. User mode only: the file\nlives in the user's Copilot directory, so a system daemon rejects the\nprogram.",
+      "type": "object",
+      "properties": {
+        "models": {
+          "description": "Copilot CLI model entries, keyed by the model ID the CLI shows\n(`copilot --model agentdesktop/<id>`).\n\nAt least one is required when a top-level `llmGateway` is configured.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/CopilotModel"
+          }
+        },
+        "useLlmGateway": {
+          "description": "Whether this program uses the top-level LLM gateway.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CopilotModel": {
+      "description": "One Copilot CLI model entry. The entry's `id` is the map key; `provider`\nand `modelId` are the typed fields below; any other key (for example\n`wireModel`, the name sent upstream when it differs) is passed through to\nthe CLI unchanged.",
+      "type": "object",
+      "properties": {
+        "modelId": {
+          "description": "The CLI's `modelId` for the entry. Defaults to the entry's ID. The\nname sent to the gateway is `wireModel` when that pass-through key is\nset, else this one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "Which managed provider entry serves the model.",
+          "$ref": "#/$defs/CopilotProvider",
+          "default": "agentdesktop"
+        }
+      },
+      "additionalProperties": true
+    },
+    "CopilotProvider": {
+      "description": "The two provider entries agentdesktop writes into `providers.json`, one per\nAPI shape the proxy's `/copilot-cli` route serves.",
+      "oneOf": [
+        {
+          "description": "OpenAI-compatible, `http://<listen>/copilot-cli/v1`.",
+          "type": "string",
+          "const": "agentdesktop"
+        },
+        {
+          "description": "Anthropic, `http://<listen>/copilot-cli`.",
+          "type": "string",
+          "const": "agentdesktop-anthropic"
+        }
+      ]
+    },
     "DaemonStartupConfig": {
       "description": "Settings read only at local daemon startup. Paths use the process working directory.",
       "type": "object",
@@ -187,6 +239,11 @@
         },
         "codex": {
           "description": "Codex paths.",
+          "$ref": "#/$defs/ToolConfigPath",
+          "default": {}
+        },
+        "copilot": {
+          "description": "GitHub Copilot CLI paths (`config` = the `providers.json` to manage;\ndefaults to `COPILOT_PROVIDERS_CONFIG`, `$COPILOT_HOME/providers.json`,\nthen `~/.copilot/providers.json`).",
           "$ref": "#/$defs/ToolConfigPath",
           "default": {}
         },
@@ -531,6 +588,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/CodexConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "copilot": {
+          "description": "GitHub Copilot CLI managed configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CopilotConfig"
             },
             {
               "type": "null"
