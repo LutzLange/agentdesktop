@@ -98,7 +98,14 @@ for prerequisites, test credentials, and a walkthrough of the local services.
 
 For clients without an API-key helper, enable the daemon's optional loopback proxy
 in the local configuration file (startup settings are local only, not delivered by
-the controller):
+the controller). The proxy is available in `--user` mode only: it hands out the
+current user's gateway credential, so a system daemon rejects
+`daemon.llmProxy.listen`. If the address cannot be bound at startup, the daemon
+keeps running without the proxy and reports `llmProxy.bound: false` with the
+reason in daemon-info (the desktop app's "Daemon information" panel, or
+`curl --unix-socket <socket> http://localhost/v1/daemon-info`). If the proxy
+stops later, the daemon also keeps running; that is only visible in the daemon
+log until the next restart:
 
 ```yaml
 daemon:

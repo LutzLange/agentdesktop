@@ -421,7 +421,7 @@
       ]
     },
     "LlmProxyStartupConfig": {
-      "description": "Local loopback LLM proxy settings.",
+      "description": "Local loopback LLM proxy settings. User mode only: the proxy hands out the\ncurrent user's gateway credential, so a system daemon never runs one.",
       "type": "object",
       "properties": {
         "clientId": {
@@ -432,7 +432,7 @@
           ]
         },
         "listen": {
-          "description": "Loopback address to listen on. Unset disables the proxy in `--user` mode.",
+          "description": "Loopback address to listen on. Unset disables the proxy. Rejected in system mode.",
           "type": [
             "string",
             "null"

@@ -81,12 +81,13 @@ pub struct DaemonStartupConfig {
     pub llm_proxy: LlmProxyStartupConfig,
 }
 
-/// Local loopback LLM proxy settings.
+/// Local loopback LLM proxy settings. User mode only: the proxy hands out the
+/// current user's gateway credential, so a system daemon never runs one.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LlmProxyStartupConfig {
-    /// Loopback address to listen on. Unset disables the proxy in `--user` mode.
+    /// Loopback address to listen on. Unset disables the proxy. Rejected in system mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<SocketAddr>,
     /// Credential policy client ID used by the proxy. Defaults to `vscode`.
