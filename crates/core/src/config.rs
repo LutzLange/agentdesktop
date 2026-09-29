@@ -81,6 +81,11 @@ pub struct DaemonStartupConfig {
     /// then `~/.copilot/providers.json`).
     #[serde(default)]
     pub copilot: ToolConfigPath,
+    /// VS Code paths (`config` = the `chatLanguageModels.json` to manage;
+    /// defaults to `chatLanguageModels.json` inside the per-OS VS Code user
+    /// profile directory).
+    #[serde(default)]
+    pub vscode: ToolConfigPath,
     /// Local loopback LLM proxy.
     #[serde(default)]
     pub llm_proxy: LlmProxyStartupConfig,
@@ -551,6 +556,9 @@ pub struct ProgramsConfig {
     /// GitHub Copilot CLI managed configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copilot: Option<CopilotConfig>,
+    /// VS Code (Copilot Chat, own models) managed configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vscode: Option<VsCodeConfig>,
 }
 
 impl ProgramsConfig {
@@ -561,6 +569,7 @@ impl ProgramsConfig {
             && self.open_code.is_none()
             && self.grok.is_none()
             && self.copilot.is_none()
+            && self.vscode.is_none()
     }
 }
 
@@ -802,18 +811,180 @@ impl CopilotConfig {
             {
                 anyhow::bail!("programs.copilot.models.{id}.modelId must not be empty");
             }
-            if let Some(key) = model
-                .extra
-                .keys()
-                .find(|key| Self::RESERVED_MODEL_KEYS.contains(&key.as_str()))
-            {
+            if let Some(key) = model.extra.keys().find(|key| {
+                Self::RESERVED_MODEL_KEYS
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(key))
+            }) {
                 anyhow::bail!(
                     "programs.copilot.models.{id}.{key} is set by agentdesktop and cannot be overridden"
                 );
             }
-            if model.extra.contains_key("apiKey") {
+            if model
+                .extra
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("apiKey"))
+            {
                 anyhow::bail!(
                     "programs.copilot.models.{id}.apiKey is not allowed: the local proxy adds the gateway credential"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Settings reconciled into VS Code's `chatLanguageModels.json`: points
+/// Copilot Chat's built-in "Custom Endpoint" model provider at the local LLM
+/// proxy's `/vscode-copilot` route (the `githubModels` variant of
+/// `copilotChat`, using GitHub's own models through the gateway, arrives in a
+/// later PR). See `provider::vscode::reconcile` in the agent crate for how
+/// this is turned into the merged document. User mode only: the file lives in
+/// the user's VS Code profile directory, so a system daemon rejects the
+/// program.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VsCodeConfig {
+    /// Whether this program uses the top-level LLM gateway.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_llm_gateway: bool,
+    /// Which Copilot Chat model source VS Code is pointed at. Only
+    /// `ownModels` is available for now.
+    #[serde(default)]
+    pub copilot_chat: VsCodeCopilotChat,
+    /// Custom model entries exposed to VS Code's Copilot Chat model picker,
+    /// keyed by the model ID VS Code sends as `model`.
+    ///
+    /// At least one is required when a top-level `llmGateway` is configured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, VsCodeModel>,
+}
+
+/// Which Copilot Chat model source VS Code is pointed at.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum VsCodeCopilotChat {
+    /// Custom models served through the local LLM proxy's `/vscode-copilot`
+    /// route (VS Code's "Custom Endpoint" provider).
+    #[default]
+    OwnModels,
+}
+
+/// One VS Code custom model entry. The entry's `id` is the map key; other
+/// typed fields below match VS Code's `chatLanguageModels.json` model shape;
+/// any other key is passed through to VS Code unchanged.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct VsCodeModel {
+    /// Display name shown in VS Code's model picker. Defaults to
+    /// `"<id> (agentdesktop)"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Whether the model supports tool calling.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub tool_calling: bool,
+    /// Whether the model supports image input.
+    #[serde(default)]
+    pub vision: bool,
+    /// Maximum input tokens accepted by the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    /// Maximum output tokens produced by the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    /// Further VS Code model keys, passed through unchanged.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for VsCodeModel {
+    fn default() -> Self {
+        Self {
+            name: None,
+            tool_calling: true,
+            vision: false,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+impl VsCodeConfig {
+    /// The `name` of the single vendor entry agentdesktop owns in
+    /// `chatLanguageModels.json`, matching the Copilot CLI provider's name.
+    pub const VENDOR_NAME: &'static str = "agentdesktop";
+    /// Keys agentdesktop sets on every model entry; a pass-through key must
+    /// not set them.
+    pub const RESERVED_MODEL_KEYS: [&'static str; 3] = ["id", "url", "requestHeaders"];
+
+    /// The configured part of each model object in the vendor entry's
+    /// `models` array, in ID order: `id`, `name` (defaulting to
+    /// `"<id> (agentdesktop)"`), `toolCalling`, `vision`, the optional token
+    /// limits and the pass-through keys. The daemon adds the proxy `url` and
+    /// the pairing `requestHeaders`; the core crate knows neither.
+    pub fn model_documents(&self) -> Vec<serde_json::Value> {
+        self.models
+            .iter()
+            .map(|(id, model)| {
+                let mut object = serde_json::Map::new();
+                object.insert("id".to_owned(), serde_json::Value::String(id.clone()));
+                object.insert(
+                    "name".to_owned(),
+                    serde_json::Value::String(
+                        model
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("{id} ({})", Self::VENDOR_NAME)),
+                    ),
+                );
+                object.insert(
+                    "toolCalling".to_owned(),
+                    serde_json::Value::Bool(model.tool_calling),
+                );
+                object.insert("vision".to_owned(), serde_json::Value::Bool(model.vision));
+                if let Some(limit) = model.max_input_tokens {
+                    object.insert("maxInputTokens".to_owned(), serde_json::Value::from(limit));
+                }
+                if let Some(limit) = model.max_output_tokens {
+                    object.insert("maxOutputTokens".to_owned(), serde_json::Value::from(limit));
+                }
+                for (key, value) in &model.extra {
+                    object.insert(key.clone(), value.clone());
+                }
+                serde_json::Value::Object(object)
+            })
+            .collect()
+    }
+
+    /// Rejects an empty model ID, a pass-through `id`, `url` or
+    /// `requestHeaders`, and a pass-through `apiKey`. Called from daemon
+    /// config validation, so the controller refuses the config before any
+    /// device sees it.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (id, model) in &self.models {
+            if id.trim().is_empty() {
+                anyhow::bail!("programs.vscode.models has an entry with an empty ID");
+            }
+            if model
+                .extra
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("apiKey"))
+            {
+                anyhow::bail!(
+                    "programs.vscode.models.{id}.apiKey is not allowed: the local proxy adds the gateway credential"
+                );
+            }
+            if let Some(key) = model.extra.keys().find(|key| {
+                Self::RESERVED_MODEL_KEYS
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(key))
+            }) {
+                anyhow::bail!(
+                    "programs.vscode.models.{id}.{key} is set by agentdesktop and cannot be overridden"
                 );
             }
         }
@@ -965,6 +1136,9 @@ fn validate_daemon(
         }
         if programs.copilot.is_some() {
             anyhow::bail!("sandbox is not supported for GitHub Copilot CLI");
+        }
+        if programs.vscode.is_some() {
+            anyhow::bail!("sandbox is not supported for VS Code");
         }
     }
     if let Some(gateway) = llm_gateway {
@@ -1138,6 +1312,19 @@ fn validate_daemon(
             anyhow::bail!(
                 "GitHub Copilot CLI requires at least one entry in models when llmGateway is configured"
             );
+        }
+    }
+    if let Some(vscode) = &programs.vscode {
+        vscode.validate()?;
+        // Matched, not defaulted: a new model source must decide its own rules.
+        match vscode.copilot_chat {
+            VsCodeCopilotChat::OwnModels => {
+                if llm_gateway.is_some() && vscode.use_llm_gateway && vscode.models.is_empty() {
+                    anyhow::bail!(
+                        "VS Code requires at least one entry in models when llmGateway is configured"
+                    );
+                }
+            }
         }
     }
     Ok(())

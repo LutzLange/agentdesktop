@@ -75,7 +75,8 @@ export type AgentKind =
   | "codex"
   | "openCode"
   | "grok"
-  | "copilot";
+  | "copilot"
+  | "vscode";
 
 export type AgentDraft = {
   kind: AgentKind;

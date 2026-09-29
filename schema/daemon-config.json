@@ -290,6 +290,11 @@
           "description": "Manage the current user’s tool settings instead of system settings.",
           "type": "boolean",
           "default": false
+        },
+        "vscode": {
+          "description": "VS Code paths (`config` = the `chatLanguageModels.json` to manage;\ndefaults to `chatLanguageModels.json` inside the per-OS VS Code user\nprofile directory).",
+          "$ref": "#/$defs/ToolConfigPath",
+          "default": {}
         }
       },
       "additionalProperties": false
@@ -626,6 +631,17 @@
               "type": "null"
             }
           ]
+        },
+        "vscode": {
+          "description": "VS Code (Copilot Chat, own models) managed configuration.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VsCodeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -731,6 +747,80 @@
         }
       },
       "additionalProperties": false
+    },
+    "VsCodeConfig": {
+      "description": "Settings reconciled into VS Code's `chatLanguageModels.json`: points\nCopilot Chat's built-in \"Custom Endpoint\" model provider at the local LLM\nproxy's `/vscode-copilot` route (the `githubModels` variant of\n`copilotChat`, using GitHub's own models through the gateway, arrives in a\nlater PR). See `provider::vscode::reconcile` in the agent crate for how\nthis is turned into the merged document. User mode only: the file lives in\nthe user's VS Code profile directory, so a system daemon rejects the\nprogram.",
+      "type": "object",
+      "properties": {
+        "copilotChat": {
+          "description": "Which Copilot Chat model source VS Code is pointed at. Only\n`ownModels` is available for now.",
+          "$ref": "#/$defs/VsCodeCopilotChat",
+          "default": "ownModels"
+        },
+        "models": {
+          "description": "Custom model entries exposed to VS Code's Copilot Chat model picker,\nkeyed by the model ID VS Code sends as `model`.\n\nAt least one is required when a top-level `llmGateway` is configured.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/VsCodeModel"
+          }
+        },
+        "useLlmGateway": {
+          "description": "Whether this program uses the top-level LLM gateway.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "VsCodeCopilotChat": {
+      "description": "Which Copilot Chat model source VS Code is pointed at.",
+      "oneOf": [
+        {
+          "description": "Custom models served through the local LLM proxy's `/vscode-copilot`\nroute (VS Code's \"Custom Endpoint\" provider).",
+          "type": "string",
+          "const": "ownModels"
+        }
+      ]
+    },
+    "VsCodeModel": {
+      "description": "One VS Code custom model entry. The entry's `id` is the map key; other\ntyped fields below match VS Code's `chatLanguageModels.json` model shape;\nany other key is passed through to VS Code unchanged.",
+      "type": "object",
+      "properties": {
+        "maxInputTokens": {
+          "description": "Maximum input tokens accepted by the model.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "maxOutputTokens": {
+          "description": "Maximum output tokens produced by the model.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "name": {
+          "description": "Display name shown in VS Code's model picker. Defaults to\n`\"<id> (agentdesktop)\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toolCalling": {
+          "description": "Whether the model supports tool calling.",
+          "type": "boolean"
+        },
+        "vision": {
+          "description": "Whether the model supports image input.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": true
     }
   }
 }

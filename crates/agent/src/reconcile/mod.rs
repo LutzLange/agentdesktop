@@ -27,6 +27,7 @@ pub use crate::provider::{
     copilot::default_copilot_providers_path,
     grok::default_grok_managed_config_path,
     opencode::{default_open_code_managed_config_path, default_open_code_plugin_path},
+    vscode::default_vscode_chat_models_path,
 };
 
 #[derive(Clone)]
@@ -47,6 +48,7 @@ impl Reconciler {
         open_code_plugin_path: PathBuf,
         grok_managed_config_path: PathBuf,
         copilot_providers_path: Option<PathBuf>,
+        vscode_chat_models_path: Option<PathBuf>,
         credential_helper: PathBuf,
         socket: PathBuf,
     ) -> Self {
@@ -72,7 +74,9 @@ impl Reconciler {
                     managed_config_path: open_code_managed_config_path,
                     plugin_path: open_code_plugin_path,
                 }),
-                Box::new(VsCode),
+                Box::new(VsCode {
+                    chat_models_path: vscode_chat_models_path,
+                }),
                 Box::new(Cursor),
                 Box::new(Grok {
                     managed_config_path: grok_managed_config_path,
@@ -288,6 +292,7 @@ programs:
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
             Some(root.join("copilot/providers.json")),
+            None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
         );
@@ -327,6 +332,7 @@ programs:
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
             Some(root.join("copilot/providers.json")),
+            None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
         );
@@ -367,6 +373,7 @@ programs:
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
             Some(providers.clone()),
+            None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
         )
@@ -380,6 +387,60 @@ programs:
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(providers.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "directory created through the reconciler");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vscode_directory_is_created_owner_only_through_the_reconciler() {
+        // Same private-directory request as the Copilot CLI test above, for
+        // the VS Code user profile directory.
+        let root = std::env::temp_dir().join(format!(
+            "agentdesktop-reconcile-vscode-dir-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let config = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  vscode:
+    models:
+      gpt-4.1-mini: {}
+"#,
+        )
+        .unwrap();
+        let chat_models = root.join("vscode/User/chatLanguageModels.json");
+        let reconciler = Reconciler::new(
+            true,
+            root.join("claude/settings.json"),
+            root.join("claude-desktop/settings.json"),
+            root.join("claude-desktop/helper"),
+            root.join("codex/config.toml"),
+            root.join("opencode/config.json"),
+            root.join("opencode/plugin.js"),
+            root.join("grok/managed_config.toml"),
+            Some(root.join("copilot/providers.json")),
+            Some(chat_models.clone()),
+            root.join("bin/agentdesktop"),
+            root.join("agentdesktop.sock"),
+        )
+        .with_llm_proxy(Some(crate::llm_proxy::LlmProxyContext {
+            address: "127.0.0.1:18095".parse().unwrap(),
+            pairing: std::sync::Arc::from("PAIRING-RECONCILER"),
+        }));
+        reconciler.apply(&config).expect("apply");
+        assert!(chat_models.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(chat_models.parent().unwrap())
                 .unwrap()
                 .permissions()
                 .mode()
@@ -416,6 +477,7 @@ programs:
             root.join("opencode/config.json"),
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
+            None,
             None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
@@ -476,6 +538,7 @@ programs:
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
             Some(root.join("copilot/providers.json")),
+            None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
         );
@@ -518,6 +581,7 @@ programs:
                 root.join("opencode/plugin.js"),
                 root.join("grok/managed_config.toml"),
                 Some(root.join("copilot/providers.json")),
+                None,
                 root.join("bin/agentdesktop"),
                 root.join("agentdesktop.sock"),
             );
