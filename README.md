@@ -326,6 +326,69 @@ apply. Discovery reports the CLI's version from the `@github/copilot` npm
 manifest next to the launcher; a standalone binary shows no version. The
 program cannot be applied with `--once`.
 
+### Managed program: VS Code Copilot Chat on own models
+
+`programs.vscode` makes the daemon write VS Code's custom language-model file
+(`chatLanguageModels.json`, read by Copilot Chat's built-in **Custom
+Endpoint** provider) so the model picker offers the configured models through
+the proxy's `/vscode-copilot` route with client ID `vscode-copilot`. User mode
+only; needs `daemon.llmProxy.listen`, a configured `llmGateway`, and
+`vscode-copilot` (not the proxy's default `vscode`) in `allowedClientIds`:
+
+```yaml
+programs:
+  vscode:
+    copilotChat: ownModels          # the only value for now
+    models:
+      gpt-4.1-mini:                 # the model name sent to the gateway
+        name: GPT-4.1 mini (agentdesktop)   # picker label, defaults to "<id> (agentdesktop)"
+        maxInputTokens: 128000
+        maxOutputTokens: 16000
+```
+
+The file lives in the VS Code user profile directory: Linux
+`~/.config/Code/User`, macOS `~/Library/Application Support/Code/User`,
+Windows `<home>\AppData\Roaming\Code\User` (the daemon derives it from the
+home directory, not from `APPDATA`); the local startup setting
+`daemon.vscode.config` overrides it. Insiders and VSCodium profiles are not
+managed.
+
+The daemon writes one vendor entry named `agentdesktop` (`vendor:
+customendpoint`, `apiType: chat-completions`) with one model per configured
+entry: `id`, `name`, the `url` on the proxy, `toolCalling` (default true),
+`vision` (default false), the token limits when set, and the pairing value in
+`requestHeaders`; other keys are passed through. VS Code keeps the file's
+`apiKey` in the OS keyring and does not send it reliably, so the placeholder
+`apiKey: unused` stays and the header carries the pairing; no secret is
+written.
+
+Other vendor entries in the file are the user's and are kept. The
+`agentdesktop` entry belongs to the daemon once it has written the file: it is
+replaced as a whole on every apply (a hand edit, or a model added by hand
+inside that entry, is undone) and removed by name on removal. Before the
+first write, a user entry with that name and no pairing header is a conflict,
+as for the Copilot CLI file. The file is written owner-only, plan reports
+carry no content, there is no `--dry-run` preview and `--once` refuses the
+program, and the upgrade note for `programs.copilot` applies (controller
+first, then daemons, user-mode devices only).
+
+VS Code reads the file at startup: restart it after an apply that changes the
+file (first apply, model changes, re-pairing after a re-enrollment).
+`chat.defaultModel` is not written by the daemon; set it by policy if a
+default is wanted. The file must stay plain JSON: a file with comments or
+trailing commas is reported as a conflict rather than rewritten without
+them, and a conflict blocks every managed file on the device until it is
+resolved (and stops the daemon at startup, as for the other programs); an
+empty file is filled. If the daemon's sidecar next to the file is gone, an
+`agentdesktop` entry carrying a pairing header is replaced on the next apply,
+and one carrying this daemon's own pairing value is removed when the program
+goes away. Pass-through
+model keys are written as given, so a misspelt key reaches VS Code unchanged.
+The daemon's sidecar next to the file (`.chatLanguageModels.json.agentdesktop`,
+owner-only) keeps a copy of the file as last written, including the user's
+own entries, until the next apply. Non-default VS Code profiles and
+`XDG_CONFIG_HOME` are not considered, matching the MCP inventory.
+
 ## Start locally, grow into a fleet
 
 Agentdesktop uses the same daemon and tool-native configuration model at every
@@ -367,7 +430,7 @@ stage.
 | Codex | Yes | Yes | MCP and skills | Yes |
 | Cursor | Yes | — | MCP and skills | — |
 | OpenCode | Yes | Yes | MCP | — |
-| VS Code | Yes | — | MCP and skills | — |
+| VS Code | Yes | User mode (Copilot Chat) | MCP and skills | — |
 | Grok Build | Yes | System mode | MCP and skills | — |
 | GitHub Copilot CLI | Yes | User mode | — | — |
 

@@ -83,6 +83,8 @@ struct ResolvedDaemonArgs {
     grok: ResolvedToolConfigPath,
     /// The Copilot CLI providers file; `None` in system mode (user-only program).
     copilot_providers: Option<PathBuf>,
+    /// VS Code's `chatLanguageModels.json`; `None` in system mode (user-only program).
+    vscode_chat_models: Option<PathBuf>,
     once: bool,
     dry_run: bool,
 }
@@ -135,9 +137,7 @@ impl DaemonArgs {
         }
         // VS Code's chatLanguageModels.json lives in the user's own profile,
         // like the Copilot CLI providers file: a system daemon has no user
-        // file to manage, so an explicit override is rejected up front. Not
-        // yet wired into the reconciler (TODO(pr3a)); this only rejects the
-        // override before it would otherwise be silently ignored.
+        // file to manage, so an explicit override is rejected up front.
         if !user && startup.vscode.config.is_some() {
             bail!("daemon.vscode.config requires --user (or daemon.user: true)");
         }
@@ -196,6 +196,7 @@ impl DaemonArgs {
                     }
                     None
                 },
+                vscode_chat_models: None,
                 once: self.once || self.dry_run,
                 dry_run: self.dry_run,
             });
@@ -270,6 +271,12 @@ impl DaemonArgs {
                 Some(path) => path,
                 None => reconcile::default_copilot_providers_path()?,
             }),
+            vscode_chat_models: Some(
+                startup
+                    .vscode
+                    .config
+                    .unwrap_or_else(|| reconcile::default_vscode_chat_models_path(&home)),
+            ),
             once: self.once || self.dry_run,
             dry_run: self.dry_run,
         })
@@ -373,9 +380,7 @@ where
         args.open_code.plugin.clone(),
         args.grok.config.clone(),
         args.copilot_providers.clone(),
-        // TODO(pr3a): wire a resolved VS Code chatLanguageModels.json path
-        // through ResolvedDaemonArgs once VsCode::plan is implemented.
-        None,
+        args.vscode_chat_models.clone(),
         agentdesktop_client_executable()?,
         socket.clone(),
     )
@@ -885,6 +890,11 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
             config
                 .programs
                 .copilot
+                .as_ref()
+                .is_some_and(|program| program.use_llm_gateway),
+            config
+                .programs
+                .vscode
                 .as_ref()
                 .is_some_and(|program| program.use_llm_gateway),
         ]

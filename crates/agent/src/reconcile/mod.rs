@@ -399,7 +399,7 @@ programs:
     #[test]
     fn vscode_directory_is_created_owner_only_through_the_reconciler() {
         // Same private-directory request as the Copilot CLI test above, for
-        // the VS Code user profile directory (spec PR-3a, criterion 8).
+        // the VS Code user profile directory.
         let root = std::env::temp_dir().join(format!(
             "agentdesktop-reconcile-vscode-dir-{}-{}",
             std::process::id(),

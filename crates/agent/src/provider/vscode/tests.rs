@@ -609,3 +609,20 @@ fn system_mode_rejects_a_configured_program_before_writing_anything() {
     }
     assert!(!path.exists(), "preflight failure must not write any files");
 }
+
+// Added with the implementation (not part of the spec-derived baseline).
+#[test]
+fn config_rejects_reserved_and_secret_keys_in_any_case() {
+    for key in ["ID", "Url", "RequestHeaders", "apikey", "APIKEY", "ApiKey"] {
+        let error = parse_programs(&format!(
+            "programs:\n  vscode:\n    models:\n      x:\n        {key}: y\n"
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("models.x."),
+            "{key}: {error:#}"
+        );
+    }
+    parse_programs("programs:\n  vscode:\n    models:\n      x:\n        apiKeyHint: y\n")
+        .expect("a key that merely starts like a reserved one passes");
+}

@@ -535,6 +535,13 @@ const configurableAgents: Array<{
     placeholder: "models:\n  gpt-4.1:\n    wireModel: gpt-4.1-mini",
     initialSettings: "models:\n  gpt-4.1: {}",
   },
+  {
+    kind: "vscode",
+    label: "VS Code (Copilot Chat)",
+    iconKind: "vscode",
+    placeholder: "models:\n  gpt-4.1-mini:\n    maxInputTokens: 128000",
+    initialSettings: "models:\n  gpt-4.1-mini: {}",
+  },
 ];
 
 const sandboxUnsupportedAgents = new Set<AgentKind>([
@@ -542,6 +549,7 @@ const sandboxUnsupportedAgents = new Set<AgentKind>([
   "openCode",
   "grok",
   "copilot",
+  "vscode",
 ]);
 
 function daemonConfigYaml(options: {
@@ -566,7 +574,7 @@ function daemonConfigYaml(options: {
         "  authentication:",
         "    type: controllerJwt",
         `    audience: ${yamlString(options.audience)}`,
-        "    allowedClientIds: [claude-code, claude-desktop, codex, opencode, grok, copilot-cli]",
+        "    allowedClientIds: [claude-code, claude-desktop, codex, opencode, grok, copilot-cli, vscode-copilot]",
       );
     }
     lines.push("");

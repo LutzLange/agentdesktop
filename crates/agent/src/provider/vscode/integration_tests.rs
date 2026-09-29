@@ -4,7 +4,7 @@ use agentdesktop_core::{DEFAULT_SOCKET_PATH, model::Discovery};
 use anyhow::{Context, ensure};
 use tracing::info;
 
-use crate::common::Container;
+use crate::common::{Container, Gateway};
 
 const VERSION: &str = "1.136.2";
 const USER_MCP: &str = "/home/tester/.config/Code/User/mcp.json";
@@ -68,4 +68,92 @@ async fn headless_discovery() -> anyhow::Result<()> {
         }
         Ok(())
     }).await
+}
+
+const CONFIG: &str = "/tmp/agentdesktop-chat.yaml";
+const CHAT_MODELS: &str = "/home/tester/.config/Code/User/chatLanguageModels.json";
+const CHAT_SIDECAR: &str = "/home/tester/.config/Code/User/.chatLanguageModels.json.agentdesktop";
+const PAIRING: &str = "/home/tester/.local/state/agentdesktop/llm-proxy-pairing";
+const SOCKET: &str = "/run/user/1000/agentdesktop.sock";
+const LISTEN: &str = "127.0.0.1:18096";
+
+/// The daemon runs as the user (`--user` through `runuser`, since the file
+/// lives in the user's VS Code profile), writes `chatLanguageModels.json`
+/// pointed at its loopback proxy, a client using the file's `url` and
+/// `requestHeaders` reaches the gateway through the proxy, and removing the
+/// program leaves the user's own vendor entry at the file's mode.
+#[tokio::test]
+async fn managed_chat_models_lifecycle() -> anyhow::Result<()> {
+    Container::run("vscode", "crates/agent/src/provider/vscode/testdata/Dockerfile", async |container| {
+        let gateway = Gateway::start().await?;
+        let user_vendor = serde_json::json!([{
+            "name": "my-own", "vendor": "customendpoint", "apiKey": "sk-user", "apiType": "chat-completions",
+            "models": [{"id": "gpt-mine", "name": "mine", "url": "https://example.invalid/v1/chat/completions"}],
+        }]);
+        container.write(CHAT_MODELS, &serde_json::to_string_pretty(&user_vendor)?).await?;
+        container.exec(&["chown", "-R", "tester:tester", "/home/tester/.config"]).await?;
+        // A mode the daemon does not write itself, so "mode kept" can fail.
+        container.exec(&["chmod", "640", CHAT_MODELS]).await?;
+        let config = |with_program: bool| {
+            let mut document = serde_json::json!({
+                "daemon": { "user": true, "llmProxy": { "listen": LISTEN } },
+                "llmGateway": { "url": gateway.url },
+                "programs": {},
+            });
+            if with_program {
+                document["programs"]["vscode"] =
+                    serde_json::json!({ "models": { "gpt-4.1-mini": { "maxInputTokens": 128000 } } });
+            }
+            serde_json::to_string_pretty(&document).unwrap()
+        };
+        container.write(CONFIG, &config(true)).await?;
+        container.exec(&["chown", "tester:tester", CONFIG]).await?;
+        let daemon = ["runuser", "-u", "tester", "--", "agentdesktop", "daemon", "--config", CONFIG];
+        container.start_process("daemon", &daemon).await?;
+        container.wait_ready(&["agentdesktop", "--socket", SOCKET, "status"]).await?;
+
+        info!("Checking the written chat language models file");
+        let pairing = container.exec(&["cat", PAIRING]).await?;
+        let pairing = pairing.trim().to_owned();
+        let written: serde_json::Value = serde_json::from_str(&container.exec(&["cat", CHAT_MODELS]).await?)?;
+        let vendors = written.as_array().cloned().context("chatLanguageModels.json is not an array")?;
+        ensure!(vendors.iter().any(|vendor| vendor["name"] == "my-own"), "user vendor entry lost: {written}");
+        let ours = vendors.iter().find(|vendor| vendor["name"] == "agentdesktop").cloned().context("managed vendor entry missing")?;
+        let model = &ours["models"][0];
+        ensure!(model["id"] == "gpt-4.1-mini" && model["url"] == format!("http://{LISTEN}/vscode-copilot/v1/chat/completions"), "unexpected model: {ours}");
+        ensure!(model["requestHeaders"]["x-agentdesktop-pairing"] == pairing, "pairing header mismatch: {ours}");
+        ensure!(ours["apiKey"] == "unused", "no secret may be written as apiKey: {ours}");
+        let mode = container.exec(&["stat", "-c", "%a", CHAT_MODELS]).await?;
+        ensure!(mode.trim() == "600", "a file the daemon writes is owner-only, got {mode}");
+        container.exec(&["test", "-e", CHAT_SIDECAR]).await?;
+
+        info!("Checking that a client using the file reaches the gateway through the proxy");
+        let url = model["url"].as_str().context("model url")?.to_owned();
+        let status = container.exec_as("tester", &["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", &format!("x-agentdesktop-pairing: {pairing}"), "-H", "authorization: Bearer client-token", "-H", "x-api-key: client-key", "-H", "content-type: application/json", "-X", "POST", &url, "-d", "{\"model\":\"gpt-4.1-mini\",\"messages\":[]}"], Duration::from_secs(15)).await?;
+        // The stub knows no /v1/chat/completions route and answers 404, which
+        // the proxy passes through; what matters is that the request arrived
+        // upstream with the client's own Authorization and x-api-key stripped
+        // (the curl sends both) and, with no gateway authentication configured
+        // here, no Authorization added.
+        let requests = gateway.requests();
+        let upstream = requests.iter().find(|request| request["path"] == "/v1/chat/completions").with_context(|| format!("no request reached the gateway (client saw {status}): {requests:?}"))?;
+        ensure!(upstream["authorization"].is_null() && upstream["apiKey"].is_null(), "client headers must not reach the gateway: {upstream}");
+
+        info!("Removing the program");
+        // The daemon wrote the file 600 while managed; the user then set 640
+        // by hand, which removal must keep.
+        container.exec(&["chmod", "640", CHAT_MODELS]).await?;
+        container.write(CONFIG, &config(false)).await?;
+        container.stop_process("daemon").await?;
+        container.start_process("daemon", &daemon).await?;
+        container.wait_ready(&["agentdesktop", "--socket", SOCKET, "status"]).await?;
+        let remaining: serde_json::Value = serde_json::from_str(&container.exec(&["cat", CHAT_MODELS]).await?)?;
+        let vendors = remaining.as_array().cloned().unwrap_or_default();
+        ensure!(vendors.len() == 1 && vendors[0]["name"] == "my-own", "managed entry not removed: {remaining}");
+        let mode = container.exec(&["stat", "-c", "%a", CHAT_MODELS]).await?;
+        ensure!(mode.trim() == "640", "removal must keep the user's file mode, got {mode}");
+        container.exec(&["test", "!", "-e", CHAT_SIDECAR]).await?;
+        Ok(())
+    })
+    .await
 }
