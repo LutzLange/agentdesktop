@@ -34,7 +34,9 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
 #[cfg(windows)]
 use crate::windows_security::SecurityDescriptor;
-use crate::{api, enrollment::EnrollmentState, gateway_oidc, reconcile, remote, secure_fs};
+use crate::{
+    api, enrollment::EnrollmentState, gateway_oidc, llm_proxy, reconcile, remote, secure_fs,
+};
 
 #[cfg(unix)]
 const LOCAL_API_GROUP: &str = "agentdesktop";
@@ -320,6 +322,27 @@ where
     let args = args.resolve(startup, config_path, socket)?;
     let _log_flush = telemetry::setup_logging(if args.once { "warn" } else { "info" }, false);
     let socket = args.socket.clone();
+    // Bind the loopback proxy before the reconciler exists, so anything that
+    // writes the proxy address into a managed file gets the bind result, never
+    // a configured address the daemon does not own. A failed bind is reported
+    // through daemon-info and the proxy stays off; the daemon keeps enrolling
+    // and reconciling, since a port taken by some other process must not take
+    // the device out of the fleet.
+    let (mut proxy_listener, mut llm_proxy) =
+        bind_llm_proxy(args.llm_proxy_listen, &args.llm_proxy_client_id).await;
+    let pairing = attach_llm_proxy_pairing(&mut proxy_listener, &mut llm_proxy, &args.state_dir);
+    let proxy_context = match (&proxy_listener, &pairing) {
+        (Some(listener), Some(pairing)) => {
+            listener
+                .local_addr()
+                .ok()
+                .map(|address| llm_proxy::LlmProxyContext {
+                    address,
+                    pairing: pairing.clone(),
+                })
+        }
+        _ => None,
+    };
     let reconciler = reconcile::Reconciler::new(
         args.user,
         args.claude_code.config.clone(),
@@ -331,7 +354,8 @@ where
         args.grok.config.clone(),
         agentdesktop_client_executable()?,
         socket.clone(),
-    );
+    )
+    .with_llm_proxy(proxy_context);
     if args.once {
         if args.dry_run {
             validate_dry_run(&config)?;
@@ -348,13 +372,6 @@ where
         return Ok(());
     }
 
-    // Bind the loopback proxy before the initial reconcile, so anything that
-    // later writes the proxy address into a managed file can rely on the bind
-    // result. A failed bind is reported through daemon-info and the proxy stays
-    // off; the daemon keeps enrolling and reconciling, since a port taken by some
-    // other process must not take the device out of the fleet.
-    let (proxy_listener, llm_proxy) =
-        bind_llm_proxy(args.llm_proxy_listen, &args.llm_proxy_client_id).await;
     let daemon_info = describe_daemon(&config, &args.config, &args.state_dir, args.user, llm_proxy);
     secure_fs::ensure_private_dir(&args.state_dir)?;
     start_gateway_authentication(
@@ -457,8 +474,15 @@ where
     // without the proxy rather than dropping the device out of the fleet.
     let proxy = async move {
         if let Some(listener) = proxy_listener
-            && let Err(error) =
-                crate::llm_proxy::serve(listener, state, args.llm_proxy_client_id).await
+            && let Err(error) = llm_proxy::serve(
+                listener,
+                state,
+                llm_proxy::ProxyConfig {
+                    default_client_id: args.llm_proxy_client_id,
+                    pairing: pairing.expect("pairing exists whenever the listener does"),
+                },
+            )
+            .await
         {
             tracing::error!(
                 error = %format!("{error:#}"),
@@ -479,6 +503,33 @@ where
     }
 
     Ok(())
+}
+
+/// Load or create the pairing value for a bound proxy. Without a pairing value
+/// the proxy would accept anyone on the host, so a failure to obtain one
+/// switches the proxy off like a failed bind: the listener is dropped and
+/// daemon-info reports `bound: false` with the reason.
+fn attach_llm_proxy_pairing(
+    proxy_listener: &mut Option<tokio::net::TcpListener>,
+    llm_proxy: &mut Option<LlmProxyInfo>,
+    state_dir: &Path,
+) -> Option<std::sync::Arc<str>> {
+    proxy_listener.as_ref()?;
+    match llm_proxy::load_or_create_pairing(state_dir) {
+        Ok(pairing) => Some(pairing),
+        Err(error) => {
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "LLM proxy pairing unavailable; proxy disabled until the daemon restarts"
+            );
+            *proxy_listener = None;
+            if let Some(info) = llm_proxy.as_mut() {
+                info.bound = false;
+                info.error = Some(format!("pairing unavailable: {error:#}"));
+            }
+            None
+        }
+    }
 }
 
 /// Bind the loopback LLM proxy listener, if one is configured.
@@ -1695,6 +1746,37 @@ programs:
         assert_eq!(info.client_id, "copilot-cli");
         let (none, info) = bind_llm_proxy(None, "vscode").await;
         assert!(none.is_none() && info.is_none());
+    }
+
+    #[tokio::test]
+    async fn pairing_failure_switches_the_proxy_off_and_reports_it() {
+        // A state directory that is a regular file: reading the pairing file
+        // fails (not a directory), which is neither "missing" nor "unusable", so
+        // no pairing is created and the proxy is switched off.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("state-as-file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let (mut listener, mut info) =
+            bind_llm_proxy(Some("127.0.0.1:0".parse().unwrap()), "copilot-cli").await;
+        assert!(listener.is_some());
+        let pairing = super::attach_llm_proxy_pairing(&mut listener, &mut info, &blocked);
+        assert!(pairing.is_none());
+        assert!(
+            listener.is_none(),
+            "the listener is dropped when no pairing exists"
+        );
+        let info = info.expect("proxy info");
+        assert!(!info.bound);
+        assert!(
+            info.error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("pairing unavailable"))
+        );
+        // A usable state directory keeps the listener and yields the pairing.
+        let (mut listener, mut info) =
+            bind_llm_proxy(Some("127.0.0.1:0".parse().unwrap()), "copilot-cli").await;
+        let pairing = super::attach_llm_proxy_pairing(&mut listener, &mut info, dir.path());
+        assert!(pairing.is_some() && listener.is_some() && info.unwrap().bound);
     }
 
     #[test]

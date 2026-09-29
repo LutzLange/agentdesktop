@@ -120,25 +120,94 @@ agentdesktop daemon --user --config examples/standalone/config.yaml
 ```
 
 Point the client's model endpoint at `http://127.0.0.1:4000/v1/chat/completions`,
-`/v1/messages`, or `/v1/responses`, according to the protocol it uses. The proxy
-streams bodies unchanged to `llmGateway.url` and adds the credential from the same
-authentication flow used by the daemon's API-key helpers. Login and refresh stay
-with the existing authentication implementation. No client API key is needed.
-Incoming authorization/API-key headers are replaced, and upstream HTTP errors and
-redirects are passed back without following redirects.
+`/v1/messages`, or `/v1/responses`, according to the protocol it uses, and give it
+the pairing header (see **Pairing** below). The proxy forwards bodies unchanged
+to `llmGateway.proxyUrl` (or `llmGateway.url` when unset) and adds the credential
+from the same authentication flow used by the daemon's API-key helpers. Login and
+refresh stay with the existing authentication implementation. No client API key is
+needed. Incoming authorization/API-key headers are replaced, and upstream HTTP
+errors and redirects are passed back without following redirects.
 
 The incoming path and query are appended to the gateway base URL: with
-`llmGateway.url: https://gateway.example/prefix`, `/v1/messages` goes to
-`https://gateway.example/prefix/v1/messages`. Avoid repeating `/v1` in both URLs.
+`llmGateway.proxyUrl: https://gateway.example/prefix` (or `url`, when `proxyUrl`
+is unset), `/v1/messages` goes to `https://gateway.example/prefix/v1/messages`.
+Avoid repeating `/v1` in both URLs.
 The proxy does not discover models or rewrite model IDs; configure those in the
 client. VS Code's built-in **Custom Endpoint** provider can use this endpoint
-without the experimental extension in `vscode/`.
+without the experimental extension in `vscode/`. The provider reads
+`chatLanguageModels.json` in the VS Code user directory (on Linux
+`~/.config/Code/User/`); keep the file owner-only, since it carries the pairing
+value. Give it the pairing value in the model's `requestHeaders` (the file's
+`apiKey` is not sent reliably without an OS keyring):
 
-Controller JWT authentication uses client ID `vscode` by default; include it in
-`allowedClientIds`, or choose another ID with `daemon.llmProxy.clientId`. The listen
-address must be loopback. Local processes can use the proxy's credentials;
-browser-origin requests and CONNECT tunnels are rejected. The listener and active
-proxy connections stop with the daemon.
+```json
+[
+  {
+    "name": "agentdesktop",
+    "vendor": "customendpoint",
+    "apiKey": "unused",
+    "apiType": "chat-completions",
+    "models": [
+      { "id": "gpt-4.1-mini", "name": "gpt-4.1-mini (agentdesktop)",
+        "url": "http://127.0.0.1:4000/v1/chat/completions",
+        "toolCalling": true, "vision": false,
+        "maxInputTokens": 128000, "maxOutputTokens": 16000,
+        "requestHeaders": { "x-agentdesktop-pairing": "<value>" } }
+    ]
+  }
+]
+```
+
+Upgrade note: before the pairing existed, this route accepted any local caller.
+A manual setup made against that version now gets `403 pairing_invalid` until
+the header is added.
+
+Controller JWT authentication uses client ID `vscode` by default on the
+prefix-less route; choose another ID with `daemon.llmProxy.clientId`. Every client
+ID the proxy presents (`vscode` or your choice, plus `copilot-cli` and
+`vscode-copilot` for the routes below) must be in the controller's
+`allowedClientIds`. With `authentication.type: oidc` the client ID has no effect: the
+OIDC token is the same for every route. The listen address must be loopback.
+
+**Routes.** Besides the prefix-less route (the manual shape used above, with the
+credential mode from `llmGateway.githubOAuth` and the upstream from
+`llmGateway.proxyUrl`), the proxy serves fixed path prefixes for the managed
+Copilot programs, one per program route, so the client ID is decided by the file
+the daemon writes and never by request headers. The prefix is stripped before
+forwarding. A path whose first segment looks like a route name without matching
+one exactly is refused with `404 route_unknown` rather than served as the
+prefix-less route; this also applies to a gateway sub-path that happens to start
+with a route name (for example `/vscode-copilot-proxy/...`), so do not use such
+paths on the prefix-less route:
+
+| Prefix | Client ID | Sends upstream | Upstream |
+| --- | --- | --- | --- |
+| `/copilot-cli/` | `copilot-cli` | gateway identity only | `llmGateway.url` |
+| `/vscode-copilot/` | `vscode-copilot` | gateway identity only | `llmGateway.url` |
+| `/vscode-copilot-passthrough/` | `vscode-copilot` | gateway identity in `Authorization`, the client's own bearer token in `x-llm-token` | `llmGateway.proxyUrl` (required) |
+
+**Pairing.** Every route requires the per-device pairing value in the
+`x-agentdesktop-pairing` header. The daemon creates it in its state directory
+(`llm-proxy-pairing`, owner-only) on first use and keeps it across restarts; a
+manual setup copies it from there. The state directory in `--user` mode is
+`$XDG_STATE_HOME/agentdesktop`, by default `~/.local/state/agentdesktop` (the
+home directory from `HOME` or `USERPROFILE`, on every platform), unless
+`daemon.stateDir` says otherwise. The Copilot CLI's
+`providers.json` carries it as `"headers": {"x-agentdesktop-pairing": "<value>"}`
+on the provider entry. It keeps other local users on a shared host
+and browser pages off the proxy, provided the client files that carry it are
+owner-only too. It does not restrict the current user's own processes, which can
+obtain a credential from the daemon directly. If the value cannot be created the
+proxy stays off, reported in daemon-info like a failed bind.
+
+**Requests.** `Host` must be a loopback address; `Origin`, `CONNECT` and
+`OPTIONS` are refused; `..` path segments are refused. Refused and failed requests
+return an OpenAI-style JSON body, `{"error": {"message", "type", "code"}}`, so the
+LLM clients display the message. Codes: `host_not_allowed`, `pairing_invalid`,
+`browser_not_allowed`, `method_not_allowed`, `path_invalid`, `route_unknown`,
+`client_credential_missing`, `agentdesktop_credential` (no gateway credential
+for this device: not enrolled, revoked, controller unreachable),
+`agentdesktop_unavailable`, `gateway_unreachable`.
 
 To attach the local user's GitHub App OAuth token as well, add the App's client ID
 to the gateway configuration (keep the existing `authentication` block):
@@ -162,7 +231,9 @@ needed. The App's permissions and the user's Copilot access must permit the
 upstream requests. This flow currently targets GitHub.com.
 
 The proxy sends `Authorization: Bearer <gateway identity token>` and
-`x-llm-token: <GitHub access token>`. Incoming values for both are discarded.
+`x-llm-token: <GitHub access token>`. Incoming values for both are discarded on
+this route (with `githubOAuth.source: request`, and on the pass-through route,
+the client's own token is what goes into `x-llm-token`).
 The GitHub access and refresh tokens are stored in the daemon's existing secret
 store, separately for each App client ID. Expiring tokens refresh automatically,
 including refresh-token rotation; expired/rejected refresh credentials trigger
