@@ -1,6 +1,5 @@
 use std::{convert::Infallible, time::Duration};
 
-use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
@@ -44,7 +43,17 @@ pub(crate) async fn serve(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accept LLM proxy connection")?;
+                // A per-connection accept error (EMFILE, ECONNABORTED, ENOBUFS)
+                // must not end the proxy, let alone the daemon: log, pause briefly
+                // so a persistent condition does not spin, and keep accepting.
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "LLM proxy accept failed; retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let client = client.clone();
                 let state = state.clone();
                 let client_id = client_id.clone();
@@ -300,7 +309,7 @@ mod tests {
                 config,
                 daemon_info: DaemonInfo { version: "test".into(), scope: DaemonScope::User,
                     config_path: String::new(), state_directory: String::new(),
-                    inventory_interval: Duration::from_secs(60), controller: None },
+                    inventory_interval: Duration::from_secs(60), controller: None, llm_proxy: None },
                 discovery, enrollment: EnrollmentState::new(false), state_dir: dir.path().to_owned(),
                 oidc_callback_listen: None, telemetry: None, logout: None,
             };
@@ -449,6 +458,7 @@ mod tests {
                 state_directory: String::new(),
                 inventory_interval: Duration::from_secs(60),
                 controller: None,
+                llm_proxy: None,
             },
             discovery,
             enrollment: EnrollmentState::new(false),

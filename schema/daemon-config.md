@@ -18,7 +18,7 @@
 |`daemon.grok.config`|string|Configuration file.|
 |`daemon.llmProxy`|object|Local loopback LLM proxy.|
 |`daemon.llmProxy.clientId`|string|Credential policy client ID used by the proxy. Defaults to `vscode`.|
-|`daemon.llmProxy.listen`|string|Loopback address to listen on. Unset disables the proxy in `--user` mode.|
+|`daemon.llmProxy.listen`|string|Loopback address to listen on. Unset disables the proxy. Rejected in system mode.|
 |`daemon.oidcCallbackListen`|string|Override the OIDC callback bind address.|
 |`daemon.openCode`|object|OpenCode paths.|
 |`daemon.openCode.config`|string|Configuration file.|
