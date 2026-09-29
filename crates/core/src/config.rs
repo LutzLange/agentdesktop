@@ -76,6 +76,11 @@ pub struct DaemonStartupConfig {
     /// Grok Build paths.
     #[serde(default)]
     pub grok: ToolConfigPath,
+    /// GitHub Copilot CLI paths (`config` = the `providers.json` to manage;
+    /// defaults to `COPILOT_PROVIDERS_CONFIG`, `$COPILOT_HOME/providers.json`,
+    /// then `~/.copilot/providers.json`).
+    #[serde(default)]
+    pub copilot: ToolConfigPath,
     /// Local loopback LLM proxy.
     #[serde(default)]
     pub llm_proxy: LlmProxyStartupConfig,
@@ -543,6 +548,9 @@ pub struct ProgramsConfig {
     /// Grok Build managed configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok: Option<GrokConfig>,
+    /// GitHub Copilot CLI managed configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copilot: Option<CopilotConfig>,
 }
 
 impl ProgramsConfig {
@@ -552,6 +560,7 @@ impl ProgramsConfig {
             && self.codex.is_none()
             && self.open_code.is_none()
             && self.grok.is_none()
+            && self.copilot.is_none()
     }
 }
 
@@ -676,6 +685,140 @@ pub struct GrokConfig {
     /// so null values cannot be reconciled.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub managed_config: BTreeMap<String, serde_json::Value>,
+}
+
+/// Settings reconciled into GitHub Copilot CLI's `providers.json`.
+///
+/// `providers.json` is merged, never owned outright: the CLI has no
+/// managed-settings equivalent for providers, and users may have their own
+/// BYOK entries. See `provider::copilot::reconcile` in the agent crate for
+/// how this is turned into the merged document. User mode only: the file
+/// lives in the user's Copilot directory, so a system daemon rejects the
+/// program.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CopilotConfig {
+    /// Whether this program uses the top-level LLM gateway.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub use_llm_gateway: bool,
+    /// Copilot CLI model entries, keyed by the model ID the CLI shows
+    /// (`copilot --model agentdesktop/<id>`).
+    ///
+    /// At least one is required when a top-level `llmGateway` is configured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, CopilotModel>,
+}
+
+/// One Copilot CLI model entry. The entry's `id` is the map key; `provider`
+/// and `modelId` are the typed fields below; any other key (for example
+/// `wireModel`, the name sent upstream when it differs) is passed through to
+/// the CLI unchanged.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CopilotModel {
+    /// Which managed provider entry serves the model.
+    #[serde(default)]
+    pub provider: CopilotProvider,
+    /// The CLI's `modelId` for the entry. Defaults to the entry's ID. The
+    /// name sent to the gateway is `wireModel` when that pass-through key is
+    /// set, else this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Further Copilot CLI model keys, passed through unchanged.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// The two provider entries agentdesktop writes into `providers.json`, one per
+/// API shape the proxy's `/copilot-cli` route serves.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum CopilotProvider {
+    /// OpenAI-compatible, `http://<listen>/copilot-cli/v1`.
+    #[default]
+    #[serde(rename = "agentdesktop")]
+    Agentdesktop,
+    /// Anthropic, `http://<listen>/copilot-cli`.
+    #[serde(rename = "agentdesktop-anthropic")]
+    AgentdesktopAnthropic,
+}
+
+impl CopilotProvider {
+    /// The provider entry's `name` in `providers.json`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Agentdesktop => CopilotConfig::PROVIDER_OPENAI,
+            Self::AgentdesktopAnthropic => CopilotConfig::PROVIDER_ANTHROPIC,
+        }
+    }
+}
+
+impl CopilotConfig {
+    /// Provider name for the OpenAI-shaped route (`/copilot-cli/v1`).
+    pub const PROVIDER_OPENAI: &'static str = "agentdesktop";
+    /// Provider name for the Anthropic-shaped route (`/copilot-cli`).
+    pub const PROVIDER_ANTHROPIC: &'static str = "agentdesktop-anthropic";
+    /// The entry's ID comes from the map key; a pass-through key must not set it.
+    pub const RESERVED_MODEL_KEYS: [&'static str; 1] = ["id"];
+
+    /// The model objects written to `providers.json`, in ID order: `id`,
+    /// `provider`, `modelId` (defaulting to the ID) and the pass-through keys.
+    pub fn model_documents(&self) -> Vec<serde_json::Value> {
+        self.models
+            .iter()
+            .map(|(id, model)| {
+                let mut object = serde_json::Map::new();
+                object.insert(
+                    "provider".to_owned(),
+                    serde_json::Value::String(model.provider.name().to_owned()),
+                );
+                object.insert("id".to_owned(), serde_json::Value::String(id.clone()));
+                object.insert(
+                    "modelId".to_owned(),
+                    serde_json::Value::String(model.model_id.clone().unwrap_or_else(|| id.clone())),
+                );
+                for (key, value) in &model.extra {
+                    object.insert(key.clone(), value.clone());
+                }
+                serde_json::Value::Object(object)
+            })
+            .collect()
+    }
+
+    /// Rejects an empty model ID, an empty `modelId`, a pass-through `id`
+    /// and a pass-through `apiKey`. Called from daemon config validation, so
+    /// the controller refuses the config before any device sees it.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (id, model) in &self.models {
+            if id.trim().is_empty() {
+                anyhow::bail!("programs.copilot.models has an entry with an empty ID");
+            }
+            if model
+                .model_id
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                anyhow::bail!("programs.copilot.models.{id}.modelId must not be empty");
+            }
+            if let Some(key) = model
+                .extra
+                .keys()
+                .find(|key| Self::RESERVED_MODEL_KEYS.contains(&key.as_str()))
+            {
+                anyhow::bail!(
+                    "programs.copilot.models.{id}.{key} is set by agentdesktop and cannot be overridden"
+                );
+            }
+            if model.extra.contains_key("apiKey") {
+                anyhow::bail!(
+                    "programs.copilot.models.{id}.apiKey is not allowed: the local proxy adds the gateway credential"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Upstream authentication selected by a managed agent.
@@ -819,6 +962,9 @@ fn validate_daemon(
         }
         if programs.grok.is_some() {
             anyhow::bail!("sandbox is not supported for Grok Build");
+        }
+        if programs.copilot.is_some() {
+            anyhow::bail!("sandbox is not supported for GitHub Copilot CLI");
         }
     }
     if let Some(gateway) = llm_gateway {
@@ -984,6 +1130,14 @@ fn validate_daemon(
             .context("Grok Build requires model when llmGateway is configured")?;
         if !grok.models.is_empty() && !grok.models.contains_key(model) {
             anyhow::bail!("Grok Build model {model} is not declared in models");
+        }
+    }
+    if let Some(copilot) = &programs.copilot {
+        copilot.validate()?;
+        if llm_gateway.is_some() && copilot.use_llm_gateway && copilot.models.is_empty() {
+            anyhow::bail!(
+                "GitHub Copilot CLI requires at least one entry in models when llmGateway is configured"
+            );
         }
     }
     Ok(())

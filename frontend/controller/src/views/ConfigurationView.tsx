@@ -528,12 +528,20 @@ const configurableAgents: Array<{
     placeholder: "model: grok-4.6",
     initialSettings: "model: grok-4.6",
   },
+  {
+    kind: "copilot",
+    label: "GitHub Copilot CLI",
+    iconKind: "copilot",
+    placeholder: "models:\n  gpt-4.1:\n    wireModel: gpt-4.1-mini",
+    initialSettings: "models:\n  gpt-4.1: {}",
+  },
 ];
 
 const sandboxUnsupportedAgents = new Set<AgentKind>([
   "claudeDesktop",
   "openCode",
   "grok",
+  "copilot",
 ]);
 
 function daemonConfigYaml(options: {
@@ -558,7 +566,7 @@ function daemonConfigYaml(options: {
         "  authentication:",
         "    type: controllerJwt",
         `    audience: ${yamlString(options.audience)}`,
-        "    allowedClientIds: [claude-code, claude-desktop, codex, opencode, grok]",
+        "    allowedClientIds: [claude-code, claude-desktop, codex, opencode, grok, copilot-cli]",
       );
     }
     lines.push("");

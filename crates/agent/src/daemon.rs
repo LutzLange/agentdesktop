@@ -81,6 +81,8 @@ struct ResolvedDaemonArgs {
     codex: ResolvedToolConfigPath,
     open_code: ResolvedOpenCodeStartupConfig,
     grok: ResolvedToolConfigPath,
+    /// The Copilot CLI providers file; `None` in system mode (user-only program).
+    copilot_providers: Option<PathBuf>,
     once: bool,
     dry_run: bool,
 }
@@ -180,6 +182,12 @@ impl DaemonArgs {
                         .config
                         .unwrap_or_else(reconcile::default_grok_managed_config_path),
                 },
+                copilot_providers: {
+                    if startup.copilot.config.is_some() {
+                        bail!("daemon.copilot.config requires --user (or daemon.user: true)");
+                    }
+                    None
+                },
                 once: self.once || self.dry_run,
                 dry_run: self.dry_run,
             });
@@ -250,6 +258,10 @@ impl DaemonArgs {
                         .join("managed_config.toml")
                 }),
             },
+            copilot_providers: Some(match startup.copilot.config {
+                Some(path) => path,
+                None => reconcile::default_copilot_providers_path()?,
+            }),
             once: self.once || self.dry_run,
             dry_run: self.dry_run,
         })
@@ -352,6 +364,7 @@ where
         args.open_code.config.clone(),
         args.open_code.plugin.clone(),
         args.grok.config.clone(),
+        args.copilot_providers.clone(),
         agentdesktop_client_executable()?,
         socket.clone(),
     )
@@ -818,6 +831,11 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
     if !config.telemetry.events.is_empty() {
         bail!("--once cannot collect telemetry because hooks require the daemon to remain running");
     }
+    if config.programs.copilot.is_some() {
+        bail!(
+            "--once cannot manage the GitHub Copilot CLI providers file because its local proxy requires the daemon to remain running"
+        );
+    }
     let authenticated_gateway_is_used = config
         .llm_gateway
         .as_ref()
@@ -846,6 +864,11 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
             config
                 .programs
                 .grok
+                .as_ref()
+                .is_some_and(|program| program.use_llm_gateway),
+            config
+                .programs
+                .copilot
                 .as_ref()
                 .is_some_and(|program| program.use_llm_gateway),
         ]
@@ -1568,6 +1591,27 @@ telemetry:
     }
 
     #[test]
+    fn one_shot_rejects_the_copilot_program() {
+        let copilot = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  copilot:
+    models:
+      gpt-4.1: {}
+"#,
+        )
+        .unwrap();
+        assert!(
+            validate_one_shot(&copilot)
+                .unwrap_err()
+                .to_string()
+                .contains("Copilot")
+        );
+    }
+
+    #[test]
     fn dry_run_rejects_controller_managed_configuration() {
         let managed = parse_daemon(
             r#"
@@ -1618,6 +1662,19 @@ programs:
         let mut startup = config::DaemonStartupConfig::default();
         startup.llm_proxy.listen = Some(listen.parse().unwrap());
         startup
+    }
+
+    #[test]
+    fn system_mode_rejects_a_copilot_providers_path() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.copilot.config = Some(PathBuf::from("/tmp/providers.json"));
+        let error = resolve_error(daemon_args(false), startup);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.copilot.config requires --user"),
+            "{error:#}"
+        );
     }
 
     #[test]

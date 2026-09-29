@@ -260,6 +260,72 @@ device authorization again. Non-expiring App user tokens are also supported.
 Request bodies remain untouched. The existing Claude credential-helper flow is
 unchanged; the local proxy always uses the gateway identity in `Authorization`.
 
+### Managed program: GitHub Copilot CLI
+
+`programs.copilot` makes the daemon write the Copilot CLI's BYOK provider
+registry so the CLI talks to the proxy's `/copilot-cli` route with client ID
+`copilot-cli`; nothing is edited by hand. User mode only (the file lives in the
+user's Copilot directory), and it needs `daemon.llmProxy.listen`, a configured
+`llmGateway`, and `copilot-cli` in `allowedClientIds`:
+
+```yaml
+programs:
+  copilot:
+    models:
+      gpt-4.1:                    # the name the CLI shows: --model agentdesktop/gpt-4.1
+        wireModel: gpt-4.1-mini   # what is sent to the gateway (defaults to modelId, which defaults to the key)
+      claude-haiku-4.5:
+        provider: agentdesktop-anthropic
+        wireModel: claude-haiku-4-5
+```
+
+The file is `providers.json` in `$COPILOT_HOME` (default `~/.copilot`), or the
+path in `COPILOT_PROVIDERS_CONFIG` when set. The daemon reads those variables
+from its own environment, which for a service-started daemon is not the
+user's shell: if the CLI is pointed elsewhere by a shell profile, set
+`daemon.copilot.config` in the local startup file to the same path. The daemon
+adds two provider entries, `agentdesktop` (OpenAI-compatible, base URL
+`http://<listen>/copilot-cli/v1`) and `agentdesktop-anthropic` (Anthropic,
+base URL `http://<listen>/copilot-cli`), both carrying the pairing header,
+plus one model entry per configured model (`id` is the map key, `provider`
+and `modelId` are typed fields, other keys such as `wireModel` are passed
+through to the CLI). Providers and
+models the user added themselves are kept, including models of their own
+under other providers with the same IDs. The two provider names and the
+models under them belong to the daemon once it has written the file: it
+replaces them on every apply, so an edit made by hand to one of them is
+undone. Before the daemon has written the file, a user provider under one of
+those names (without a pairing header), or a model under such a name, is a conflict:
+the file is left alone and, as for every managed file, the daemon applies
+nothing on the device until the conflict is resolved (a conflict present at
+startup stops the daemon from starting, as for the other programs). If the
+daemon's sidecar next to the file is gone, entries under the managed names
+that carry a pairing header are replaced on the next apply, and those that
+carry this daemon's own pairing value are removed when the program goes
+away; entries with another pairing value are left alone. The file is written owner-only. Removing
+`programs.copilot`, setting `useLlmGateway: false`, or running without the
+proxy takes the managed entries out again and restores the user's file with
+its previous mode (deleted only if the daemon created it and nothing else is
+left).
+
+Upgrade note: `programs.copilot` is a new field. Upgrade the controller first
+(an older controller rejects the configuration), then the daemons (an older
+daemon marks a pushed configuration that carries the field as failed); push
+the program only to devices that run in user mode, since a system-mode daemon
+fails the whole apply for the program it cannot manage.
+
+Pick the model with `copilot --model agentdesktop/gpt-4.1` or the `model` key
+in the CLI's `settings.json` (`/model` in the CLI); the daemon does not write
+that key. There is no `--dry-run` preview for this file: the proxy cannot run
+in one-shot mode, so `daemon.llmProxy.listen` is refused together with
+`--once` or `--dry-run`, and without the listener the daemon has nothing to
+point the CLI at. A running CLI session does not pick up a changed `providers.json`;
+start a new one. Each device's `providers.json` is tied to that device's
+pairing value, so after a re-enrollment the daemon rewrites it on the next
+apply. Discovery reports the CLI's version from the `@github/copilot` npm
+manifest next to the launcher; a standalone binary shows no version. The
+program cannot be applied with `--once`.
+
 ## Start locally, grow into a fleet
 
 Agentdesktop uses the same daemon and tool-native configuration model at every
@@ -303,6 +369,7 @@ stage.
 | OpenCode | Yes | Yes | MCP | — |
 | VS Code | Yes | — | MCP and skills | — |
 | Grok Build | Yes | System mode | MCP and skills | — |
+| GitHub Copilot CLI | Yes | User mode | — | — |
 
 > **Don't see your tool?** We're actively expanding this list and would love
 > your help. [Open an integration request](https://github.com/agentdesktop-dev/agentdesktop/issues/new)

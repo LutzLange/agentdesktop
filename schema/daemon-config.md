@@ -14,6 +14,8 @@
 |`daemon.claudeDesktop.credentialHelper`|string|Credential helper path.|
 |`daemon.codex`|object|Codex paths.|
 |`daemon.codex.config`|string|Configuration file.|
+|`daemon.copilot`|object|GitHub Copilot CLI paths (`config` = the `providers.json` to manage;<br>defaults to `COPILOT_PROVIDERS_CONFIG`, `$COPILOT_HOME/providers.json`,<br>then `~/.copilot/providers.json`).|
+|`daemon.copilot.config`|string|Configuration file.|
 |`daemon.grok`|object|Grok Build paths.|
 |`daemon.grok.config`|string|Configuration file.|
 |`daemon.llmProxy`|object|Local loopback LLM proxy.|
@@ -53,6 +55,11 @@
 |`programs.codex`|object|Codex managed configuration.|
 |`programs.codex.managedConfig`|object|Arbitrary values written to Codex's organization-managed TOML configuration.<br><br>Use Codex's native snake_case configuration keys. TOML has no null value,<br>so null values cannot be reconciled.|
 |`programs.codex.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
+|`programs.copilot`|object|GitHub Copilot CLI managed configuration.|
+|`programs.copilot.models`|object|Copilot CLI model entries, keyed by the model ID the CLI shows<br>(`copilot --model agentdesktop/<id>`).<br><br>At least one is required when a top-level `llmGateway` is configured.|
+|`programs.copilot.models.*.modelId`|string|The CLI's `modelId` for the entry. Defaults to the entry's ID. The<br>name sent to the gateway is `wireModel` when that pass-through key is<br>set, else this one.|
+|`programs.copilot.models.*.provider`|enum|Which managed provider entry serves the model.<br>Possible values: `agentdesktop`, `agentdesktop-anthropic`.|
+|`programs.copilot.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
 |`programs.grok`|object|Grok Build managed configuration.|
 |`programs.grok.managedConfig`|object|Arbitrary values written to Grok's organization-managed TOML configuration.<br><br>Use Grok's native snake_case configuration keys. TOML has no null value,<br>so null values cannot be reconciled.|
 |`programs.grok.model`|string|Catalog ID and API model used when pointing Grok at the LLM gateway.<br><br>This is required when a top-level `llmGateway` is configured. If `models`<br>is empty, agentdesktop creates a catalog entry with this ID.|
