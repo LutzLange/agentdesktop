@@ -551,4 +551,192 @@ mod tests {
             "a file the merge recreated is removed whole"
         );
     }
+
+    // --- Root-array support (PR-3a, criterion 4) ----------------------------
+    //
+    // A managed document that is itself a top-level array, keyed by `name` at
+    // the document root (`field: ""`), used by the VS Code provider's
+    // `chatLanguageModels.json`. Object-root callers (above) must keep
+    // working unchanged.
+
+    const ROOT_KEYED: &[KeyedArray] = &[KeyedArray {
+        field: "",
+        keys: &["name"],
+    }];
+
+    fn root_array_options() -> MergeOptions {
+        MergeOptions {
+            mode: 0o600,
+            keyed_arrays: ROOT_KEYED,
+            redact_diff: true,
+        }
+    }
+
+    #[test]
+    fn root_array_merge_keeps_user_entries_and_replaces_managed_entry_by_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatLanguageModels.json");
+        let state = state_path(&path);
+        let options = root_array_options();
+
+        let managed = json!([{"name": "agentdesktop", "vendor": "customendpoint"}]);
+        let plan = ReconcilePlan::default();
+        plan_merge_with(
+            &path,
+            &state,
+            managed,
+            false,
+            "chat models",
+            "Test",
+            options,
+            &plan,
+        )
+        .unwrap();
+        plan.apply().unwrap();
+
+        let mut document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(document.is_array(), "managed document must stay an array");
+        // The user hand-adds their own vendor entry.
+        document
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "user-vendor"}));
+        std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        // Re-apply with an edited managed entry: replaced by key, not
+        // duplicated; the user's entry survives.
+        let managed = json!([{"name": "agentdesktop", "vendor": "customendpoint", "apiType": "chat-completions"}]);
+        let plan = ReconcilePlan::default();
+        plan_merge_with(
+            &path,
+            &state,
+            managed,
+            false,
+            "chat models",
+            "Test",
+            options,
+            &plan,
+        )
+        .unwrap();
+        plan.apply().unwrap();
+
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let array = after.as_array().unwrap();
+        assert_eq!(array.len(), 2, "{after}");
+        assert!(array.iter().any(|entry| entry["name"] == "user-vendor"));
+        let ours = array
+            .iter()
+            .find(|entry| entry["name"] == "agentdesktop")
+            .unwrap();
+        assert_eq!(ours["apiType"], "chat-completions");
+    }
+
+    #[test]
+    fn root_array_removal_strips_the_managed_entry_by_key_and_deletes_when_empty_and_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatLanguageModels.json");
+        let state = state_path(&path);
+        let options = root_array_options();
+
+        let managed = json!([{"name": "agentdesktop"}]);
+        let plan = ReconcilePlan::default();
+        plan_merge_with(
+            &path,
+            &state,
+            managed,
+            false,
+            "chat models",
+            "Test",
+            options,
+            &plan,
+        )
+        .unwrap();
+        plan.apply().unwrap();
+        assert!(path.exists());
+
+        let plan = ReconcilePlan::default();
+        assert!(plan_remove_with(&path, &state, "chat models", "Test", options, &plan).unwrap());
+        plan.apply().unwrap();
+        assert!(
+            !path.exists(),
+            "an empty root array we created must be deleted"
+        );
+    }
+
+    #[test]
+    fn root_array_removal_keeps_a_user_entry_and_the_files_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatLanguageModels.json");
+        let state = state_path(&path);
+        let options = root_array_options();
+
+        std::fs::write(&path, b"[{\"name\":\"user-vendor\"}]\n").unwrap();
+        let plan = ReconcilePlan::default();
+        plan_merge_with(
+            &path,
+            &state,
+            json!([{"name": "agentdesktop"}]),
+            false,
+            "chat models",
+            "Test",
+            options,
+            &plan,
+        )
+        .unwrap();
+        plan.apply().unwrap();
+
+        let plan = ReconcilePlan::default();
+        assert!(plan_remove_with(&path, &state, "chat models", "Test", options, &plan).unwrap());
+        plan.apply().unwrap();
+
+        assert!(
+            path.exists(),
+            "a file we did not create must not be deleted"
+        );
+        let remaining: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(remaining, json!([{"name": "user-vendor"}]));
+    }
+
+    #[test]
+    fn object_root_callers_are_unaffected_by_root_array_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        plan.apply().unwrap();
+        let document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(document.is_object(), "{document}");
+        assert_eq!(document, json!({"env": {"MANAGED": "1"}}));
+
+        let plan = ReconcilePlan::default();
+        assert!(plan_remove(&path, &state, "settings", "Test", &plan).unwrap());
+        plan.apply().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_non_array_file_is_a_conflict_when_the_managed_document_is_an_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatLanguageModels.json");
+        let state = state_path(&path);
+        std::fs::write(&path, b"42\n").unwrap();
+
+        let plan = ReconcilePlan::default();
+        plan_merge_with(
+            &path,
+            &state,
+            json!([{"name": "agentdesktop"}]),
+            false,
+            "chat models",
+            "Test",
+            root_array_options(),
+            &plan,
+        )
+        .unwrap();
+        assert!(plan.has_conflicts(), "{}", plan.render());
+        assert!(plan.apply().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"42\n");
+    }
 }
