@@ -21,8 +21,134 @@ use agentdesktop_core::config::{GitHubTokenSource, LlmGatewayConfig};
 
 use crate::api::{self, AppState};
 
-type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Incoming>;
+type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
+
+/// Largest request body the proxy buffers. Bodies are buffered so a request can
+/// be retried once with a fresh credential; LLM requests are far below this.
+const MAX_REQUEST_BODY: usize = if cfg!(test) {
+    64 * 1024
+} else {
+    32 * 1024 * 1024
+};
+/// How long to wait for the gateway's response headers. Streaming bodies have
+/// no total timeout: a long completion is normal. A non-streaming completion
+/// sends nothing until the model is done, so this also bounds those.
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a request waits for a controller credential fetch before it fails
+/// with `agentdesktop_credential` instead of hanging the tool. The fetch itself
+/// bounds its controller connection and call (remote.rs, 15 s), so it normally
+/// ends with its own error first; this outer wait covers the OAuth refresh in
+/// front of it. Applies to controller-issued credentials only: an OIDC
+/// credential may need a browser login.
+const CREDENTIAL_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// A cached controller credential is not used within this margin of its expiry.
+const CREDENTIAL_EXPIRY_MARGIN: Duration = Duration::from_secs(30);
+/// Longest a controller credential is served from the cache, counted from the
+/// gateway's first answer with it. Together with the wait for that answer this
+/// bounds how long a revoked device keeps using the proxy: revocation is
+/// enforced at issuance, the gateway validates tokens statelessly.
+const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Listener-local cache of controller-issued gateway credentials, one per client
+/// id. A controller fetch is a fresh mTLS connection and round trip; agent-mode
+/// sessions issue bursts of requests, so a short cache keeps them off the
+/// controller. The lock is never held across a fetch: a slow controller delays
+/// only the requests that need a credential, not cache hits on other routes.
+/// OIDC credentials never go through here; the secret store is their cache.
+#[derive(Default)]
+pub(crate) struct CredentialCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, CachedCredential>>,
+}
+
+struct CachedCredential {
+    credential: String,
+    /// The enrolled device the credential was issued to. A logout or a
+    /// re-enrollment changes it, and the entry is then ignored.
+    device_id: String,
+    /// Monotonic deadline (wall-clock expiry at fetch time, minus the margin,
+    /// capped by CREDENTIAL_CACHE_TTL) and the wall-clock deadline itself. Both
+    /// must be in the future: the monotonic clock does not advance across a
+    /// suspend, the wall clock can jump; neither alone is trusted.
+    valid_until: std::time::Instant,
+    valid_until_unix: u64,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl CredentialCache {
+    /// A cached credential for the key and device, if one is still valid.
+    fn get(&self, key: &str, device_id: &str) -> Option<String> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .get(key)
+            .filter(|entry| {
+                entry.device_id == device_id
+                    && std::time::Instant::now() < entry.valid_until
+                    && now_unix() < entry.valid_until_unix
+            })
+            .map(|entry| entry.credential.clone())
+    }
+
+    /// Remember a freshly fetched credential until the earlier of its expiry
+    /// margin and the cache TTL.
+    fn insert(
+        &self,
+        key: &str,
+        device_id: &str,
+        fetched: &agentdesktop_core::model::LlmGatewayCredential,
+    ) {
+        let now = now_unix();
+        let remaining = Duration::from_secs(fetched.expires_at_unix_seconds.saturating_sub(now));
+        let lifetime = remaining
+            .saturating_sub(CREDENTIAL_EXPIRY_MARGIN)
+            .min(CREDENTIAL_CACHE_TTL);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifetime > Duration::ZERO {
+            entries.insert(
+                key.to_owned(),
+                CachedCredential {
+                    credential: fetched.credential.clone(),
+                    device_id: device_id.to_owned(),
+                    valid_until: std::time::Instant::now() + lifetime,
+                    valid_until_unix: now + lifetime.as_secs(),
+                },
+            );
+        } else {
+            tracing::debug!(
+                key,
+                "controller credential already within its expiry margin; not cached"
+            );
+            entries.remove(key);
+        }
+    }
+
+    /// Drop the entry for the key if it still holds the given credential. A
+    /// concurrent request that already replaced it with a fresh one is left alone.
+    fn invalidate_if(&self, key: &str, credential: &str) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries
+            .get(key)
+            .is_some_and(|entry| entry.credential == credential)
+        {
+            entries.remove(key);
+        }
+    }
+}
 
 /// Header that carries the per-device pairing value on every route.
 pub(crate) const PAIRING_HEADER: &str = "x-agentdesktop-pairing";
@@ -170,6 +296,22 @@ pub(crate) async fn serve(
     state: AppState,
     config: ProxyConfig,
 ) -> anyhow::Result<()> {
+    serve_with_cache(
+        listener,
+        state,
+        config,
+        Arc::new(CredentialCache::default()),
+    )
+    .await
+}
+
+/// `serve` with a caller-provided credential cache (tests pre-seed it).
+pub(crate) async fn serve_with_cache(
+    listener: TcpListener,
+    state: AppState,
+    config: ProxyConfig,
+    cache: Arc<CredentialCache>,
+) -> anyhow::Result<()> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_connect_timeout(Some(Duration::from_secs(30)));
@@ -201,13 +343,15 @@ pub(crate) async fn serve(
                 let client = client.clone();
                 let state = state.clone();
                 let config = config.clone();
+                let cache = cache.clone();
                 connections.spawn(async move {
                     let service = service_fn(move |request| {
                         let client = client.clone();
                         let state = state.clone();
                         let config = config.clone();
+                        let cache = cache.clone();
                         async move {
-                            let response = match forward(request, &client, &state, &config).await {
+                            let response = match forward(request, &client, &state, &config, &cache).await {
                                 Ok(response) => response,
                                 Err(error) => {
                                     tracing::warn!(status = %error.status, code = error.code, message = %error.message, "LLM proxy request failed");
@@ -409,10 +553,11 @@ fn upstream_base(gateway: &LlmGatewayConfig, upstream: Upstream) -> &url::Url {
 }
 
 async fn forward(
-    mut request: Request<Incoming>,
+    request: Request<Incoming>,
     client: &ProxyClient,
     state: &AppState,
     config: &ProxyConfig,
+    cache: &CredentialCache,
 ) -> Result<Response<ProxyBody>, ProxyError> {
     if !host_is_loopback(request.headers()) {
         return Err(ProxyError::new(
@@ -555,6 +700,36 @@ async fn forward(
     let client_credential = bearer_or_header(request.headers(), "x-llm-token")
         .filter(|value| !constant_time_eq(value.as_bytes(), config.pairing.as_bytes()));
 
+    // Buffer the body (capped) so the request can be retried once with a fresh
+    // credential; the response is streamed as it arrives.
+    let (parts, body) = request.into_parts();
+    let body = http_body_util::Limited::new(body, MAX_REQUEST_BODY)
+        .collect()
+        .await
+        .map_err(|error| {
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                ProxyError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "body_too_large",
+                    format!(
+                        "agentdesktop proxy: request body exceeds {} bytes",
+                        MAX_REQUEST_BODY
+                    ),
+                )
+            } else {
+                ProxyError::new(
+                    StatusCode::BAD_REQUEST,
+                    "body_invalid",
+                    format!("agentdesktop proxy: could not read the request body: {error}"),
+                )
+            }
+        })?
+        .to_bytes();
+    let mut request = Request::from_parts(parts, ());
+
     strip_hop_headers(request.headers_mut());
     for header in [
         AUTHORIZATION.as_str(),
@@ -607,6 +782,7 @@ async fn forward(
             }),
         },
     };
+    let client_token_sent = upstream_token.is_some();
     if let Some(token) = upstream_token {
         let mut value = HeaderValue::from_str(&token).map_err(|_| {
             ProxyError::new(
@@ -617,23 +793,6 @@ async fn forward(
         })?;
         value.set_sensitive(true);
         request.headers_mut().insert("x-llm-token", value);
-    }
-    // Identity last: no controller or OIDC round trip for a request that was
-    // going to be refused anyway.
-    if gateway.authentication.is_some() {
-        let credential = api::gateway_credential(state, &effective, &client_id, false)
-            .await
-            .map_err(ProxyError::credential)?;
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credential.credential))
-            .map_err(|_| {
-                ProxyError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "gateway_unreachable",
-                    "invalid gateway credential header",
-                )
-            })?;
-        authorization.set_sensitive(true);
-        request.headers_mut().insert(AUTHORIZATION, authorization);
     }
     request.headers_mut().insert(
         HOST,
@@ -651,15 +810,151 @@ async fn forward(
         })?,
     );
     *request.uri_mut() = uri;
-    let mut response = client.request(request).await.map_err(|error| {
-        ProxyError::new(
-            StatusCode::BAD_GATEWAY,
-            "gateway_unreachable",
-            format!("agentdesktop proxy: gateway unreachable: {error}"),
-        )
-    })?;
-    strip_hop_headers(response.headers_mut());
-    Ok(response.map(BodyExt::boxed))
+    // Identity last: no controller or OIDC round trip for a request that was
+    // going to be refused anyway. Controller credentials are cached per client
+    // id; on a 401 from the gateway the request is sent once more with a fresh
+    // credential, which covers a token that expired between fetch and use.
+    let authenticated = gateway.authentication.is_some();
+    let controller_issued = matches!(
+        gateway.authentication,
+        Some(agentdesktop_core::config::LlmGatewayAuthentication::ControllerJwt { .. })
+    );
+    // Only controller-issued credentials are cached, keyed by client id,
+    // gateway and audience, and tagged with the enrolled device so a logout or
+    // re-enrollment (a different identity.json) never reuses an old token. The
+    // device id is read from identity.json alone; the secret store is not opened.
+    let cache_key = match &gateway.authentication {
+        Some(agentdesktop_core::config::LlmGatewayAuthentication::ControllerJwt {
+            audience,
+            ..
+        }) => crate::identity::load_device_id(&state.state_dir.join("identity.json"))
+            .ok()
+            .flatten()
+            .map(|device_id| {
+                (
+                    format!("{client_id}\u{0}{}\u{0}{audience}", gateway.url),
+                    device_id,
+                )
+            }),
+        _ => None,
+    };
+    let mut retried = false;
+    loop {
+        let mut attempt =
+            Request::from_parts(request.clone().into_parts().0, Full::new(body.clone()));
+        let mut from_cache = false;
+        // A credential fetched for this attempt; cached only once the gateway
+        // has not rejected it, so a bad token is never handed to later requests.
+        let mut fetched_now: Option<agentdesktop_core::model::LlmGatewayCredential> = None;
+        let mut attempt_credential: Option<String> = None;
+        if authenticated {
+            let cached = cache_key
+                .as_ref()
+                .and_then(|(key, device_id)| cache.get(key, device_id));
+            let credential = match cached {
+                Some(credential) => {
+                    from_cache = true;
+                    credential
+                }
+                None => {
+                    // The fetch runs on its own task so a client disconnect or the
+                    // wait below does not cancel it half-way (an OAuth refresh must
+                    // finish and be stored). The fetch bounds its own controller
+                    // call, so a detached fetch ends by itself; an OIDC acquisition
+                    // may wait for a browser login and is not bounded.
+                    let fetch = {
+                        let state = state.clone();
+                        let effective = effective.clone();
+                        let client_id = client_id.clone();
+                        tokio::spawn(async move {
+                            api::gateway_credential(&state, &effective, &client_id, false).await
+                        })
+                    };
+                    let outcome = if controller_issued {
+                        tokio::time::timeout(CREDENTIAL_FETCH_TIMEOUT, fetch)
+                            .await
+                            .map_err(|_| {
+                                ProxyError::credential((
+                                    StatusCode::GATEWAY_TIMEOUT,
+                                    "the credential fetch (token refresh or controller call) did not finish in time".to_owned(),
+                                ))
+                            })?
+                    } else {
+                        fetch.await
+                    };
+                    let fetched = outcome
+                        .map_err(|error| {
+                            ProxyError::credential((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("credential fetch failed: {error}"),
+                            ))
+                        })?
+                        .map_err(ProxyError::credential)?;
+                    let credential = fetched.credential.clone();
+                    fetched_now = Some(fetched);
+                    credential
+                }
+            };
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {credential}"))
+                .map_err(|_| {
+                    ProxyError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "gateway_unreachable",
+                        "invalid gateway credential header",
+                    )
+                })?;
+            authorization.set_sensitive(true);
+            attempt.headers_mut().insert(AUTHORIZATION, authorization);
+            attempt_credential = Some(credential);
+        }
+        let response = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, client.request(attempt))
+            .await
+            .map_err(|_| {
+                ProxyError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "gateway_timeout",
+                    "agentdesktop proxy: the gateway did not answer in time",
+                )
+            })?
+            .map_err(|error| {
+                ProxyError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "gateway_unreachable",
+                    format!("agentdesktop proxy: gateway unreachable: {error}"),
+                )
+            })?;
+        // Retry only when the rejected credential came from the cache and no
+        // client token was forwarded: a freshly fetched credential that is
+        // rejected would be rejected again, and with a client token in
+        // x-llm-token the 401 may be about that token, not the gateway identity
+        // (the cached gateway credential is then kept: dropping it on every
+        // client-token 401 would turn a bad client token into a controller
+        // fetch per request).
+        if response.status() == StatusCode::UNAUTHORIZED
+            && from_cache
+            && !client_token_sent
+            && !retried
+        {
+            tracing::info!(
+                client_id,
+                "gateway rejected a cached credential; retrying once with a fresh one"
+            );
+            if let Some((key, _)) = &cache_key {
+                let rejected = attempt_credential.as_deref().unwrap_or_default();
+                cache.invalidate_if(key, rejected);
+            }
+            retried = true;
+            continue;
+        }
+        if response.status() != StatusCode::UNAUTHORIZED
+            && let (Some(fetched), Some((key, device_id))) = (&fetched_now, &cache_key)
+        {
+            cache.insert(key, device_id, fetched);
+        }
+        let mut response = response;
+        strip_hop_headers(response.headers_mut());
+        return Ok(response.map(BodyExt::boxed));
+    }
 }
 
 fn strip_hop_headers(headers: &mut HeaderMap) {
@@ -1449,6 +1744,401 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // The retry applies only to a credential served from the cache. OIDC
+    // credentials are never cached, so a 401 from the gateway is returned as is
+    // after a single attempt, with the buffered body delivered once. The cached
+    // path is covered by `cached_credential_is_used_and_dropped_on_401` below.
+    #[tokio::test]
+    async fn uncached_credentials_are_not_retried_on_401() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = attempts.clone();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = upstream.accept().await.unwrap();
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(socket),
+                                service_fn(move |request: Request<Incoming>| {
+                                    let seen = seen.clone();
+                                    async move {
+                                        let n =
+                                            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        assert_eq!(
+                                            request.headers()[AUTHORIZATION],
+                                            "Bearer identity"
+                                        );
+                                        let body =
+                                            request.into_body().collect().await.unwrap().to_bytes();
+                                        assert_eq!(body, "{\"n\":1}");
+                                        // One attempt per client request: the first
+                                        // is answered 401, the second 200.
+                                        let status = if n == 1 {
+                                            StatusCode::OK
+                                        } else {
+                                            StatusCode::UNAUTHORIZED
+                                        };
+                                        Ok::<_, Infallible>(
+                                            Response::builder()
+                                                .status(status)
+                                                .body(Full::new(Bytes::from_static(b"upstream")))
+                                                .unwrap(),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+            let (dir, state) = request_source_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = || {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{proxy_address}/chat/completions"))
+                    .header(PAIRING_HEADER, PAIRING)
+                    .header(AUTHORIZATION, "Bearer tid=from-client")
+                    .body(Full::new(Bytes::from_static(b"{\"n\":1}")))
+                    .unwrap()
+            };
+            let response = client.request(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let response = client.request(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // A pre-seeded cache stands in for a controller: the proxy sends the cached
+    // credential; when the gateway accepts it the entry stays; when the gateway
+    // rejects it the entry is dropped and the request is retried, which here
+    // needs a controller that does not exist, so the client gets
+    // `agentdesktop_credential` and the gateway saw the body exactly once.
+    #[tokio::test]
+    async fn cached_credential_is_used_and_dropped_on_401() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            type Seen = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+            let seen: Seen = Arc::default();
+            let record = seen.clone();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = upstream.accept().await.unwrap();
+                    let record = record.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(socket),
+                                service_fn(move |request: Request<Incoming>| {
+                                    let record = record.clone();
+                                    async move {
+                                        let authorization = request
+                                            .headers()
+                                            .get(AUTHORIZATION)
+                                            .and_then(|v| v.to_str().ok())
+                                            .unwrap_or("")
+                                            .to_owned();
+                                        let body = request
+                                            .into_body()
+                                            .collect()
+                                            .await
+                                            .unwrap()
+                                            .to_bytes()
+                                            .to_vec();
+                                        let status = if authorization == "Bearer good" {
+                                            StatusCode::OK
+                                        } else {
+                                            StatusCode::UNAUTHORIZED
+                                        };
+                                        record.lock().unwrap().push((authorization, body));
+                                        Ok::<_, Infallible>(
+                                            Response::builder()
+                                                .status(status)
+                                                .body(Full::new(Bytes::from_static(b"{}")))
+                                                .unwrap(),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+            let (dir, state) = controller_jwt_state(address, false).await;
+            let cache = Arc::new(CredentialCache::default());
+            let key = format!("copilot-cli\u{0}http://{address}/\u{0}agentgateway");
+            let issued = |value: &str| agentdesktop_core::model::LlmGatewayCredential {
+                credential: value.to_owned(),
+                expires_at_unix_seconds: now_unix() + 600,
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve_with_cache(
+                listener,
+                state,
+                default_config(),
+                cache.clone(),
+            ));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = |body: &'static [u8]| {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "http://{proxy_address}/copilot-cli/v1/chat/completions"
+                    ))
+                    .header(PAIRING_HEADER, PAIRING)
+                    .body(Full::new(Bytes::from_static(body)))
+                    .unwrap()
+            };
+            // Accepted: served from the cache, entry kept.
+            cache.insert(&key, "device-test", &issued("good"));
+            let response = client.request(request(b"{\"n\":1}")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(cache.get(&key, "device-test").as_deref(), Some("good"));
+            // Rejected: entry dropped, one retry that needs a controller.
+            cache.insert(&key, "device-test", &issued("stale"));
+            let (status, code) =
+                error_code(client.request(request(b"{\"n\":2}")).await.unwrap()).await;
+            assert_eq!(code, "agentdesktop_credential", "{status}");
+            assert_eq!(cache.get(&key, "device-test"), None);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![
+                    ("Bearer good".to_owned(), b"{\"n\":1}".to_vec()),
+                    ("Bearer stale".to_owned(), b"{\"n\":2}".to_vec()),
+                ],
+                "each body reaches the gateway exactly once per attempt"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // With a client token forwarded (prefix-less route, githubOAuth source
+    // request) a 401 is returned as is: no retry, and the cached gateway
+    // credential is kept.
+    #[tokio::test]
+    async fn client_token_401_is_not_retried_and_keeps_the_cached_credential() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = attempts.clone();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = upstream.accept().await.unwrap();
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(socket),
+                                service_fn(move |request: Request<Incoming>| {
+                                    let seen = seen.clone();
+                                    async move {
+                                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        assert_eq!(
+                                            request.headers()[AUTHORIZATION],
+                                            "Bearer cached"
+                                        );
+                                        assert_eq!(request.headers()["x-llm-token"], "tid=bad");
+                                        Ok::<_, Infallible>(
+                                            Response::builder()
+                                                .status(StatusCode::UNAUTHORIZED)
+                                                .body(Full::new(Bytes::from_static(b"{}")))
+                                                .unwrap(),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+            let (dir, state) = controller_jwt_state(address, true).await;
+            let cache = Arc::new(CredentialCache::default());
+            let key = format!("vscode\u{0}http://{address}/\u{0}agentgateway");
+            cache.insert(
+                &key,
+                "device-test",
+                &agentdesktop_core::model::LlmGatewayCredential {
+                    credential: "cached".to_owned(),
+                    expires_at_unix_seconds: now_unix() + 600,
+                },
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve_with_cache(
+                listener,
+                state,
+                default_config(),
+                cache.clone(),
+            ));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/chat/completions"))
+                .header(PAIRING_HEADER, PAIRING)
+                .header(AUTHORIZATION, "Bearer tid=bad")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(cache.get(&key, "device-test").as_deref(), Some("cached"));
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // Controller-JWT state with an identity.json but no controller configured:
+    // the device id is readable for the cache key, a fetch fails at once
+    // ("requires a controller"), so no timeout is involved.
+    async fn controller_jwt_state(
+        address: std::net::SocketAddr,
+        client_token: bool,
+    ) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("identity.json"),
+            serde_json::json!({
+                "deviceId": "device-test",
+                "clientCertificatePem": "",
+                "clientCertificateExpiresAtUnixSeconds": 4_000_000_000u64,
+                "oauthTokenEndpoint": "https://controller.example/token",
+                "oauthClientId": "device",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let github = if client_token {
+            "  githubOAuth:\n    source: request\n"
+        } else {
+            ""
+        };
+        let config = parse_daemon(&format!(
+            "llmGateway:\n  url: http://{address}\n{github}  authentication:\n    type: controllerJwt\n    audience: agentgateway\n    allowedClientIds: [copilot-cli, vscode]\n"
+        )).unwrap();
+        let (_, discovery) = watch::channel(Arc::new(Discovery {
+            agents: vec![],
+            model_runtimes: vec![],
+        }));
+        let state = AppState {
+            config,
+            daemon_info: DaemonInfo {
+                version: "test".into(),
+                scope: DaemonScope::User,
+                config_path: String::new(),
+                state_directory: String::new(),
+                inventory_interval: Duration::from_secs(60),
+                controller: None,
+                llm_proxy: None,
+            },
+            discovery,
+            enrollment: EnrollmentState::new(false),
+            state_dir: dir.path().to_owned(),
+            oidc_callback_listen: None,
+            telemetry: None,
+            logout: None,
+        };
+        (dir, state)
+    }
+
+    #[tokio::test]
+    async fn refuses_a_body_over_the_cap_with_a_json_error() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (dir, state) = request_source_state(upstream.local_addr().unwrap()).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/chat/completions"))
+                .header(PAIRING_HEADER, PAIRING)
+                .header(AUTHORIZATION, "Bearer tid=from-client")
+                .body(Full::new(Bytes::from(vec![b'x'; MAX_REQUEST_BODY + 1])))
+                .unwrap();
+            assert_eq!(
+                error_code(client.request(request).await.unwrap()).await,
+                (StatusCode::PAYLOAD_TOO_LARGE, "body_too_large".to_owned())
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn credential_cache_honours_device_ttl_and_invalidation() {
+        let cache = CredentialCache::default();
+        let far = now_unix() + 600;
+        let issued = |value: &str, expires: u64| agentdesktop_core::model::LlmGatewayCredential {
+            credential: value.to_owned(),
+            expires_at_unix_seconds: expires,
+        };
+        cache.insert("k", "device-1", &issued("one", far));
+        assert_eq!(cache.get("k", "device-1").as_deref(), Some("one"));
+        assert_eq!(
+            cache.get("k", "device-2"),
+            None,
+            "another device never sees it"
+        );
+        assert_eq!(cache.get("other", "device-1"), None);
+        cache.invalidate_if("k", "someone-else");
+        assert_eq!(
+            cache.get("k", "device-1").as_deref(),
+            Some("one"),
+            "a different credential leaves the entry alone"
+        );
+        cache.invalidate_if("k", "one");
+        assert_eq!(cache.get("k", "device-1"), None);
+        // Already within the expiry margin: not cached at all.
+        cache.insert("m", "device-1", &issued("m1", now_unix() + 10));
+        assert_eq!(cache.get("m", "device-1"), None);
+        // Lifetime is capped by the TTL, not the token's own expiry.
+        cache.insert("t", "device-1", &issued("t1", far));
+        let entries = cache.entries.lock().unwrap();
+        let entry = &entries["t"];
+        assert!(entry.valid_until <= std::time::Instant::now() + CREDENTIAL_CACHE_TTL);
+        assert!(entry.valid_until_unix <= now_unix() + CREDENTIAL_CACHE_TTL.as_secs());
     }
 
     async fn request_source_state(address: std::net::SocketAddr) -> (tempfile::TempDir, AppState) {
