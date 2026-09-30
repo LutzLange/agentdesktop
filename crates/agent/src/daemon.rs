@@ -81,6 +81,12 @@ struct ResolvedDaemonArgs {
     codex: ResolvedToolConfigPath,
     open_code: ResolvedOpenCodeStartupConfig,
     grok: ResolvedToolConfigPath,
+    /// The Copilot CLI providers file; `None` in system mode (user-only program).
+    copilot_providers: Option<PathBuf>,
+    /// VS Code's `chatLanguageModels.json`; `None` in system mode (user-only program).
+    vscode_chat_models: Option<PathBuf>,
+    /// VS Code's user `settings.json`; `None` in system mode (user-only program).
+    vscode_settings: Option<PathBuf>,
     once: bool,
     dry_run: bool,
 }
@@ -131,6 +137,20 @@ impl DaemonArgs {
         if llm_proxy_listen.is_some() && !config::valid_client_id(&llm_proxy_client_id) {
             bail!("invalid daemon.llmProxy.clientId");
         }
+        // VS Code's chatLanguageModels.json and settings.json live in the
+        // user's own profile, like the Copilot CLI providers file: a system
+        // daemon has no user file to manage, so an explicit override is
+        // rejected up front.
+        if !user
+            && let Some(field) = [
+                ("config", startup.vscode.config.is_some()),
+                ("settings", startup.vscode.settings.is_some()),
+            ]
+            .into_iter()
+            .find_map(|(field, set)| set.then_some(field))
+        {
+            bail!("daemon.vscode.{field} requires --user (or daemon.user: true)");
+        }
         if !user {
             return Ok(ResolvedDaemonArgs {
                 user: false,
@@ -180,6 +200,14 @@ impl DaemonArgs {
                         .config
                         .unwrap_or_else(reconcile::default_grok_managed_config_path),
                 },
+                copilot_providers: {
+                    if startup.copilot.config.is_some() {
+                        bail!("daemon.copilot.config requires --user (or daemon.user: true)");
+                    }
+                    None
+                },
+                vscode_chat_models: None,
+                vscode_settings: None,
                 once: self.once || self.dry_run,
                 dry_run: self.dry_run,
             });
@@ -250,6 +278,22 @@ impl DaemonArgs {
                         .join("managed_config.toml")
                 }),
             },
+            copilot_providers: Some(match startup.copilot.config {
+                Some(path) => path,
+                None => reconcile::default_copilot_providers_path()?,
+            }),
+            vscode_chat_models: Some(
+                startup
+                    .vscode
+                    .config
+                    .unwrap_or_else(|| reconcile::default_vscode_chat_models_path(&home)),
+            ),
+            vscode_settings: Some(
+                startup
+                    .vscode
+                    .settings
+                    .unwrap_or_else(|| reconcile::default_vscode_settings_path(&home)),
+            ),
             once: self.once || self.dry_run,
             dry_run: self.dry_run,
         })
@@ -371,6 +415,9 @@ where
         args.open_code.config.clone(),
         args.open_code.plugin.clone(),
         args.grok.config.clone(),
+        args.copilot_providers.clone(),
+        args.vscode_chat_models.clone(),
+        args.vscode_settings.clone(),
         agentdesktop_client_executable()?,
         socket.clone(),
     )
@@ -856,6 +903,16 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
     if !config.telemetry.events.is_empty() {
         bail!("--once cannot collect telemetry because hooks require the daemon to remain running");
     }
+    if config.programs.copilot.is_some() {
+        bail!(
+            "--once cannot manage the GitHub Copilot CLI providers file because its local proxy requires the daemon to remain running"
+        );
+    }
+    if config.programs.vscode.is_some() {
+        bail!(
+            "--once cannot manage the VS Code chatLanguageModels.json and settings.json files because their local proxy requires the daemon to remain running"
+        );
+    }
     let authenticated_gateway_is_used = config
         .llm_gateway
         .as_ref()
@@ -884,6 +941,16 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
             config
                 .programs
                 .grok
+                .as_ref()
+                .is_some_and(|program| program.use_llm_gateway),
+            config
+                .programs
+                .copilot
+                .as_ref()
+                .is_some_and(|program| program.use_llm_gateway),
+            config
+                .programs
+                .vscode
                 .as_ref()
                 .is_some_and(|program| program.use_llm_gateway),
         ]
@@ -1608,6 +1675,48 @@ telemetry:
     }
 
     #[test]
+    fn one_shot_rejects_the_copilot_program() {
+        let copilot = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  copilot:
+    models:
+      gpt-4.1: {}
+"#,
+        )
+        .unwrap();
+        assert!(
+            validate_one_shot(&copilot)
+                .unwrap_err()
+                .to_string()
+                .contains("Copilot")
+        );
+    }
+
+    #[test]
+    fn one_shot_rejects_the_vscode_program() {
+        let vscode = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  vscode:
+    models:
+      gpt-4.1-mini: {}
+"#,
+        )
+        .unwrap();
+        assert!(
+            validate_one_shot(&vscode)
+                .unwrap_err()
+                .to_string()
+                .contains("VS Code")
+        );
+    }
+
+    #[test]
     fn dry_run_rejects_controller_managed_configuration() {
         let managed = parse_daemon(
             r#"
@@ -1658,6 +1767,45 @@ programs:
         let mut startup = config::DaemonStartupConfig::default();
         startup.llm_proxy.listen = Some(listen.parse().unwrap());
         startup
+    }
+
+    #[test]
+    fn system_mode_rejects_a_copilot_providers_path() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.copilot.config = Some(PathBuf::from("/tmp/providers.json"));
+        let error = resolve_error(daemon_args(false), startup);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.copilot.config requires --user"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn system_mode_rejects_a_vscode_settings_path() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.vscode.settings = Some(PathBuf::from("/tmp/settings.json"));
+        let error = resolve_error(daemon_args(false), startup);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.vscode.settings requires --user"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn system_mode_rejects_a_vscode_chat_models_path() {
+        let mut startup = config::DaemonStartupConfig::default();
+        startup.vscode.config = Some(PathBuf::from("/tmp/chatLanguageModels.json"));
+        let error = resolve_error(daemon_args(false), startup);
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.vscode.config requires --user"),
+            "{error:#}"
+        );
     }
 
     #[test]
