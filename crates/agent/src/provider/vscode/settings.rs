@@ -13,6 +13,7 @@ use std::{
 
 use agentdesktop_core::config::{LlmGatewayConfig, VsCodeConfig, VsCodeCopilotChat};
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -52,6 +53,120 @@ pub(super) fn managed_settings(listen: SocketAddr, pairing: &str) -> Value {
         OVERRIDE_KEY: override_url(listen, pairing),
         IGNORED_SETTINGS_KEY: [OVERRIDE_KEY, CAPI_ALIAS_KEY],
     })
+}
+
+// --- In-place JSONC edit (specs/PR-3c.md) -------------------------------
+//
+// `edit_settings`/`remove_settings` are the pure, filesystem-free core of the
+// in-place edit: a lossless CST edit (`jsonc-parser`) of the user's own text,
+// touching only the override key and the two `settingsSync.ignoredSettings`
+// entries, plus the v2 sidecar that carries what removal must restore. The
+// writer wires these into `plan`/`remove` in place of `json_merge`; this
+// module is the interface contract's compile-only stub for the test author's
+// spec-derived baseline (specs/PR-3c.md, "Interface contract for the test
+// author"): `edit_settings`, `remove_settings` and `read_state` `todo!()`.
+
+/// Why `edit_settings`/`remove_settings` refuse to touch the file (AC2/AC3):
+/// anything beyond VS Code's own JSONC (comments, trailing commas), a
+/// non-object root, `settingsSync.ignoredSettings` present and not an array,
+/// or the override key or `settingsSync.ignoredSettings` appearing more than
+/// once at the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsConflict {
+    Parse,
+    NotAnObject,
+    IgnoredNotArray,
+    DuplicateKey,
+}
+
+/// The v2 sidecar (AC4): what removal must restore, without a whole-document
+/// snapshot. `override_before` keeps an explicit JSON `null` as
+/// `Some(Value::Null)`, distinct from the key being absent (`None`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SettingsState {
+    pub version: u32,
+    pub created: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "some_or_explicit_null"
+    )]
+    pub override_before: Option<Value>,
+    pub added_ignored: Vec<String>,
+    pub ignored_created: bool,
+}
+
+/// A present-but-`null` field deserializes to `Some(Value::Null)`; an absent
+/// field is left at its `#[serde(default)]` (`None`) by serde before this
+/// function is ever called.
+fn some_or_explicit_null<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// The current sidecar version `edit_settings`/`remove_settings` write
+/// (AC4); a sidecar without this shape (PR 3b's `MergeState`, no `version`)
+/// is upgraded by `read_state` (AC7).
+pub(super) const SETTINGS_STATE_VERSION: u32 = 2;
+
+/// The outcome of `remove_settings` (AC5): the removal may be a no-op text
+/// (`Unchanged`; distinct from an unchanged `edit_settings`, which returns the
+/// new text unconditionally), rewritten text, or the whole file going away
+/// (a file this daemon created that reduces to nothing but whitespace once
+/// the managed keys are taken out).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Removal {
+    Unchanged,
+    Write(String),
+    Delete,
+}
+
+/// In-place JSONC edit of `settings.json` (AC1-AC4): `text: None` is an
+/// absent file (created as the golden text); an empty or whitespace-only
+/// file is treated as `{}`. Sets the override to `url` (`set_value` in place
+/// when the key exists, `append`ed otherwise) and ensures
+/// `settingsSync.ignoredSettings` holds both `OVERRIDE_KEY` and
+/// `CAPI_ALIAS_KEY`, creating the array when absent and appending only the
+/// missing entries, user entries kept in order. `state` is the previous
+/// sidecar (`None` on a first apply or when it could not be read, AC6); the
+/// returned `SettingsState` is what removal needs afterwards.
+pub(super) fn edit_settings(
+    text: Option<&str>,
+    url: &str,
+    state: Option<&SettingsState>,
+) -> Result<(String, SettingsState), SettingsConflict> {
+    let _ = (text, url, state);
+    todo!("writer: in-place JSONC edit of settings.json (specs/PR-3c.md AC1-AC4, AC6, AC7)")
+}
+
+/// In-place JSONC removal of the managed keys (AC5-AC7): the override is
+/// restored to `state.override_before` (`set_value` when the property still
+/// exists, appended when the user deleted it meanwhile, removed when there
+/// was none); `state.added_ignored` entries are taken out of
+/// `settingsSync.ignoredSettings`; the array property itself is removed when
+/// `state.ignored_created` and it is now empty. Without a sidecar
+/// (`state: None`), `own_url` is the daemon's own current override URL: an
+/// override equal to it, and the two well-known entries, are removed by
+/// value; an unparseable file is `Ok(Unchanged)` (not a conflict, matching
+/// today's `plan_remove_orphaned`, settings.rs:157-163).
+pub(super) fn remove_settings(
+    text: &str,
+    state: Option<&SettingsState>,
+    own_url: Option<&str>,
+) -> Result<Removal, SettingsConflict> {
+    let _ = (text, state, own_url);
+    todo!("writer: in-place JSONC removal of settings.json (specs/PR-3c.md AC5-AC7)")
+}
+
+/// Reads a sidecar (v2, or PR 3b's `MergeState` upgraded per AC7); `None`
+/// when the bytes are not one of those two shapes (AC6: a warning, not a
+/// hard error, at the call site).
+pub(super) fn read_state(bytes: &[u8]) -> Option<SettingsState> {
+    let _ = bytes;
+    todo!("writer: v2 sidecar read, v1 MergeState upgraded (specs/PR-3c.md AC7)")
 }
 
 fn options() -> json_merge::MergeOptions {

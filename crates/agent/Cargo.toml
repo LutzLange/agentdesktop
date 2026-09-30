@@ -35,6 +35,7 @@ hyper-rustls.workspace = true
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
 http-body-util.workspace = true
 json5.workspace = true
+jsonc-parser.workspace = true
 memchr.workspace = true
 open.workspace = true
 rand.workspace = true
