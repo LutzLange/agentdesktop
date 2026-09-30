@@ -133,6 +133,33 @@ The incoming path and query are appended to the gateway base URL: with
 `llmGateway.proxyUrl: https://gateway.example/prefix` (or `url`, when `proxyUrl`
 is unset), `/v1/messages` goes to `https://gateway.example/prefix/v1/messages`.
 Avoid repeating `/v1` in both URLs.
+
+**Without the proxy.** When the daemon runs without its loopback proxy
+(`daemon.llmProxy.listen` unset, or the address could not be bound),
+`llmGateway.whenProxyUnavailable` decides what happens to the files of the
+programs that use the proxy (`programs.copilot`, `programs.vscode`). With
+`failClosed`, the default, the daemon leaves their managed entries as they
+are: the Copilot CLI and VS Code stay pointed at the loopback port, and those
+requests fail instead of reaching GitHub past the gateway. If the address could
+not be bound because another process holds it, that process receives those
+requests, with VS Code's Copilot tokens and the pairing value: use the default
+on devices with a single user, as for the proxy in general. With
+`failOpen`, the daemon removes the entries until the proxy is back: VS Code on
+GitHub's models then talks to GitHub directly, and the Copilot CLI and VS Code
+on own models lose the gateway's models. Either way the programs report
+`inactive` with the reason, and the next apply with the proxy writes the
+current entries. A stopped daemon changes no file, so the tools fail until it
+runs again, whatever the policy. The policy covers only the files the daemon
+writes: whether developers can reach GitHub's models without the gateway is
+set by the organisation's Copilot policy and egress rules. Set the key only
+after the controller and the daemons run a version that knows it; older ones
+reject a configuration that carries it.
+
+```yaml
+llmGateway:
+  url: https://gateway.example.com
+  whenProxyUnavailable: failOpen   # default failClosed
+```
 The proxy does not discover models or rewrite model IDs; configure those in the
 client. VS Code's built-in **Custom Endpoint** provider can use this endpoint
 without the experimental extension in `vscode/`. The provider reads
@@ -271,6 +298,14 @@ device authorization again. Non-expiring App user tokens are also supported.
 Request bodies remain untouched. The existing Claude credential-helper flow is
 unchanged; the local proxy always uses the gateway identity in `Authorization`.
 
+### GitHub Copilot: a runnable example
+
+[`examples/copilot`](examples/copilot/README.md) runs Dex and Agentgateway
+locally and walks through the Copilot CLI, VS Code on the gateway's models and
+VS Code on GitHub's models, with what to check at each step (drift,
+conflicts, removal) and the settings the GitHub organisation owner controls
+([`examples/copilot/github-side.md`](examples/copilot/github-side.md)).
+
 ### Managed program: GitHub Copilot CLI
 
 `programs.copilot` makes the daemon write the Copilot CLI's BYOK provider
@@ -317,8 +352,9 @@ away; entries with another pairing value are left alone. The file is written own
 daemon's sidecar next to it (`.providers.json.agentdesktop`, owner-only) keeps
 a copy of the file as last written, including the user's own providers and
 their `apiKey` values, until the next apply. Removing
-`programs.copilot`, setting `useLlmGateway: false`, or running without the
-proxy takes the managed entries out again and restores the user's file with
+`programs.copilot` or setting `useLlmGateway: false` takes the managed
+entries out again (running without the proxy depends on
+`llmGateway.whenProxyUnavailable`, see **Without the proxy**) and restores the user's file with
 its previous mode (deleted only if the daemon created it and nothing else is
 left).
 
@@ -493,11 +529,14 @@ single-quoted string; the top level is not an object;
 leaves the file untouched and blocks every managed file on the device until it
 is resolved (and stops the daemon at startup); fix the file in VS Code and
 re-apply (with `daemon.reconcileInterval` set, the next tick applies it). Removal (program
-absent, `ownModels`, `useLlmGateway: false`, no gateway, no `proxyUrl`, or no
-proxy, with a warning) takes the key and the two entries out and deletes the
-file only if the daemon created it. Restart VS Code after an apply that changes
+absent, `ownModels`, `useLlmGateway: false`, no gateway, or no `proxyUrl`)
+takes the key and the two entries out and deletes the file only if the daemon
+created it. Without the proxy, `llmGateway.whenProxyUnavailable` decides (see
+**Without the proxy** above): the default keeps the override, so Copilot Chat
+fails instead of reaching GitHub directly. Restart VS Code after an apply that changes
 the file (first apply, re-pairing after a re-enrollment). There is no
-`--dry-run` preview: a dry run has no proxy and plans a removal; `--once`
+`--dry-run` preview: a dry run has no proxy, so it lists nothing for this file
+under `failClosed` and the removal under `failOpen`; `--once`
 refuses the program.
 
 Caveats. `github.copilot.advanced.debug.overrideCapiUrl` is an undocumented
@@ -625,7 +664,7 @@ device-wide state. The device page in the controller lists them under
 | `unchanged` | The program is configured and nothing needed to change. |
 | `removed` | The program is no longer configured and its managed content was removed. |
 | `conflict` | A managed file holds configuration the daemon will not overwrite; the detail names the file. |
-| `inactive` | The program uses the LLM gateway but the local LLM proxy is not running (see `llmProxy.error` in daemon-info), so its files point nowhere and were removed. |
+| `inactive` | The program uses the LLM gateway but the local LLM proxy is not running (see `llmProxy.error` in daemon-info): its entries were left pointing at the loopback port (`whenProxyUnavailable: failClosed`, the default) or removed (`failOpen`). |
 | `blocked` | The program had changes, but none were written because another program conflicted or failed; the detail names that program. |
 | `failed` | Planning or writing this program failed; the detail carries the error. |
 

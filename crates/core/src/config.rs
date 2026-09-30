@@ -252,6 +252,35 @@ pub struct LlmGatewayConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub github_oauth: Option<GitHubOAuthConfig>,
+    /// What the programs behind the local LLM proxy (`programs.copilot`,
+    /// `programs.vscode`) do while the daemon runs without that proxy:
+    /// `failClosed` (the default) leaves their managed entries in place, so
+    /// the tools stay pointed at the loopback port and fail instead
+    /// of falling back to GitHub past the gateway; `failOpen` removes them
+    /// until the proxy is back (VS Code on `githubModels` then talks to GitHub
+    /// directly, the Copilot CLI and VS Code on `ownModels` lose the gateway's
+    /// models).
+    #[serde(default, skip_serializing_if = "ProxyUnavailable::is_default")]
+    pub when_proxy_unavailable: ProxyUnavailable,
+}
+
+/// The `llmGateway.whenProxyUnavailable` policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyUnavailable {
+    /// Keep the managed entries: the tools fail instead of bypassing the
+    /// gateway.
+    #[default]
+    FailClosed,
+    /// Remove the managed entries until the proxy is back.
+    FailOpen,
+}
+
+impl ProxyUnavailable {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// GitHub App user authorization for Copilot requests through the local proxy.

@@ -354,6 +354,19 @@ export const activeDaemonConfig: DaemonConfigDocument = {
   },
 };
 
+export const copilotFailOpenDaemonConfig: DaemonConfigDocument = {
+  llmGateway: {
+    url: "https://gateway.example.internal",
+    proxyUrl: "https://gateway.example.internal/copilot-proxy",
+    whenProxyUnavailable: "failOpen",
+    authentication: { type: "controllerJwt", audience: "agentgateway" },
+  },
+  programs: {
+    copilot: { models: { "gpt-4.1": {} } },
+    vscode: { copilotChat: "githubModels" },
+  },
+};
+
 export const sandboxDaemonConfig: DaemonConfigDocument = {
   sandbox: {
     network: {

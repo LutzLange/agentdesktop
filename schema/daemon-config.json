@@ -483,6 +483,10 @@
         "url": {
           "description": "Base HTTP or HTTPS URL of the LLM gateway.\n\nThe URL must include a host and cannot include credentials, a query, or a fragment.",
           "type": "string"
+        },
+        "whenProxyUnavailable": {
+          "description": "What the programs behind the local LLM proxy (`programs.copilot`,\n`programs.vscode`) do while the daemon runs without that proxy:\n`failClosed` (the default) leaves their managed entries in place, so\nthe tools stay pointed at the loopback port and fail instead\nof falling back to GitHub past the gateway; `failOpen` removes them\nuntil the proxy is back (VS Code on `githubModels` then talks to GitHub\ndirectly, the Copilot CLI and VS Code on `ownModels` lose the gateway's\nmodels).",
+          "$ref": "#/$defs/ProxyUnavailable"
         }
       },
       "additionalProperties": false,
@@ -653,6 +657,21 @@
         }
       },
       "additionalProperties": false
+    },
+    "ProxyUnavailable": {
+      "description": "The `llmGateway.whenProxyUnavailable` policy.",
+      "oneOf": [
+        {
+          "description": "Keep the managed entries: the tools fail instead of bypassing the\ngateway.",
+          "type": "string",
+          "const": "failClosed"
+        },
+        {
+          "description": "Remove the managed entries until the proxy is back.",
+          "type": "string",
+          "const": "failOpen"
+        }
+      ]
     },
     "SandboxConfig": {
       "description": "Local execution restrictions applied to managed developer tools.",
