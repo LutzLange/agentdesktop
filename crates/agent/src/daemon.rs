@@ -586,7 +586,7 @@ fn attach_llm_proxy_pairing(
 /// failure is logged and reported as `bound: false` rather than propagated:
 /// the proxy is optional, the rest of the daemon is not.
 ///
-/// Invariant for callers: this runs before the initial `reconciler.apply`, so a
+/// Invariant for callers: this runs before the initial apply, so a
 /// reconciler that writes the proxy address into a client file must take the
 /// address from this result and must not write it when `bound` is false. The
 /// accept loop starts later, after discovery; connections in between queue in

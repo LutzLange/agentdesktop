@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(identity, "identity");
     }
 
-    // --- PR 4: per-program configuration status (specs/PR-4.md) ------------
+    // --- Per-program configuration status -----------------------------------
 
     fn test_reconciler(root: &std::path::Path) -> crate::reconcile::Reconciler {
         crate::reconcile::Reconciler::new(

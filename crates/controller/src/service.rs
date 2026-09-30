@@ -2,9 +2,9 @@ use std::pin::Pin;
 
 use agentdesktop_proto::fleet::{
     AgentMessage, BeginEnrollmentRequest, BeginEnrollmentResponse, CompleteEnrollmentRequest,
-    ControllerMessage, DeviceCertificateResponse, EnrollResponse, LlmGatewayCredentialRequest,
-    LlmGatewayCredentialResponse, RenewDeviceCertificateRequest, agent_message, controller_message,
-    fleet_agent_server::FleetAgent,
+    ConfigStatus, ControllerMessage, DeviceCertificateResponse, EnrollResponse,
+    LlmGatewayCredentialRequest, LlmGatewayCredentialResponse, RenewDeviceCertificateRequest,
+    agent_message, controller_message, fleet_agent_server::FleetAgent,
 };
 use futures_core::Stream;
 use tokio::{sync::mpsc, time};
@@ -482,7 +482,7 @@ async fn handle_agent_message(
             );
         }
         Some(agent_message::Message::ConfigStatus(status)) => {
-            database.update_config_status(device_id, &status).await?;
+            store_config_status(database, device_id, &status).await?;
             if status.error.is_empty() {
                 info!(
                     device_id,
@@ -505,6 +505,31 @@ async fn handle_agent_message(
         None => {}
     }
     Ok(())
+}
+
+/// Stores a device's configuration status. A per-program report the
+/// controller rejects must not break the stream (the agent would reconnect,
+/// receive the configuration again and send the same report), so the
+/// device-wide status is kept and the program rows are dropped.
+async fn store_config_status(
+    database: &Database,
+    device_id: &str,
+    status: &ConfigStatus,
+) -> anyhow::Result<()> {
+    let Err(error) = database.update_config_status(device_id, status).await else {
+        return Ok(());
+    };
+    warn!(
+        device_id,
+        error = %format!("{error:#}"),
+        "rejected per-program configuration status; storing the device status without it"
+    );
+    let device_only = ConfigStatus {
+        programs: Vec::new(),
+        programs_reported: false,
+        ..status.clone()
+    };
+    database.update_config_status(device_id, &device_only).await
 }
 
 fn bearer_credential(metadata: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
@@ -655,5 +680,44 @@ mod tests {
             device_id_from_certificate(certificate.der().as_ref()).unwrap(),
             device_id
         );
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[tokio::test]
+    async fn a_rejected_program_report_keeps_the_device_status() {
+        use agentdesktop_proto::fleet::{ConfigState, ConfigStatus, ProgramState, ProgramStatus};
+        let path = std::env::temp_dir().join(format!(
+            "agentdesktop-rejected-report-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let database = Database::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        database
+            .enroll_device("device", "host", "issuer", "subject", None)
+            .await
+            .unwrap();
+        let status = ConfigStatus {
+            revision: 3,
+            state: ConfigState::Failed.into(),
+            error: "refusing to change VS Code settings".to_owned(),
+            programs: vec![ProgramStatus {
+                program: "Not Valid".to_owned(),
+                state: ProgramState::Conflict.into(),
+                detail: String::new(),
+            }],
+            programs_reported: true,
+        };
+        super::store_config_status(&database, "device", &status)
+            .await
+            .expect("a rejected program report does not fail the stream");
+        let device = database.get_device("device").await.unwrap().unwrap();
+        assert_eq!(device.device.config_revision, Some(3));
+        assert_eq!(device.device.config_state, Some(2));
+        assert!(device.programs.is_empty());
+        assert_eq!(device.programs_reported, Some(false));
+        drop(database);
+        let _ = std::fs::remove_file(path);
     }
 }

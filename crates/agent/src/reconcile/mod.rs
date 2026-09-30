@@ -124,7 +124,7 @@ impl Reconciler {
     }
 
     pub fn apply(&self, config: &DaemonConfig) -> anyhow::Result<()> {
-        self.plan(config)?.apply()
+        self.apply_with_report(config).1
     }
 
     pub fn dry_run(&self, config: &DaemonConfig) -> anyhow::Result<()> {
@@ -255,13 +255,28 @@ pub struct ApplyReport {
 }
 
 impl ApplyReport {
-    /// One log line per program whose state is not applied or unchanged.
+    /// One log line per program whose state is not applied or unchanged; a
+    /// program that failed, conflicted or was blocked is a warning.
     pub fn log(&self) {
         for outcome in &self.programs {
-            if !matches!(
+            let warning = matches!(
+                outcome.state,
+                ProgramState::Failed | ProgramState::Conflict | ProgramState::Blocked
+            );
+            if matches!(
                 outcome.state,
                 ProgramState::Applied | ProgramState::Unchanged
             ) {
+                continue;
+            }
+            if warning {
+                tracing::warn!(
+                    program = outcome.program,
+                    state = outcome.state.as_str(),
+                    detail = %outcome.detail,
+                    "program configuration outcome"
+                );
+            } else {
                 tracing::info!(
                     program = outcome.program,
                     state = outcome.state.as_str(),
@@ -335,88 +350,99 @@ impl AttributedPlan {
             entries,
             first_error,
         } = self;
-        // The first program, in registration order, that stops the apply.
-        let first_bad = entries.iter().find_map(|entry| {
-            if entry.failed.is_some() {
-                Some(format!("{} failed", entry.program))
-            } else if !entry.conflicts.is_empty() {
-                Some(format!("{} conflicted", entry.program))
-            } else {
-                None
-            }
-        });
-        let refused = |result: anyhow::Result<()>, blocked_by: &str| {
-            let programs = entries
-                .iter()
-                .filter_map(|entry| {
-                    let (state, detail) = if let Some(detail) = &entry.failed {
-                        (ProgramState::Failed, detail.clone())
-                    } else if !entry.conflicts.is_empty() {
-                        (ProgramState::Conflict, entry.conflicts.join("; "))
-                    } else {
-                        entry.settled(false, blocked_by)?
+        let (result, stop) = if let Some(error) = first_error {
+            (Err(error), Stop::BeforeWrites)
+        } else if entries.iter().any(|entry| !entry.conflicts.is_empty()) {
+            // The plan refuses without writing and returns the conflict error.
+            (plan.apply(), Stop::BeforeWrites)
+        } else {
+            match plan.apply_tracked() {
+                Ok(()) => (Ok(()), Stop::Completed),
+                Err((error, at)) => {
+                    let stop = Stop::Failed {
+                        owners: owners_of(&entries, &at),
+                        detail: format!("{error:#}"),
+                        written: match at {
+                            plan::ApplyStop::Operation(index) => index,
+                            _ => 0,
+                        },
                     };
-                    Some(outcome(entry.program, state, detail))
-                })
-                .collect();
-            (ApplyReport { programs }, result)
-        };
-        if let Some(error) = first_error {
-            return refused(Err(error), first_bad.as_deref().unwrap_or_default());
-        }
-        if let Some(blocked_by) = first_bad {
-            // Only conflicts are left; the plan refuses without writing.
-            return refused(plan.apply(), &blocked_by);
-        }
-        let (result, owners_failed, written_upto) = match plan.apply_tracked() {
-            Ok(()) => (Ok(()), None, usize::MAX),
-            Err((error, stop)) => {
-                let detail = format!("{error:#}");
-                let failed: Vec<&'static str> = match &stop {
-                    plan::ApplyStop::Conflict => Vec::new(),
-                    plan::ApplyStop::Observed(path) => entries
-                        .iter()
-                        .filter(|entry| entry.paths.contains(path))
-                        .map(|entry| entry.program)
-                        .collect(),
-                    plan::ApplyStop::PrivateDir(dir) => entries
-                        .iter()
-                        .filter(|entry| entry.paths.iter().any(|path| path.starts_with(dir)))
-                        .map(|entry| entry.program)
-                        .collect(),
-                    plan::ApplyStop::Operation(index) => entries
-                        .iter()
-                        .filter(|entry| entry.operations.contains(index))
-                        .map(|entry| entry.program)
-                        .collect(),
-                };
-                let upto = match stop {
-                    plan::ApplyStop::Operation(index) => index,
-                    _ => 0,
-                };
-                (Err(error), Some((failed, detail)), upto)
+                    (Err(error), stop)
+                }
             }
         };
-        let blocked_by = owners_failed
-            .as_ref()
-            .and_then(|(failed, _)| failed.first())
-            .map(|program| format!("{program} failed"))
+        let failed_during = |program: &str| match &stop {
+            Stop::Failed { owners, .. } => owners.contains(&program),
+            _ => false,
+        };
+        // The first program, in registration order, that stopped the apply.
+        let blocked_by = entries
+            .iter()
+            .find_map(|entry| {
+                if entry.failed.is_some() || failed_during(entry.program) {
+                    Some(format!("{} failed", entry.program))
+                } else if !entry.conflicts.is_empty() {
+                    Some(format!("{} conflicted", entry.program))
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default();
         let programs = entries
             .iter()
             .filter_map(|entry| {
-                if let Some((failed, detail)) = &owners_failed
-                    && failed.contains(&entry.program)
+                let (state, detail) = if let Some(detail) = &entry.failed {
+                    (ProgramState::Failed, detail.clone())
+                } else if let Stop::Failed { detail, .. } = &stop
+                    && failed_during(entry.program)
                 {
-                    return Some(outcome(entry.program, ProgramState::Failed, detail.clone()));
-                }
-                let written = entry.operations.end <= written_upto;
-                let (state, detail) = entry.settled(written, &blocked_by)?;
+                    (ProgramState::Failed, detail.clone())
+                } else if !entry.conflicts.is_empty() {
+                    (ProgramState::Conflict, entry.conflicts.join("; "))
+                } else {
+                    let written = match &stop {
+                        Stop::Completed => true,
+                        Stop::BeforeWrites => false,
+                        Stop::Failed { written, .. } => entry.operations.end <= *written,
+                    };
+                    entry.settled(written, &blocked_by)?
+                };
                 Some(outcome(entry.program, state, detail))
             })
             .collect();
         (ApplyReport { programs }, result)
     }
+}
+
+/// How an attributed apply ended.
+enum Stop {
+    /// Every operation was written.
+    Completed,
+    /// Refused before any write (a failed plan or a conflict).
+    BeforeWrites,
+    /// Stopped while applying: `owners` failed, the first `written`
+    /// operations reached the disk.
+    Failed {
+        owners: Vec<&'static str>,
+        detail: String,
+        written: usize,
+    },
+}
+
+/// The programs responsible for where an apply stopped.
+fn owners_of(entries: &[ProgramEntry], at: &plan::ApplyStop) -> Vec<&'static str> {
+    entries
+        .iter()
+        .filter(|entry| match at {
+            plan::ApplyStop::Conflict => false,
+            plan::ApplyStop::Observed(path) => entry.paths.contains(path),
+            plan::ApplyStop::PrivateDir(dir) => {
+                entry.paths.iter().any(|path| path.starts_with(dir))
+            }
+            plan::ApplyStop::Operation(index) => entry.operations.contains(index),
+        })
+        .map(|entry| entry.program)
+        .collect()
 }
 
 fn outcome(program: &'static str, state: ProgramState, detail: String) -> ProgramOutcome {
@@ -1065,11 +1091,11 @@ programs:
         assert!(!fixture.root.exists());
     }
 
-    // --- PR 4: per-program configuration status (specs/PR-4.md) ------------
+    // --- Per-program configuration status -----------------------------------
 
     fn new_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "agentdesktop-reconcile-pr4-{name}-{}-{}",
+            "agentdesktop-reconcile-status-{name}-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ))
@@ -1664,5 +1690,68 @@ programs:
             );
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn two_programs_planning_the_same_path_both_fail_and_the_rest_is_blocked() {
+        let root = new_root("same-path");
+        let shared = root.join("shared/settings.json");
+        let mut reconciler = full_reconciler(&root);
+        reconciler.providers = std::sync::Arc::new(vec![
+            Box::new(super::ClaudeCode {
+                settings_path: shared.clone(),
+            }),
+            Box::new(super::OpenCode {
+                managed_config_path: root.join("opencode/config.json"),
+                plugin_path: root.join("opencode/plugin.js"),
+            }),
+            Box::new(super::Codex {
+                managed_config_path: shared,
+            }),
+        ]);
+        let config = parse_daemon(
+            "programs:\n  claudeCode: {}\n  codex: {}\n  openCode:\n    model: m\n    models:\n      m: {}\n",
+        )
+        .unwrap();
+        let (report, result) = reconciler.apply_with_report(&config);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("multiple providers plan to modify")
+        );
+        let state = |program| program_outcome(&report, program).map(|outcome| outcome.state);
+        assert_eq!(state("claude-code"), Some(ProgramState::Failed));
+        assert_eq!(state("codex"), Some(ProgramState::Failed));
+        assert_eq!(state("opencode"), Some(ProgramState::Blocked));
+        assert!(!root.exists(), "nothing is written");
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn a_wrongly_typed_sidecar_field_does_not_put_its_value_in_the_detail() {
+        const PAIRING: &str = "PAIRING-IN-SIDECAR";
+        let root = new_root("typed-sidecar");
+        let providers = root.join("copilot/providers.json");
+        fs::create_dir_all(providers.parent().unwrap()).unwrap();
+        fs::write(&providers, b"{}\n").unwrap();
+        // `created` must be a boolean; serde would quote the string.
+        fs::write(
+            root.join("copilot/.providers.json.agentdesktop"),
+            format!("{{\"created\": \"{PAIRING}\", \"before\": {{}}, \"after\": {{}}}}"),
+        )
+        .unwrap();
+        let reconciler = full_reconciler(&root).with_llm_proxy(Some(proxy_context(PAIRING)));
+        let config = parse_daemon(
+            "llmGateway:\n  url: https://gateway.example.com\nprograms:\n  copilot:\n    models:\n      gpt-4.1: {}\n",
+        )
+        .unwrap();
+        let (report, result) = reconciler.apply_with_report(&config);
+        assert!(result.is_err());
+        let copilot = program_outcome(&report, "copilot").expect("copilot is reported");
+        assert_eq!(copilot.state, ProgramState::Failed);
+        assert!(!copilot.detail.contains(PAIRING), "{}", copilot.detail);
+        let _ = fs::remove_dir_all(&root);
     }
 }

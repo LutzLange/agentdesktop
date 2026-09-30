@@ -810,7 +810,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    // --- PR 4: per-program configuration status (specs/PR-4.md) ------------
+    // --- Per-program configuration status -----------------------------------
 
     async fn test_database(name: &str) -> (Database, PathBuf) {
         let path = std::env::temp_dir().join(format!(

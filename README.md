@@ -594,7 +594,10 @@ line (`program`, `state`, `detail`) per program that is not `applied` or
 `unchanged`. A daemon restart reports again, because the controller re-sends
 the configuration on every connection. Agents and controllers can be upgraded
 in either order: an older agent shows as "Per-program status is not reported
-by this agent version", and an older controller ignores the new fields.
+by this agent version", and an older controller ignores the new fields. The
+controller's database migration is one-way: once this controller has run, an
+older controller refuses the same database, so roll back from a database
+backup taken before the upgrade.
 
 ## Core capabilities
 

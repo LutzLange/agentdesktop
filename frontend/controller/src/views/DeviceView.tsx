@@ -118,7 +118,7 @@ export function DeviceView({
           ) : device.programs.length ? (
             <div className="event-list">
               {device.programs.map((program) => (
-                <div className="event-row program-row" key={program.program}>
+                <div className="event-row" key={program.program}>
                   <span className="event-source">
                     <ToolIcon kind={program.program} />
                     <strong>{friendlyTool(program.program)}</strong>
