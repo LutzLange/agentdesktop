@@ -587,6 +587,43 @@ stage.
 
 ![Agentdesktop controller device inventory](images/controller-ui.png)
 
+### Configuration status
+
+Each apply reports the outcome for every managed program, next to the
+device-wide state. The device page in the controller lists them under
+"Managed programs" (`GET /api/v1/devices/{id}` returns them as `programs`):
+
+| State | Meaning |
+| --- | --- |
+| `applied` | The program is configured and its files were changed. |
+| `unchanged` | The program is configured and nothing needed to change. |
+| `removed` | The program is no longer configured and its managed content was removed. |
+| `conflict` | A managed file holds configuration the daemon will not overwrite; the detail names the file. |
+| `inactive` | The program uses the LLM gateway but the local LLM proxy is not running (see `llmProxy.error` in daemon-info), so its files point nowhere and were removed. |
+| `blocked` | The program had changes, but none were written because another program conflicted or failed; the detail names that program. |
+| `failed` | Planning or writing this program failed; the detail carries the error. |
+
+When several apply, the first in the list `failed`, `conflict`, `blocked`,
+`inactive`, `applied`/`removed`, `unchanged` is shown. An apply is all or
+nothing across programs: one conflict or failure means no file is written for
+any program, which is what `blocked` makes visible. Programs that are not
+configured and have nothing to clean up, and discovery-only tools, are not
+listed. After each apply the daemon logs one `program configuration outcome`
+line (`program`, `state`, `detail`) per program that is not `applied` or
+`unchanged`. A daemon restart reports again, because the controller re-sends
+the configuration on every connection; the files are already written by the
+startup apply of the saved configuration at that point, so the report after a
+restart usually says `unchanged` (the startup apply's outcome lines for programs
+that are not `applied` or `unchanged` are in the daemon log). If the controller
+rejects a report (an agent outside the reporting limits), it keeps the device
+status and the last accepted program rows; rows from an earlier revision show
+that revision on the device page. Agents and controllers can be upgraded
+in either order: an older agent shows as "Per-program status is not reported
+by this agent version", and an older controller ignores the new fields. The
+controller's database migration is one-way: once this controller has run, an
+older controller refuses the same database, so roll back from a database
+backup taken before the upgrade.
+
 ## Core capabilities
 
 - **AI tool discovery:** detect supported developer tools and their versions

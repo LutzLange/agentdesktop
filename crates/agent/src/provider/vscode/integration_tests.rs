@@ -395,3 +395,61 @@ fn jsonc(text: &str) -> anyhow::Result<serde_json::Value> {
         .and_then(|value| value.to_serde_value())
         .context("settings.json holds no JSON value")
 }
+
+#[tokio::test]
+async fn program_status_reports_inactive_without_the_proxy() -> anyhow::Result<()> {
+    Container::run(
+        "vscode",
+        "crates/agent/src/provider/vscode/testdata/Dockerfile",
+        async |container| {
+            let gateway = Gateway::start().await?;
+            // A gateway and the VS Code program, but no daemon.llmProxy: the
+            // program uses the gateway without a listener, so it is inactive.
+            let document = serde_json::json!({
+                "daemon": { "user": true },
+                "llmGateway": { "url": gateway.url },
+                "programs": { "vscode": { "models": { "gpt-4.1-mini": {} } } },
+            });
+            container
+                .write(CONFIG, &serde_json::to_string_pretty(&document)?)
+                .await?;
+            container.exec(&["chown", "tester:tester", CONFIG]).await?;
+            container
+                .exec(&["chown", "-R", "tester:tester", "/home/tester"])
+                .await?;
+            let daemon = [
+                "runuser",
+                "-u",
+                "tester",
+                "--",
+                "agentdesktop",
+                "daemon",
+                "--config",
+                CONFIG,
+            ];
+            container.start_process("daemon", &daemon).await?;
+            container
+                .wait_ready(&["agentdesktop", "--socket", SOCKET, "status"])
+                .await?;
+
+            info!("Checking the program outcome line in the daemon log");
+            let log = container.exec(&["cat", "/tmp/daemon.log"]).await?;
+            let line = log
+                .lines()
+                .find(|line| {
+                    line.contains("program configuration outcome") && line.contains("vscode")
+                })
+                .with_context(|| format!("no outcome line for vscode in the daemon log:\n{log}"))?;
+            ensure!(
+                line.contains("inactive"),
+                "vscode must be inactive without the proxy: {line}"
+            );
+            ensure!(
+                line.contains("local LLM proxy not available"),
+                "the reason is in the detail: {line}"
+            );
+            Ok(())
+        },
+    )
+    .await
+}

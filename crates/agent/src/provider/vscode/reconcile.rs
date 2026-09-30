@@ -107,6 +107,7 @@ pub(super) fn plan(
             path = %path.display(),
             "programs.vscode is configured but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed chat language models"
         );
+        plan.inactive(crate::reconcile::PROXY_ABSENT_REASON);
         remove(path, &state_path, None, plan)?;
         return Ok(());
     };

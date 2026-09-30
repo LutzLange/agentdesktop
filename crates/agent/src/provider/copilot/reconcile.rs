@@ -112,6 +112,7 @@ pub(super) fn plan(
             path = %path.display(),
             "programs.copilot is configured but the local LLM proxy is not available, so the Copilot CLI is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed Copilot CLI providers"
         );
+        plan.inactive(crate::reconcile::PROXY_ABSENT_REASON);
         remove(path, &state_path, None, plan)?;
         return Ok(());
     };
