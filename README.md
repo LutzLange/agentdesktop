@@ -592,7 +592,10 @@ configured and have nothing to clean up, and discovery-only tools, are not
 listed. After each apply the daemon logs one `program configuration outcome`
 line (`program`, `state`, `detail`) per program that is not `applied` or
 `unchanged`. A daemon restart reports again, because the controller re-sends
-the configuration on every connection. Agents and controllers can be upgraded
+the configuration on every connection; the files are already written by the
+startup apply of the saved configuration at that point, so the report after a
+restart usually says `unchanged` (the startup apply's own outcomes are in the
+daemon log). Agents and controllers can be upgraded
 in either order: an older agent shows as "Per-program status is not reported
 by this agent version", and an older controller ignores the new fields. The
 controller's database migration is one-way: once this controller has run, an
