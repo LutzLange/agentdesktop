@@ -141,11 +141,15 @@ impl DaemonArgs {
         // user's own profile, like the Copilot CLI providers file: a system
         // daemon has no user file to manage, so an explicit override is
         // rejected up front.
-        if !user && startup.vscode.config.is_some() {
-            bail!("daemon.vscode.config requires --user (or daemon.user: true)");
-        }
-        if !user && startup.vscode.settings.is_some() {
-            bail!("daemon.vscode.settings requires --user (or daemon.user: true)");
+        if !user
+            && let Some(field) = [
+                ("config", startup.vscode.config.is_some()),
+                ("settings", startup.vscode.settings.is_some()),
+            ]
+            .into_iter()
+            .find_map(|(field, set)| set.then_some(field))
+        {
+            bail!("daemon.vscode.{field} requires --user (or daemon.user: true)");
         }
         if !user {
             return Ok(ResolvedDaemonArgs {

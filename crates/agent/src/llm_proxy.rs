@@ -782,8 +782,11 @@ async fn forward(
     // nothing about this device and costs it no work.
     let pairing_ok =
         |offered: &str| constant_time_eq(offered.as_bytes(), config.pairing.as_bytes());
-    let matched_route = match_route(path).map(|(route, _)| route);
-    let capi_rest = match match_route(path) {
+    // Matched once; the route decides pairing placement, upgrade handling,
+    // the ping exemption, client id, credential mode and upstream.
+    let matched = match_route(path);
+    let matched_route = matched.map(|(route, _)| route);
+    let capi_rest = match matched {
         Some((route, rest)) if route.pairing_in_path => {
             let Some((segment, remainder)) = split_path_pairing(rest) else {
                 return Err(ProxyError::pairing_invalid());
@@ -819,7 +822,7 @@ async fn forward(
             "agentdesktop proxy: path must not contain '..' segments",
         ));
     }
-    if match_route(path).is_none() && resembles_route(path) {
+    if matched.is_none() && resembles_route(path) {
         // A first segment that looks like a route name but is not one (case,
         // suffix, doubled slash) is a mistyped client file, not a request for
         // the hand-configured route with its different identity and credential mode.
@@ -850,7 +853,7 @@ async fn forward(
     })?;
 
     // Which route, which client id, which credential mode, which upstream.
-    let (client_id, credential_mode, base, rest) = match match_route(path) {
+    let (client_id, credential_mode, base, rest) = match matched {
         Some((route, rest)) => {
             if route.upstream == Upstream::ProxyUrl && gateway.proxy_url.is_none() {
                 // The pass-through shape needs the gateway route that restores the
@@ -2381,6 +2384,32 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn credential_cache_deadline_is_the_credential_expiry_not_the_reuse_window() {
+        let cache = CredentialCache::default();
+        let expires = now_unix() + 3600;
+        cache.insert(
+            "k",
+            "device-1",
+            &agentdesktop_core::model::LlmGatewayCredential {
+                credential: "jwt".to_owned(),
+                expires_at_unix_seconds: expires,
+            },
+        );
+        let (credential, deadline) = cache.lookup("k", "device-1").expect("cached");
+        assert_eq!(credential, "jwt");
+        assert_eq!(deadline.unix, expires);
+        let remaining = deadline.monotonic - std::time::Instant::now();
+        assert!(
+            remaining > CREDENTIAL_CACHE_TTL && remaining <= Duration::from_secs(3600),
+            "tunnel deadline must follow the credential's expiry, got {remaining:?}"
+        );
+        // The reuse window is still the short one.
+        let entry = cache.entries.lock().unwrap();
+        assert!(entry["k"].valid_until <= std::time::Instant::now() + CREDENTIAL_CACHE_TTL);
     }
 
     #[test]
