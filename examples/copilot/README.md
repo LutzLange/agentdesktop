@@ -22,8 +22,10 @@ Two paths go through the same gateway:
 - An OpenAI API key for the gateway's own models
 - For step 3: the Copilot CLI (`copilot`); for steps 4 and 5: VS Code with
   GitHub Copilot Chat. The example was run with both signed in to GitHub with a
-  Copilot Business seat; without a sign-in it was not tried. Step 5 needs a
-  Copilot Business or Enterprise seat.
+  Copilot Business seat; without a sign-in it was not tried. Steps 3 and 4
+  need the organisation's BYOK policy enabled (see
+  [github-side.md](github-side.md)); step 5 needs a Copilot Business or
+  Enterprise seat.
 - A user account where no other Agentdesktop daemon runs or ran. A daemon
   that ran before left sidecar files next to the files it managed; this
   example's daemon removes what that earlier setup added (for example Claude
