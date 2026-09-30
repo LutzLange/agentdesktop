@@ -336,8 +336,18 @@ fn read_state(
     plan: &ReconcilePlan,
 ) -> anyhow::Result<Option<MergeState>> {
     match plan.read(path) {
+        // The parse error names the position only: serde's message can quote
+        // a value from the file, and the sidecar holds managed content (a
+        // pairing value, a credential helper command).
         Ok(contents) => serde_json::from_slice(&contents)
-            .with_context(|| format!("parse {display_name} merge state from {}", path.display()))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "parse {display_name} merge state from {}: not a valid merge state (line {}, column {})",
+                    path.display(),
+                    error.line(),
+                    error.column()
+                )
+            })
             .map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error)
