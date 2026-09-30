@@ -579,7 +579,12 @@ outcome changed. Deleting a managed file is then no longer a way to opt out:
 switch the program off in the configuration or stop the daemon instead. The
 tick cannot start a local LLM proxy that was not running when the daemon
 started (restart the daemon for that). Unset means no periodic re-apply; zero
-and more than 30 days are rejected. The interval is read at startup only.
+and more than 30 days are rejected. The interval is read at startup only. After a
+logout from the controller the tick stops re-applying (the managed files stay
+until the next configuration). A controller configuration whose apply failed
+is saved as the one to restore once a tick applies it; if the device loses the
+connection before that and restarts offline, it restores the previous saved
+configuration until the controller pushes again.
 
 Any apply (tick or not) leaves a managed file alone when it already holds the
 planned bytes, and rewrites it with the same bytes when its mode grants more

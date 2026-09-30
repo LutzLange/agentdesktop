@@ -299,9 +299,15 @@ impl ApplyReport {
     /// program that failed, conflicted or was blocked is a warning.
     pub fn log(&self) {
         for outcome in &self.programs {
+            // Inactive is a warning too: the program is configured for the
+            // gateway but its files are removed. The providers log the cause
+            // at debug level, since they plan on every apply.
             let warning = matches!(
                 outcome.state,
-                ProgramState::Failed | ProgramState::Conflict | ProgramState::Blocked
+                ProgramState::Failed
+                    | ProgramState::Conflict
+                    | ProgramState::Blocked
+                    | ProgramState::Inactive
             );
             if matches!(
                 outcome.state,

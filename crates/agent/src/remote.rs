@@ -425,6 +425,7 @@ async fn connect(
                     // A failed save stays visible: the tick is reported as
                     // failed and the save is retried on the next tick.
                     if let Err(error) = persist_config(state_dir, &yaml, revision) {
+                        warn!(revision, error = %format!("{error:#}"), "saving the configuration after a reconcile tick failed; retrying on the next tick");
                         tick.error = Some(format!("{error:#}"));
                         pending_persist = Some((revision, yaml));
                     }
