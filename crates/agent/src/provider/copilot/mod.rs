@@ -40,6 +40,10 @@ pub fn default_copilot_providers_path() -> anyhow::Result<PathBuf> {
 
 #[async_trait::async_trait]
 impl Provider for Copilot {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
     async fn discover(&self) -> Discovery {
         Discovery {
             agents: discovery::discover().into_iter().collect(),
