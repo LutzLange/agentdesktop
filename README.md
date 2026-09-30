@@ -458,7 +458,8 @@ carries the pairing) and removal keeps the mode it finds; the sidecar is
 `.settings.json.agentdesktop`. VS Code itself saves the file with its own
 default mode (664 with a new inode when a setting is changed in the UI), so the
 URL is readable to the group and others until the daemon's next apply
-tightens it again (a config push or a daemon restart); an unchanged file
+tightens it again (a config push, a daemon restart, a reconnect to the
+controller, or the reconcile tick when `daemon.reconcileInterval` is set); an unchanged file
 looser than 0600 is tightened on the next apply without being rewritten
 otherwise. The override key is the daemon's while the program is active: a
 hand edit of the URL is replaced on the next apply and is not kept as the
@@ -480,7 +481,7 @@ single-quoted string; the top level is not an object;
 `settingsSync.ignoredSettings` is not an array; or a managed key appears twice)
 leaves the file untouched and blocks every managed file on the device until it
 is resolved (and stops the daemon at startup); fix the file in VS Code and
-re-apply. Removal (program
+re-apply (with `daemon.reconcileInterval` set, the next tick applies it). Removal (program
 absent, `ownModels`, `useLlmGateway: false`, no gateway, no `proxyUrl`, or no
 proxy, with a warning) takes the key and the two entries out and deletes the
 file only if the daemon created it. Restart VS Code after an apply that changes
@@ -556,6 +557,39 @@ routes:
           - x-llm-token
 ```
 
+## Periodic re-apply (opt-in)
+
+The daemon applies its configuration at startup and whenever the controller
+pushes one; a controller-managed device also re-applies the controller's
+configuration on every reconnect, which happens at least once per OIDC
+access-token lifetime. To repair drift between those points, set an interval
+in the local configuration:
+
+```yaml
+daemon:
+  reconcileInterval: 5m
+```
+
+Every interval the daemon re-applies the current configuration (the local
+file, or the last configuration the controller pushed). A managed file that
+was deleted or edited by hand comes back, a file whose mode was loosened is
+tightened, and a conflict that was fixed is applied. Nothing is written when
+nothing changed, and a tick reports to the controller and logs its outcome lines only when the outcome changed; a provider warning that explains a conflict (for example the file it refuses to change) repeats with every apply until the conflict is fixed. Deleting a managed file is then no longer a way to opt out:
+switch the program off in the configuration or stop the daemon instead. The
+tick cannot start a local LLM proxy that was not running when the daemon
+started (restart the daemon for that). Unset means no periodic re-apply; zero
+and more than 30 days are rejected. The interval is read at startup only. After a
+logout from the controller the tick stops re-applying (the managed files stay
+until the next configuration). A controller configuration whose apply failed
+is saved as the one to restore once a tick applies it; if the device loses the
+connection before that and restarts offline, it restores the previous saved
+configuration until the controller pushes again.
+
+Any apply (tick or not) leaves a managed file alone when it already holds the
+planned bytes, and rewrites it with the same bytes when its mode grants more
+than the daemon writes: for example a Claude Code user `settings.json` at
+0664 becomes 0644, a Copilot CLI `providers.json` at 0644 becomes 0600.
+
 ## Start locally, grow into a fleet
 
 Agentdesktop uses the same daemon and tool-native configuration model at every
@@ -567,6 +601,44 @@ stage.
 | [Run the standalone quickstart](https://agentdesktop.dev/docs/getting-started/standalone/) | [Run the managed quickstart](https://agentdesktop.dev/docs/getting-started/managed/) |
 
 ![Agentdesktop controller device inventory](images/controller-ui.png)
+
+### Configuration status
+
+Each apply reports the outcome for every managed program, next to the
+device-wide state. The device page in the controller lists them under
+"Managed programs" (`GET /api/v1/devices/{id}` returns them as `programs`):
+
+| State | Meaning |
+| --- | --- |
+| `applied` | The program is configured and its files were changed. |
+| `unchanged` | The program is configured and nothing needed to change. |
+| `removed` | The program is no longer configured and its managed content was removed. |
+| `conflict` | A managed file holds configuration the daemon will not overwrite; the detail names the file. |
+| `inactive` | The program uses the LLM gateway but the local LLM proxy is not running (see `llmProxy.error` in daemon-info), so its files point nowhere and were removed. |
+| `blocked` | The program had changes, but none were written because another program conflicted or failed; the detail names that program. |
+| `failed` | Planning or writing this program failed; the detail carries the error. |
+
+When several apply, the first in the list `failed`, `conflict`, `blocked`,
+`inactive`, `applied`/`removed`, `unchanged` is shown. An apply is all or
+nothing across programs: one conflict or failure means no file is written for
+any program, which is what `blocked` makes visible. Programs that are not
+configured and have nothing to clean up, and discovery-only tools, are not
+listed. After each push and startup apply the daemon logs one `program
+configuration outcome` line (`program`, `state`, `detail`) per program that is
+not `applied` or `unchanged`; a reconcile tick logs and reports only when the
+outcome changed. A daemon restart reports again, because the controller re-sends
+the configuration on every connection; the files are already written by the
+startup apply of the saved configuration at that point, so the report after a
+restart usually says `unchanged` (the startup apply's outcome lines for programs
+that are not `applied` or `unchanged` are in the daemon log). If the controller
+rejects a report (an agent outside the reporting limits), it keeps the device
+status and the last accepted program rows; rows from an earlier revision show
+that revision on the device page. Agents and controllers can be upgraded
+in either order: an older agent shows as "Per-program status is not reported
+by this agent version", and an older controller ignores the new fields. The
+controller's database migration is one-way: once this controller has run, an
+older controller refuses the same database, so roll back from a database
+backup taken before the upgrade.
 
 ## Core capabilities
 

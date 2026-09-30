@@ -507,10 +507,11 @@ pub(super) fn plan(
         return remove(path, &state_path, proxy, plan);
     }
     let Some((listen, pairing)) = proxy else {
-        warn!(
+        tracing::debug!(
             path = %path.display(),
             "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed settings"
         );
+        plan.inactive(crate::reconcile::PROXY_ABSENT_REASON);
         return remove(path, &state_path, None, plan);
     };
     if let Some(parent) = path

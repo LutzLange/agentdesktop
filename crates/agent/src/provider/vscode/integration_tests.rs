@@ -395,3 +395,105 @@ fn jsonc(text: &str) -> anyhow::Result<serde_json::Value> {
         .and_then(|value| value.to_serde_value())
         .context("settings.json holds no JSON value")
 }
+
+#[tokio::test]
+async fn program_status_reports_inactive_without_the_proxy() -> anyhow::Result<()> {
+    Container::run(
+        "vscode",
+        "crates/agent/src/provider/vscode/testdata/Dockerfile",
+        async |container| {
+            let gateway = Gateway::start().await?;
+            // A gateway and the VS Code program, but no daemon.llmProxy: the
+            // program uses the gateway without a listener, so it is inactive.
+            let document = serde_json::json!({
+                "daemon": { "user": true },
+                "llmGateway": { "url": gateway.url },
+                "programs": { "vscode": { "models": { "gpt-4.1-mini": {} } } },
+            });
+            container
+                .write(CONFIG, &serde_json::to_string_pretty(&document)?)
+                .await?;
+            container.exec(&["chown", "tester:tester", CONFIG]).await?;
+            container
+                .exec(&["chown", "-R", "tester:tester", "/home/tester"])
+                .await?;
+            let daemon = [
+                "runuser",
+                "-u",
+                "tester",
+                "--",
+                "agentdesktop",
+                "daemon",
+                "--config",
+                CONFIG,
+            ];
+            container.start_process("daemon", &daemon).await?;
+            container
+                .wait_ready(&["agentdesktop", "--socket", SOCKET, "status"])
+                .await?;
+
+            info!("Checking the program outcome line in the daemon log");
+            let log = container.exec(&["cat", "/tmp/daemon.log"]).await?;
+            let line = log
+                .lines()
+                .find(|line| {
+                    line.contains("program configuration outcome") && line.contains("vscode")
+                })
+                .with_context(|| format!("no outcome line for vscode in the daemon log:\n{log}"))?;
+            ensure!(
+                line.contains("inactive"),
+                "vscode must be inactive without the proxy: {line}"
+            );
+            ensure!(
+                line.contains("local LLM proxy not available"),
+                "the reason is in the detail: {line}"
+            );
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Its own port: the Docker tests share the host network and run in parallel.
+const TICK_LISTEN: &str = "127.0.0.1:18098";
+
+#[tokio::test]
+async fn reconcile_tick_recreates_a_deleted_managed_file() -> anyhow::Result<()> {
+    Container::run("vscode", "crates/agent/src/provider/vscode/testdata/Dockerfile", async |container| {
+        let gateway = Gateway::start().await?;
+        let document = serde_json::json!({
+            "daemon": { "user": true, "llmProxy": { "listen": TICK_LISTEN }, "reconcileInterval": "2s" },
+            "llmGateway": { "url": gateway.url },
+            "programs": { "vscode": { "models": { "gpt-4.1-mini": {} } } },
+        });
+        container.write(CONFIG, &serde_json::to_string_pretty(&document)?).await?;
+        container.exec(&["chown", "tester:tester", CONFIG]).await?;
+        container.exec(&["chown", "-R", "tester:tester", "/home/tester"]).await?;
+        let daemon = ["runuser", "-u", "tester", "--", "agentdesktop", "daemon", "--config", CONFIG];
+        container.start_process("daemon", &daemon).await?;
+        container.wait_ready(&["agentdesktop", "--socket", SOCKET, "status"]).await?;
+        container.exec(&["test", "-e", CHAT_MODELS]).await?;
+
+        info!("Deleting the managed file and waiting for the tick");
+        container.exec(&["rm", CHAT_MODELS]).await?;
+        let mut back = false;
+        for _ in 0..40 {
+            if container.exec(&["test", "-e", CHAT_MODELS]).await.is_ok() {
+                back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        ensure!(back, "the reconcile tick did not recreate {CHAT_MODELS} within 10 s");
+        let mode = container.exec(&["stat", "-c", "%a", CHAT_MODELS]).await?;
+        ensure!(mode.trim() == "600", "recreated file must be owner-only, got {mode}");
+
+        info!("Checking that later ticks write nothing");
+        let before = container.exec(&["stat", "-c", "%i %Y", CHAT_MODELS, CHAT_SIDECAR]).await?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let after = container.exec(&["stat", "-c", "%i %Y", CHAT_MODELS, CHAT_SIDECAR]).await?;
+        ensure!(before == after, "an unchanged tick rewrote a file:\n{before}\n{after}");
+        Ok(())
+    })
+    .await
+}
