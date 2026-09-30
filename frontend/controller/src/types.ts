@@ -116,6 +116,7 @@ export type DaemonConfigDocument = {
   llmGateway?: {
     url: string;
     proxyUrl?: string;
+    whenProxyUnavailable?: "failClosed" | "failOpen";
     authentication?: {
       type: string;
       audience?: string;

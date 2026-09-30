@@ -489,8 +489,11 @@ pub(super) fn read_state(bytes: &[u8]) -> Option<SettingsState> {
 ///
 /// Edits only when the program is set with `copilotChat: githubModels`,
 /// uses the gateway, the gateway has `proxyUrl` and the loopback proxy is
-/// available; removes the managed keys otherwise (with a warning when the
-/// proxy is the missing part), the same decision shape as `reconcile::plan`.
+/// available; removes the managed keys otherwise, the same decision shape as
+/// `reconcile::plan`. The one exception is the proxy being the missing part:
+/// then `llmGateway.whenProxyUnavailable` decides, and `failClosed` (the default) leaves
+/// the file as it is, so VS Code stays pointed at the loopback port
+/// instead of reaching GitHub past the gateway.
 pub(super) fn plan(
     path: &Path,
     proxy: Option<(SocketAddr, &str)>,
@@ -507,9 +510,18 @@ pub(super) fn plan(
         return remove(path, &state_path, proxy, plan);
     }
     let Some((listen, pairing)) = proxy else {
+        if let Some((_, Some(gateway))) = configured
+            && crate::reconcile::fail_closed_without_proxy(gateway, plan)
+        {
+            debug!(
+                path = %path.display(),
+                "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available; whenProxyUnavailable: failClosed, so the settings are left as they are"
+            );
+            return Ok(());
+        }
         tracing::debug!(
             path = %path.display(),
-            "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed settings"
+            "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); whenProxyUnavailable: failOpen, removing the managed settings"
         );
         plan.inactive(crate::reconcile::PROXY_ABSENT_REASON);
         return remove(path, &state_path, None, plan);
