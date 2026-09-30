@@ -37,6 +37,12 @@ pub use crate::provider::{
 pub struct Reconciler {
     context: ReconcileContext,
     providers: Arc<Vec<Box<dyn Provider>>>,
+    /// The apply lock and the report of the last apply. Held for planning
+    /// and applying, so a push, the startup apply and a reconcile tick never
+    /// overlap across clones; never held across an `.await`. `plan`,
+    /// `plan_with_report` and `dry_run` take no lock. The report feeds the
+    /// tick's log rule.
+    last_apply: Arc<std::sync::Mutex<Option<ApplyReport>>>,
 }
 
 impl Reconciler {
@@ -91,6 +97,7 @@ impl Reconciler {
                 }),
                 Box::new(Ollama),
             ]),
+            last_apply: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -187,16 +194,49 @@ impl Reconciler {
         }
     }
 
-    /// [`Reconciler::plan_with_report`] followed by [`AttributedPlan::apply`].
+    /// [`Reconciler::plan_with_report`] followed by [`AttributedPlan::apply`],
+    /// under the apply lock.
     pub fn apply_with_report(&self, config: &DaemonConfig) -> (ApplyReport, anyhow::Result<()>) {
-        self.plan_with_report(config).apply()
+        let (_, report, result) = self.apply_after_previous(config);
+        (report, result)
+    }
+
+    /// Like [`Reconciler::apply_with_report`], also returning the report of
+    /// the apply before this one (from any source), read under the same lock.
+    pub(crate) fn apply_after_previous(
+        &self,
+        config: &DaemonConfig,
+    ) -> (Option<ApplyReport>, ApplyReport, anyhow::Result<()>) {
+        let (previous, report, result) = self
+            .apply_read_under_lock(|| Some(Arc::new(config.clone())))
+            .expect("a configuration was given");
+        (previous, report, result)
+    }
+
+    /// Takes the apply lock, then reads the configuration to apply, so a
+    /// configuration pushed while this call waited for the lock is the one
+    /// applied (a tick never re-applies an older revision after a push).
+    /// `None` from `read` applies nothing.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn apply_read_under_lock(
+        &self,
+        read: impl FnOnce() -> Option<Arc<DaemonConfig>>,
+    ) -> Option<(Option<ApplyReport>, ApplyReport, anyhow::Result<()>)> {
+        let mut last = self
+            .last_apply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = read()?;
+        let (report, result) = self.plan_with_report(&config).apply();
+        let previous = last.replace(report.clone());
+        Some((previous, report, result))
     }
 }
 
 /// The reason recorded for a program that uses the gateway while the local
 /// LLM proxy is absent.
 pub(crate) const PROXY_ABSENT_REASON: &str =
-    "local LLM proxy not available; see llmProxy.error in daemon-info";
+    "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen";
 
 /// A program's outcome, by precedence (highest first): Failed > Conflict >
 /// Blocked > Inactive > Applied/Removed > Unchanged.
@@ -256,12 +296,19 @@ pub struct ApplyReport {
 
 impl ApplyReport {
     /// One log line per program whose state is not applied or unchanged; a
-    /// program that failed, conflicted or was blocked is a warning.
+    /// program that failed, conflicted, was blocked or is inactive is a
+    /// warning.
     pub fn log(&self) {
         for outcome in &self.programs {
+            // Inactive is a warning too: the program is configured for the
+            // gateway but its files are removed. The providers log the cause
+            // at debug level, since they plan on every apply.
             let warning = matches!(
                 outcome.state,
-                ProgramState::Failed | ProgramState::Conflict | ProgramState::Blocked
+                ProgramState::Failed
+                    | ProgramState::Conflict
+                    | ProgramState::Blocked
+                    | ProgramState::Inactive
             );
             if matches!(
                 outcome.state,
@@ -286,6 +333,53 @@ impl ApplyReport {
             }
         }
     }
+}
+
+/// Whether `current` (a tick's apply outcome) differs enough from
+/// `previous` (the report of the last apply from any source: startup, a
+/// push, or an earlier tick) to log, using the same same-kind-of-difference
+/// rule as `remote::tick_config_status`: a program moving from `Applied` or
+/// `Removed` to `Unchanged` is not itself a difference. `previous: None`
+/// (nothing has been applied yet) always logs.
+pub(crate) fn should_log(previous: Option<&ApplyReport>, current: &ApplyReport) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    outcomes_differ(
+        &outcome_keys(&previous.programs),
+        &outcome_keys(&current.programs),
+    )
+}
+
+/// `(program, state, detail)` of each outcome, for [`outcomes_differ`].
+pub(crate) fn outcome_keys(programs: &[ProgramOutcome]) -> Vec<(&str, ProgramState, &str)> {
+    programs
+        .iter()
+        .map(|outcome| (outcome.program, outcome.state, outcome.detail.as_str()))
+        .collect()
+}
+
+/// Whether two outcome lists differ by program, state or detail. A program
+/// that settles from applied or removed to unchanged, or a removed program
+/// that is no longer listed, is not a difference: the files are as reported.
+pub(crate) fn outcomes_differ(
+    previous: &[(&str, ProgramState, &str)],
+    current: &[(&str, ProgramState, &str)],
+) -> bool {
+    let changed = current.iter().any(|&(program, state, detail)| {
+        match previous.iter().find(|(before, _, _)| *before == program) {
+            None => true,
+            Some(&(_, before_state, before_detail)) => {
+                let settled = state == ProgramState::Unchanged
+                    && matches!(before_state, ProgramState::Applied | ProgramState::Removed);
+                !settled && (state != before_state || detail != before_detail)
+            }
+        }
+    });
+    let gone = previous.iter().any(|&(program, state, _)| {
+        state != ProgramState::Removed && !current.iter().any(|(now, _, _)| *now == program)
+    });
+    changed || gone
 }
 
 /// The longest detail an outcome carries, in bytes.
@@ -1783,5 +1877,340 @@ programs:
         assert_eq!(state("claude-code"), Some(ProgramState::Blocked));
         assert!(!root.join("claude").exists(), "nothing is written");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- No-op writes skipped, full reconciler ---------------------------------
+
+    fn sidecar_path(path: &Path) -> PathBuf {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        path.with_file_name(format!(".{name}.agentdesktop"))
+    }
+
+    #[test]
+    fn second_apply_of_an_unchanged_multi_program_config_writes_nothing() {
+        let root = new_root("second-apply-no-op");
+        let config = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  claudeCode: {}
+  copilot:
+    models:
+      gpt-4.1: {}
+  vscode:
+    models:
+      gpt-4.1-mini: {}
+"#,
+        )
+        .unwrap();
+        let reconciler =
+            full_reconciler(&root).with_llm_proxy(Some(proxy_context("PAIRING-TICK-1")));
+        reconciler
+            .apply_with_report(&config)
+            .1
+            .expect("first apply succeeds");
+
+        let paths = [
+            root.join("claude/settings.json"),
+            sidecar_path(&root.join("claude/settings.json")),
+            root.join("copilot/providers.json"),
+            sidecar_path(&root.join("copilot/providers.json")),
+            root.join("vscode/User/chatLanguageModels.json"),
+            sidecar_path(&root.join("vscode/User/chatLanguageModels.json")),
+        ];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                fs::metadata(path).unwrap_or_else(|error| {
+                    panic!(
+                        "{} must exist after the first apply: {error}",
+                        path.display()
+                    )
+                })
+            })
+            .collect();
+
+        reconciler
+            .apply_with_report(&config)
+            .1
+            .expect("second apply succeeds");
+
+        for (path, before) in paths.iter().zip(before) {
+            let after = fs::metadata(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    after.ino(),
+                    before.ino(),
+                    "{} must not be rewritten by an unchanged apply",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                after.modified().unwrap(),
+                before.modified().unwrap(),
+                "{} mtime must not change on an unchanged apply",
+                path.display()
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn providers_json_at_a_looser_mode_is_tightened_on_the_next_apply() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = new_root("copilot-tighten");
+        let config = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  copilot:
+    models:
+      gpt-4.1: {}
+"#,
+        )
+        .unwrap();
+        let reconciler =
+            full_reconciler(&root).with_llm_proxy(Some(proxy_context("PAIRING-TICK-2")));
+        reconciler
+            .apply_with_report(&config)
+            .1
+            .expect("first apply succeeds");
+
+        let providers_path = root.join("copilot/providers.json");
+        fs::set_permissions(&providers_path, fs::Permissions::from_mode(0o664)).unwrap();
+        let before_contents = fs::read(&providers_path).unwrap();
+
+        reconciler
+            .apply_with_report(&config)
+            .1
+            .expect("second apply succeeds");
+
+        assert_eq!(
+            fs::read(&providers_path).unwrap(),
+            before_contents,
+            "bytes must not change"
+        );
+        let mode = fs::metadata(&providers_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a looser providers.json must be tightened");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deleted_managed_file_is_recreated_on_the_next_apply() {
+        let root = new_root("recreate-deleted");
+        let config = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+programs:
+  copilot:
+    models:
+      gpt-4.1: {}
+"#,
+        )
+        .unwrap();
+        let reconciler =
+            full_reconciler(&root).with_llm_proxy(Some(proxy_context("PAIRING-TICK-3")));
+        reconciler
+            .apply_with_report(&config)
+            .1
+            .expect("first apply succeeds");
+
+        let providers_path = root.join("copilot/providers.json");
+        let original = fs::read(&providers_path).unwrap();
+        fs::remove_file(&providers_path).unwrap();
+
+        let (report, result) = reconciler.apply_with_report(&config);
+        result.expect("second apply recreates the deleted file");
+        assert_eq!(
+            program_outcome(&report, "copilot").map(|outcome| outcome.state),
+            Some(ProgramState::Applied)
+        );
+        assert_eq!(fs::read(&providers_path).unwrap(), original);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- Serialized applies ----------------------------------------------------
+
+    /// A provider whose `plan` records that it was entered (in order) and,
+    /// only the first time, blocks until `release` is signalled. Later calls
+    /// return immediately, so the test can tell whether a second
+    /// `apply_with_report` was let into `plan` before the first released the
+    /// lock.
+    struct BlockingProbe {
+        order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        release: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provider::Provider for BlockingProbe {
+        fn id(&self) -> &'static str {
+            "blocking-probe"
+        }
+
+        async fn discover(&self) -> agentdesktop_core::model::Discovery {
+            agentdesktop_core::model::Discovery {
+                agents: Vec::new(),
+                model_runtimes: Vec::new(),
+            }
+        }
+
+        fn plan(
+            &self,
+            _ctx: &crate::provider::ReconcileContext,
+            _config: &agentdesktop_core::config::DaemonConfig,
+        ) -> anyhow::Result<super::ReconcilePlan> {
+            let is_first = {
+                let mut order = self.order.lock().unwrap();
+                order.push("enter");
+                order.len() == 1
+            };
+            if is_first {
+                let (lock, condvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = condvar.wait(released).unwrap();
+                }
+            }
+            Ok(super::ReconcilePlan::default())
+        }
+    }
+
+    #[test]
+    fn a_second_apply_on_a_clone_does_not_enter_plan_until_the_first_releases_the_lock() {
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut reconciler = full_reconciler(&new_root("apply-lock"));
+        reconciler.providers = std::sync::Arc::new(vec![Box::new(BlockingProbe {
+            order: order.clone(),
+            release: release.clone(),
+        })]);
+        let config = parse_daemon("programs: {}").unwrap();
+
+        let first = reconciler.clone();
+        let first_config = config.clone();
+        let first_handle = std::thread::spawn(move || first.apply_with_report(&first_config));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while order.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first apply never entered plan"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let second = reconciler.clone();
+        let second_config = config.clone();
+        let second_handle = std::thread::spawn(move || second.apply_with_report(&second_config));
+
+        // Give a wrongly-unserialized second call time to enter `plan`.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            order.lock().unwrap().len(),
+            1,
+            "a second apply_with_report on a clone must not enter plan while \
+             the first holds the lock"
+        );
+
+        {
+            let (lock, condvar) = &*release;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+
+        let (_, first_result) = first_handle.join().unwrap();
+        let (_, second_result) = second_handle.join().unwrap();
+        assert!(first_result.is_ok(), "{first_result:?}");
+        assert!(second_result.is_ok(), "{second_result:?}");
+        assert_eq!(
+            order.lock().unwrap().len(),
+            2,
+            "the second apply must eventually run once the lock is released"
+        );
+    }
+
+    // --- Tick logging dedup ----------------------------------------------------
+
+    fn outcome_report(state: ProgramState, detail: &str) -> ApplyReport {
+        ApplyReport {
+            programs: vec![ProgramOutcome {
+                program: "claude-code",
+                state,
+                detail: detail.to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn should_log_with_nothing_applied_yet_always_logs() {
+        let current = outcome_report(ProgramState::Applied, "");
+        assert!(super::should_log(None, &current));
+    }
+
+    #[test]
+    fn should_log_is_false_when_the_report_is_unchanged() {
+        let previous = outcome_report(ProgramState::Unchanged, "");
+        let current = outcome_report(ProgramState::Unchanged, "");
+        assert!(!super::should_log(Some(&previous), &current));
+    }
+
+    #[test]
+    fn should_log_is_false_when_applied_or_removed_settles_to_unchanged() {
+        for state in [ProgramState::Applied, ProgramState::Removed] {
+            let previous = outcome_report(state, "");
+            let current = outcome_report(ProgramState::Unchanged, "");
+            assert!(
+                !super::should_log(Some(&previous), &current),
+                "{state:?} -> Unchanged must not be logged"
+            );
+        }
+    }
+
+    #[test]
+    fn should_log_is_true_when_a_programs_detail_changes() {
+        let previous = outcome_report(ProgramState::Conflict, "conflict at a");
+        let current = outcome_report(ProgramState::Conflict, "conflict at b");
+        assert!(super::should_log(Some(&previous), &current));
+    }
+
+    #[test]
+    fn should_log_is_true_when_a_programs_state_changes_to_something_other_than_unchanged() {
+        let previous = outcome_report(ProgramState::Unchanged, "");
+        let current = outcome_report(ProgramState::Failed, "boom");
+        assert!(super::should_log(Some(&previous), &current));
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn a_program_that_disappears_is_a_difference_unless_it_was_removed() {
+        let both = ApplyReport {
+            programs: vec![
+                ProgramOutcome {
+                    program: "claude-code",
+                    state: ProgramState::Unchanged,
+                    detail: String::new(),
+                },
+                ProgramOutcome {
+                    program: "copilot",
+                    state: ProgramState::Unchanged,
+                    detail: String::new(),
+                },
+            ],
+        };
+        let one = outcome_report(ProgramState::Unchanged, "");
+        assert!(super::should_log(Some(&both), &one), "copilot vanished");
+        let mut removed = both.clone();
+        removed.programs[1].state = ProgramState::Removed;
+        assert!(
+            !super::should_log(Some(&removed), &one),
+            "a removed program that is no longer listed is not news"
+        );
     }
 }
