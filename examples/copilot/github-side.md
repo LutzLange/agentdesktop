@@ -1,15 +1,15 @@
 # GitHub Copilot: what the GitHub organisation or enterprise owner configures
 
-Agentdesktop points the Copilot CLI and VS Code Copilot Chat at the local LLM proxy, and the proxy sends their traffic through the gateway with the developer's identity attached. Some settings that decide whether that traffic flows, and whether developers can go around it, live on the GitHub side and belong to the customer's GitHub owner and network team. This page lists them per client mode.
+Agentdesktop points the Copilot CLI and VS Code Copilot Chat at the local LLM proxy, and the proxy sends their traffic through the gateway with the developer's identity attached. Some settings that decide whether that traffic flows, and whether developers can go around it, live on the GitHub side and belong to your GitHub organisation or enterprise owner and your network team. This page lists them per client mode.
 
 ## The two VS Code modes and the Copilot CLI
 
 | | Copilot CLI (`programs.copilot`) | VS Code, own models (`copilotChat: ownModels`) | VS Code, GitHub's models (`copilotChat: githubModels`) |
 |---|---|---|---|
 | Models | The gateway's models | The gateway's models | GitHub's models, as the Copilot plan and model policy allow |
-| Billed by | The customer's model provider, per token | The customer's model provider, per token | The Copilot seat (included AI credits, then metered) |
+| Billed by | Your model provider, per token | Your model provider, per token | The Copilot seat (included AI credits, then metered) |
 | GitHub BYOK policy | Not verified whether it applies | Must stay enabled | Not needed |
-| Gateway sees | User, device, client; full request | User, device, client; full request | User, device, client; the request as VS Code sends it to GitHub |
+| Gateway sees | The user; with a controller also device and client; full request | The user; with a controller also device and client; full request | The user; with a controller also device and client; the request as VS Code sends it to GitHub |
 
 ## Settings on the GitHub side
 

@@ -16,13 +16,21 @@ Two paths go through the same gateway:
 
 ## Prerequisites
 
-- Docker with Compose, Linux or macOS (the example was run on Ubuntu 24.04)
+- Linux with Docker Compose (the example was run on Ubuntu 24.04; macOS and
+  Windows paths are covered by unit tests only)
 - `agentdesktop` on your `PATH` (see the repository README)
 - An OpenAI API key for the gateway's own models
-- For the Copilot CLI steps: the Copilot CLI (`copilot`)
-- For the VS Code steps: VS Code with GitHub Copilot Chat; for GitHub's models, a
-  Copilot Business or Enterprise seat signed in to VS Code
-- Nothing else listening on 127.0.0.1:4001, :4010 or :5557
+- For step 3: the Copilot CLI (`copilot`); for steps 4 and 5: VS Code with
+  GitHub Copilot Chat. The example was run with both signed in to GitHub with a
+  Copilot Business seat; without a sign-in it was not tried. Step 5 needs a
+  Copilot Business or Enterprise seat.
+- A user account where no other Agentdesktop daemon runs or ran. A daemon
+  that ran before left sidecar files next to the files it managed; this
+  example's daemon removes what that earlier setup added (for example Claude
+  Code or OpenCode entries). Stop the other daemon first, and expect to
+  re-apply its configuration afterwards.
+- Nothing else listening on 127.0.0.1:4001 (gateway), :4010 (the loopback
+  proxy), :5557 (Dex) and :51327 (the login callback)
 
 ## 1. Start Dex and the gateway
 
@@ -34,7 +42,10 @@ docker compose -f examples/copilot/compose.yaml up -d
 curl -sI http://127.0.0.1:4001/ | head -1     # HTTP/1.1 200 OK
 ```
 
-Dex has one user, `admin@example.com` with password `password`.
+The gateway fetches Dex's keys at start and restarts until Dex answers: if the
+check prints nothing, wait a few seconds and run it again
+(`docker compose -f examples/copilot/compose.yaml ps` shows both services
+`Up`). Dex has one user, `admin@example.com` with password `password`.
 
 ## 2. Run the daemon
 
@@ -42,22 +53,30 @@ Dex has one user, `admin@example.com` with password `password`.
 agentdesktop daemon --config examples/copilot/config.yaml
 ```
 
-The first start opens a browser for the Dex login. Then check:
+`config.yaml` sets `daemon.user: true`, so `--user` is not needed. The daemon
+stays in the foreground and logs there; run the checks below in a second
+terminal, and stop it with Ctrl+C (later steps restart it this way). There is
+no `--dry-run` preview for this example: the loopback proxy cannot run in a
+one-shot run.
+
+The first start prints `Open this URL to connect Agentdesktop:` with
+`http://127.0.0.1:51327/` and opens a browser; sign in to Dex there. Without a
+browser on this machine, open that URL in a browser on the same machine; over
+ssh, forward ports 51327 and 5557 first. Later restarts reuse the login. Then:
 
 ```sh
-agentdesktop --socket "$XDG_RUNTIME_DIR/agentdesktop.sock" status
+agentdesktop --socket "$XDG_RUNTIME_DIR/agentdesktop.sock" status   # ok
 curl -s --unix-socket "$XDG_RUNTIME_DIR/agentdesktop.sock" http://localhost/v1/daemon-info
 ```
 
 `llmProxy.bound` is `true` and `listen` is `127.0.0.1:4010`. The daemon log has
 `applied reconciliation change` lines for `~/.copilot/providers.json` and the VS
-Code `chatLanguageModels.json` (Linux `~/.config/Code/User/`, macOS
-`~/Library/Application Support/Code/User/`). Both files are owner-only (600) and
-carry a pairing value that the proxy requires on every request; other local
-users and browser pages cannot use the proxy without it. The daemon keeps a
-small sidecar next to each file (`.providers.json.agentdesktop`,
-`.chatLanguageModels.json.agentdesktop`) that records what it added, so it can
-take out exactly that later.
+Code `chatLanguageModels.json` (`~/.config/Code/User/`). Both files are
+owner-only (600) and carry a pairing value that the proxy requires on every
+request; other local users and browser pages cannot use the proxy without it.
+The daemon keeps a small sidecar next to each file
+(`.providers.json.agentdesktop`, `.chatLanguageModels.json.agentdesktop`) that
+records what it added, so it can take out exactly that later.
 
 ## 3. Copilot CLI on the gateway's models
 
@@ -81,8 +100,8 @@ Your own entries in `chatLanguageModels.json` are kept.
 ## 5. VS Code on GitHub's models (Copilot Business or Enterprise)
 
 Replace the `vscode` block in `config.yaml` with `copilotChat: githubModels`
-(the comment there shows it). The daemon re-reads the file only at start:
-stop it and start it again. Then:
+(the comment there shows it) and restart the daemon (Ctrl+C, then the command
+of step 2). Then:
 
 - The user `settings.json` gains `github.copilot.advanced.debug.overrideCapiUrl`
   pointing at `http://127.0.0.1:4010/vscode-copilot-capi/<pairing>` and two
@@ -96,27 +115,37 @@ stop it and start it again. Then:
   an agent-mode turn opens `GET /copilot-proxy/responses` with status 101 (the
   gateway logs it when the tunnel closes).
 
-The example route targets `api.business.githubcopilot.com`. Other plans use
-another host, which VS Code's Copilot Chat log shows (the `_ping` requests).
+This step was run against Solo Enterprise for AgentGateway with the same route;
+with the OSS gateway image of this example the route configuration is accepted
+(`--validate-only`) but the step has not been run end to end yet. The route
+targets `api.business.githubcopilot.com`. Other plans use another host, which
+VS Code's Copilot Chat log shows (the `_ping` requests): change both
+occurrences in `agentgateway.yaml` (`urlRewrite.authority.full` and the backend
+`host`) and restart the gateway (`docker compose -f
+examples/copilot/compose.yaml restart agentgateway`).
+
 While the daemon is not running, VS Code keeps sending its requests, with its
 Copilot tokens, to the loopback port: use this on single-user machines, and
 switch back to own models (or stop VS Code) before removing the daemon.
 
 ## 6. Drift, conflicts and removal
 
-- **Drift.** With `daemon.reconcileInterval` set (one minute in this
-  example; the tick is off when it is left out), delete
-  `~/.copilot/providers.json`: it is back within one interval, identical to
-  before. Change a mode
-  with `chmod 644` on a managed file: it is back to 600. When nothing changed,
-  the daemon writes nothing.
+Each item starts from the `config.yaml` of step 4 (own models); undo each
+change before the next.
+
+- **Drift.** With `daemon.reconcileInterval` set (one minute in this example;
+  the tick is off when it is left out), delete `~/.copilot/providers.json`:
+  within one interval it is back with the same managed entries (your own
+  entries were in the deleted file and do not come back). `chmod 644` on a
+  managed file: back to 600. When nothing changed, the daemon writes nothing.
 - **Conflict.** Put `// x` on the first line of `chatLanguageModels.json`. The
-  daemon refuses to rewrite a file it cannot parse, logs `program configuration
-  outcome` with `state="conflict"` and the path, and writes no managed file on
-  the device until the comment is gone (`settings.json` is the exception that
-  accepts VS Code's comments and trailing commas). Remove the comment: within
-  one interval everything applies again (without the tick: at the next
-  restart).
+  daemon refuses to rewrite a file it cannot parse and logs `program
+  configuration outcome` with `state="conflict"` and the path for `vscode`, and
+  `state="blocked"` (`not applied: vscode conflicted`) for the other programs
+  that had changes; it writes no managed file on the device until the comment
+  is gone (VS Code's `settings.json` is the exception that accepts comments and
+  trailing commas). Remove the comment: within one interval everything applies
+  again (without the tick: at the next restart).
 - **Proxy gone.** Remove `daemon.llmProxy` and restart: the Copilot and VS Code
   entries are removed and the log says `state="inactive"` with the reason.
 - **Removal.** Remove a program from `programs` and restart: its entries are
@@ -140,6 +169,15 @@ The Copilot plan, the BYOK policy, model policies, default models and egress
 rules are set by the GitHub organisation or enterprise owner; see
 [github-side.md](github-side.md).
 
+## 9. Clean up
+
+Stop the daemon (Ctrl+C). To take the managed entries out, remove `programs`
+from `config.yaml` and start the daemon once more (or delete the files if the
+daemon created them). Then `docker compose -f examples/copilot/compose.yaml
+down`, and remove `~/.local/state/agentdesktop` for a fresh login next time.
+Dex keeps its data in memory, so after `down` and `up` the daemon needs a new
+login.
+
 ## Known limits
 
 - Inline completions and next edit suggestions go directly to GitHub; this
@@ -147,4 +185,5 @@ rules are set by the GitHub organisation or enterprise owner; see
 - `github.copilot.advanced.debug.overrideCapiUrl` is an undocumented VS Code
   setting; the fallback is VS Code's HTTP proxy setting pointed at the gateway.
 - Tested on Linux with VS Code 1.139, Copilot CLI 1.0.88 and a Copilot Business
-  seat. macOS and Windows paths are covered by unit tests only.
+  seat: steps 1 to 4 and 6 with this example's OSS gateway; step 5 with Solo
+  Enterprise for AgentGateway.
