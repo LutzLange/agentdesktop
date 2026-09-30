@@ -39,8 +39,9 @@ pub(super) struct KeyedArray {
 /// How a managed document is written into, and removed from, a user file.
 #[derive(Clone, Copy)]
 pub(super) struct MergeOptions {
-    /// Mode of the file when the merge writes it (`plan_remove` keeps the
-    /// file's current mode).
+    /// Mode of a file the merge creates. An existing file is written with the
+    /// owner bits of this mode and at most its group and other bits (a merge
+    /// never widens them); `plan_remove` keeps the file's current mode.
     pub(super) mode: u32,
     /// Arrays whose elements are identified by key. Elements of arrays not
     /// listed here are matched by full equality.
@@ -171,9 +172,9 @@ pub(super) fn plan_merge_with(
         .with_context(|| format!("serialize merged {display_name}"))?;
     contents.push(b'\n');
     // An unchanged file that grants more than `options.mode` is rewritten
-    // with the same bytes at that mode (the plan skips identical writes
-    // otherwise).
-    let looser = current_mode(path).is_some_and(|mode| mode & !options.mode & 0o777 != 0);
+    // with the same bytes (the plan skips identical writes otherwise).
+    let current = current_mode(path);
+    let looser = current.is_some_and(|mode| mode & !options.mode & 0o777 != 0);
     let action = match existing.as_deref() {
         Some(existing) if existing == contents && !looser => "unchanged",
         Some(_) => "update",
@@ -191,7 +192,7 @@ pub(super) fn plan_merge_with(
     );
 
     if action != "unchanged" {
-        plan.write_file(path, &contents, options.mode)?;
+        plan.write_file(path, &contents, merged_mode(current, options.mode))?;
     }
     let mut state = serde_json::to_vec_pretty(&MergeState {
         created,
@@ -463,6 +464,17 @@ fn rollback_value(
     Some(current.clone())
 }
 
+/// The mode a merge writes: `planned` for a new file; for an existing one
+/// the owner bits of `planned` and the group and other bits the file and
+/// `planned` share (a merge never widens them, and the owner can always read
+/// and write a file the daemon manages).
+fn merged_mode(current: Option<u32>, planned: u32) -> u32 {
+    match current {
+        Some(current) => (planned & 0o700) | (current & planned & 0o077),
+        None => planned,
+    }
+}
+
 /// The mode bits of an existing file, on platforms that have them.
 pub(super) fn current_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
@@ -669,8 +681,8 @@ mod tests {
             let plan = ReconcilePlan::default();
             plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
             plan.apply().unwrap();
-            // The user tightens the mode after the merge (the default merge
-            // writes 0644, as before); removal keeps what it finds.
+            // The user tightens the mode after the merge; removal keeps what
+            // it finds.
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
             let plan = ReconcilePlan::default();
             assert!(plan_remove(&path, &state, "settings", "Test", &plan).unwrap());
