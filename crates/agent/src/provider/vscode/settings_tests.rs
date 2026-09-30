@@ -496,9 +496,8 @@ fn preexisting_user_override_capi_url_is_overwritten_and_restored() {
 
 // --- Comments and trailing commas are preserved, not a conflict ------
 //
-// Under the old whole-document `json_merge`, a commented or trailing-comma
-// file was a conflict (formatting would be lost silently); the in-place CST
-// edit keeps them, so applying now succeeds.
+// The in-place edit keeps comments and trailing commas, so applying a file
+// that has them succeeds.
 
 #[test]
 fn comments_and_trailing_commas_are_preserved() {
@@ -567,8 +566,7 @@ fn settings_path_on_windows() {
 }
 
 // --- githubModels removes the managed chatLanguageModels.json entry, through
-// the existing reconcile::plan. Unlike every test above,
-// this one exercises real (non-stub) code and should pass today. -----------
+// the existing reconcile::plan. -----------------------------------------
 
 #[test]
 fn github_models_removes_the_managed_chat_language_models_entry_through_reconcile_plan() {
@@ -1404,4 +1402,36 @@ fn a_duplicated_ignore_list_is_a_conflict() {
         edit_settings(Some(&text), MANAGED_URL, None),
         Err(SettingsConflict::DuplicateKey)
     );
+}
+
+// Added with the implementation (not part of the spec-derived baseline).
+#[test]
+fn removal_records_unchanged_only_when_something_of_ours_was_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_user_settings(&path, &json!({ "editor.fontSize": 14 }));
+    // No program, no sidecar: nothing of ours, nothing recorded.
+    let plan_without = apply_removal(&path, Some((listen_addr(), PAIRING)), None);
+    assert!(
+        plan_without.render().contains("0 changes, 0 unchanged"),
+        "{}",
+        plan_without.render()
+    );
+    // A sidecar and a deleted file: recorded as unchanged, sidecar removed.
+    apply_managed(
+        &path,
+        listen_addr(),
+        PAIRING,
+        &github_models_config(),
+        &gateway_with_proxy(),
+    );
+    fs::remove_file(&path).unwrap();
+    let plan_absent = apply_removal(&path, Some((listen_addr(), PAIRING)), None);
+    assert!(
+        plan_absent.render().contains("1 unchanged"),
+        "{}",
+        plan_absent.render()
+    );
+    plan_absent.apply().unwrap();
+    assert!(!super::super::json_merge::state_path(&path).exists());
 }

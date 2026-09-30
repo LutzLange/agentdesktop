@@ -294,8 +294,8 @@ pub(super) fn edit_settings(
             }
         }
         None => {
-            // Without a record, an override already equal to our own URL was
-            // written by this daemon: it is not the user's value, our entries
+            // Without a record, an override equal to our own URL or to another
+            // agentdesktop loopback CAPI URL was written by a daemon: it is not the user's value, our entries
             // next to it are ours too, and an ignore list holding nothing but
             // them was created by it.
             let ours = existing_value
@@ -353,8 +353,9 @@ fn is_daemon_capi_url(value: &str) -> bool {
 /// appended when the user deleted the property meanwhile; removed when there
 /// was none), `added_ignored` entries are taken out, and the array property
 /// goes when the daemon created it and it is now empty. Without a sidecar,
-/// an override equal to `own_url` and our two entries are removed by value,
-/// and an unparseable file is left alone.
+/// an override equal to `own_url` or to any agentdesktop loopback CAPI URL,
+/// and our two entries, are removed by value; an unparseable file is left
+/// alone.
 pub(super) fn remove_settings(
     text: &str,
     state: Option<&SettingsState>,
@@ -407,15 +408,13 @@ pub(super) fn remove_settings(
         }
     };
 
-    {
-        match (object.get(OVERRIDE_KEY), restore) {
-            (Some(property), Some(value)) => property.set_value(input_value(&value)),
-            (Some(property), None) => property.remove(),
-            (None, Some(value)) => {
-                object.append(OVERRIDE_KEY, input_value(&value));
-            }
-            (None, None) => {}
+    match (object.get(OVERRIDE_KEY), restore) {
+        (Some(property), Some(value)) => property.set_value(input_value(&value)),
+        (Some(property), None) => property.remove(),
+        (None, Some(value)) => {
+            object.append(OVERRIDE_KEY, input_value(&value));
         }
+        (None, None) => {}
     }
     if let Some(ignored) = object.array_value(IGNORED_SETTINGS_KEY) {
         for node in ignored.elements() {
@@ -563,8 +562,9 @@ pub(super) fn plan(
 }
 
 /// Removes the managed keys: through the sidecar when there is one, by value
-/// (an override pointing at this daemon's listener with its pairing) when
-/// there is none. The file keeps its mode.
+/// (an override pointing at an agentdesktop loopback CAPI route) when there
+/// is none. The file keeps its mode. Like the other managed files, `unchanged`
+/// is recorded only when there was something of ours to remove (a sidecar).
 fn remove(
     path: &Path,
     state_path: &Path,
@@ -589,7 +589,9 @@ fn remove(
         };
         match removal {
             Ok(Removal::Unchanged) => {
-                plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, "unchanged", path);
+                if sidecar.is_some() {
+                    plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, "unchanged", path);
+                }
             }
             Ok(Removal::Write(text)) => {
                 plan.record_diff(
@@ -610,6 +612,8 @@ fn remove(
             }
             Err(kind) => return conflict(path, kind, plan),
         }
+    } else if sidecar.is_some() {
+        plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, "unchanged", path);
     }
     if sidecar.is_some() {
         plan.remove_file(state_path)
@@ -632,8 +636,10 @@ fn read_optional(path: &Path, plan: &ReconcilePlan) -> anyhow::Result<Option<Vec
     }
 }
 
-/// The sidecar's bytes and its parsed state; an unreadable sidecar is a
-/// warning (the sidecar-less rules apply and the next write replaces it).
+/// The sidecar's bytes and its parsed state. A sidecar that cannot be parsed
+/// is a warning (the sidecar-less rules apply and the next write replaces
+/// it); one that cannot be read at all (permissions) is an error, as for any
+/// managed file.
 fn read_sidecar(
     state_path: &Path,
     plan: &ReconcilePlan,
@@ -642,7 +648,7 @@ fn read_sidecar(
     let state = bytes.as_deref().and_then(|bytes| {
         let state = read_state(bytes);
         if state.is_none() {
-            warn!(path = %state_path.display(), "ignoring an unreadable VS Code settings sidecar");
+            warn!(path = %state_path.display(), "ignoring a VS Code settings sidecar that cannot be parsed");
         }
         state
     });
