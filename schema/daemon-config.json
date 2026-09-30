@@ -274,6 +274,14 @@
           "$ref": "#/$defs/OpenCodeStartupConfig",
           "default": {}
         },
+        "reconcileInterval": {
+          "description": "Opt-in interval between periodic re-applies of the current\nconfiguration, which repair drift (a managed file deleted or edited by\nhand, a fixed conflict, a loosened mode) without rewriting anything\nunchanged. Unset means no periodic re-apply; a controller-managed\ndevice still re-applies the controller's configuration on every\nreconnect. Must be greater than zero; read at startup only (restart the\ndaemon after changing it).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "socket": {
           "description": "Local API Unix socket or Windows named pipe.",
           "type": [
