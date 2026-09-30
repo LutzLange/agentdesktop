@@ -1,4 +1,5 @@
-//! Periodic re-apply of the daemon's current configuration (PR 5).
+//! Periodic re-apply of the daemon's current configuration (opt-in,
+//! `daemon.reconcileInterval`).
 //!
 //! A managed file deleted or edited by hand, a conflict the user has fixed,
 //! or a managed file whose mode was loosened stay as they are until the next
@@ -45,8 +46,38 @@ pub(crate) async fn run_tick_with<F>(
 ) where
     F: FnMut(&DaemonConfig) -> (ApplyReport, anyhow::Result<()>),
 {
-    let _ = (current, interval, statuses, apply);
-    todo!("PR 5 AC3/AC6: periodic reapply loop, forwarding outcomes to `statuses`")
+    if interval.is_zero() {
+        tracing::warn!("reconcile interval is zero; not scheduling periodic re-applies");
+        return;
+    }
+    let mut current = current;
+    let mut apply = apply;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticks.tick() => {}
+            changed = current.changed() => {
+                // A new configuration is picked up at the next tick; a
+                // dropped sender (daemon shutdown) ends the loop.
+                if changed.is_err() {
+                    return;
+                }
+                continue;
+            }
+        }
+        let Some(snapshot) = current.borrow_and_update().clone() else {
+            continue;
+        };
+        let (report, result) = apply(&snapshot.config);
+        if let Some(statuses) = &statuses {
+            statuses.send_replace(Some(TickStatus {
+                revision: snapshot.revision,
+                report,
+                error: result.err().map(|error| format!("{error:#}")),
+            }));
+        }
+    }
 }
 
 /// [`run_tick_with`] applying through a real [`Reconciler`].
@@ -57,7 +88,14 @@ pub(crate) async fn run_tick(
     statuses: Option<watch::Sender<Option<TickStatus>>>,
 ) {
     run_tick_with(current, interval, statuses, move |config| {
-        reconciler.apply_with_report(config)
+        let (previous, report, result) = reconciler.apply_after_previous(config);
+        if crate::reconcile::should_log(previous.as_ref(), &report) {
+            report.log();
+        }
+        if let Err(error) = &result {
+            tracing::warn!(error = %format!("{error:#}"), "reconcile tick failed");
+        }
+        (report, result)
     })
     .await
 }

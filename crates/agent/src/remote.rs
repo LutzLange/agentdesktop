@@ -39,7 +39,7 @@ use crate::{
     oidc,
     reconcile::Reconciler,
     secure_fs,
-    tick::TickStatus,
+    tick::{CurrentConfig, TickStatus},
 };
 
 static OAUTH_REFRESH_MUTEX: Mutex<()> = Mutex::const_new(());
@@ -57,6 +57,17 @@ pub struct LogoutRequest {
 pub struct Requests {
     pub telemetry: mpsc::Receiver<ModelTelemetryEvent>,
     pub logout: mpsc::Receiver<LogoutRequest>,
+    /// The daemon's current configuration, replaced by each pushed
+    /// configuration that parses (read by the reconcile tick).
+    pub(crate) current: watch::Sender<Option<CurrentConfig>>,
+    /// Reconcile tick outcomes, when the tick is enabled.
+    pub(crate) tick_statuses: Option<watch::Receiver<Option<TickStatus>>>,
+}
+
+/// The configuration channels shared with the reconcile tick.
+struct ConfigChannels {
+    current: watch::Sender<Option<CurrentConfig>>,
+    tick_statuses: Option<watch::Receiver<Option<TickStatus>>>,
 }
 
 pub async fn run(
@@ -71,7 +82,13 @@ pub async fn run(
     let Requests {
         mut telemetry,
         mut logout,
+        current,
+        tick_statuses,
     } = requests;
+    let mut channels = ConfigChannels {
+        current,
+        tick_statuses,
+    };
     let identity_path = state_dir.join("identity.json");
     loop {
         let mut identity = match identity::load(&identity_path)? {
@@ -143,6 +160,7 @@ pub async fn run(
                     &state_dir,
                     &reconciler,
                     &mut telemetry,
+                    &mut channels,
                 ) => Some(result),
                 Some(request) = logout.recv() => {
                     if complete_logout(request, &identity_path, &identity, &enrollment).await {
@@ -328,8 +346,18 @@ async fn connect(
     state_dir: &Path,
     reconciler: &Reconciler,
     telemetry: &mut mpsc::Receiver<ModelTelemetryEvent>,
+    channels: &mut ConfigChannels,
 ) -> anyhow::Result<()> {
     let mut client = client(controller, Some(identity)).await?;
+    // Tick outcomes produced before this stream are not sent on it; the
+    // controller's configuration push on connect reports anyway.
+    if let Some(statuses) = channels.tick_statuses.as_mut() {
+        statuses.borrow_and_update();
+    }
+    // The revision of the last configuration received on this stream and the
+    // last status sent on it, for deciding whether a tick outcome is news.
+    let mut stream_revision = None;
+    let mut last_sent: Option<ConfigStatus> = None;
     let (sender, receiver) = mpsc::channel(16);
     let mut request = Request::new(ReceiverStream::new(receiver));
     authenticate_request(identity, &mut request)?;
@@ -382,6 +410,13 @@ async fn connect(
             snapshot = next_inventory(discovered) => {
                 send_inventory(&sender, &snapshot).await?;
             }
+            tick = next_tick_status(&mut channels.tick_statuses) => {
+                if let Some(status) = tick_config_status(last_sent.as_ref(), stream_revision, &tick) {
+                    info!(revision = status.revision, "reporting a changed reconcile outcome");
+                    last_sent = Some(status.clone());
+                    send(&sender, agent_message::Message::ConfigStatus(status)).await?;
+                }
+            }
             message = inbound.message() => {
                 let Some(message) = message.context("read controller stream")? else {
                     return Ok(());
@@ -392,7 +427,10 @@ async fn connect(
                         bytes = config.yaml.len(),
                         "received daemon configuration"
                     );
+                    stream_revision = Some(config.revision);
+                    replace_current_config(&channels.current, &config);
                     let status = apply_daemon_config(state_dir, config, reconciler);
+                    last_sent = Some(status.clone());
                     if status.error.is_empty() {
                         info!(revision = status.revision, "applied daemon configuration");
                     } else {
@@ -446,17 +484,7 @@ fn apply_daemon_config(
 ) -> ConfigStatus {
     let mut programs = Vec::new();
     let result = (|| -> anyhow::Result<()> {
-        let actual_hash = Sha256::digest(&config.yaml);
-        if actual_hash.as_slice() != config.sha256 {
-            bail!("configuration hash does not match payload");
-        }
-        debug!(
-            revision = config.revision,
-            "verified daemon configuration hash"
-        );
-
-        let yaml = std::str::from_utf8(&config.yaml).context("configuration is not UTF-8")?;
-        let daemon_config = config::parse_daemon(yaml)?;
+        let daemon_config = parse_pushed_config(&config)?;
         debug!(revision = config.revision, "parsed daemon configuration");
         let (report, applied) = reconciler.apply_with_report(&daemon_config);
         report.log();
@@ -517,8 +545,8 @@ fn program_state_proto(state: crate::reconcile::ProgramState) -> ProtoProgramSta
     }
 }
 
-/// The `ConfigStatus` a tick's outcome should send on this stream, if any
-/// (PR 5, AC6). A status is sent only when the tick's revision is `Some` and
+/// The `ConfigStatus` a tick's outcome should send on this stream, if any.
+/// A status is sent only when the tick's revision is `Some` and
 /// equals the revision of the last `DaemonConfig` received on this stream,
 /// and the device state, the error, or any program's `(program, state,
 /// detail)` differs from `last_sent` (the last `ConfigStatus` sent on this
@@ -531,8 +559,69 @@ pub(crate) fn tick_config_status(
     stream_revision: Option<u64>,
     tick: &TickStatus,
 ) -> Option<ConfigStatus> {
-    let _ = (last_sent, stream_revision, tick);
-    todo!("PR 5 AC6: dedup a tick's outcome against the last ConfigStatus sent on this stream")
+    if tick.revision.is_none() || tick.revision != stream_revision {
+        return None;
+    }
+    let revision = tick.revision.unwrap_or_default();
+    let programs: Vec<ProgramStatus> = tick
+        .report
+        .programs
+        .iter()
+        .map(|outcome| ProgramStatus {
+            program: outcome.program.to_owned(),
+            state: program_state_proto(outcome.state).into(),
+            detail: outcome.detail.clone(),
+        })
+        .collect();
+    let status = match &tick.error {
+        None => ConfigStatus {
+            revision,
+            state: ConfigState::Applied.into(),
+            error: String::new(),
+            programs,
+            programs_reported: true,
+        },
+        Some(error) => ConfigStatus {
+            revision,
+            state: ConfigState::Failed.into(),
+            error: error.clone(),
+            programs,
+            programs_reported: true,
+        },
+    };
+    let Some(last_sent) = last_sent else {
+        return Some(status);
+    };
+    let differs = last_sent.state != status.state
+        || last_sent.error != status.error
+        || crate::reconcile::outcomes_differ(
+            &status_keys(&last_sent.programs),
+            &status_keys(&status.programs),
+        );
+    differs.then_some(status)
+}
+
+/// `(program, state, detail)` of each reported program, for
+/// [`crate::reconcile::outcomes_differ`].
+fn status_keys(programs: &[ProgramStatus]) -> Vec<(&str, crate::reconcile::ProgramState, &str)> {
+    use crate::reconcile::ProgramState;
+    programs
+        .iter()
+        .map(|program| {
+            let state = match ProtoProgramState::try_from(program.state) {
+                Ok(ProtoProgramState::Applied) => ProgramState::Applied,
+                Ok(ProtoProgramState::Unchanged) => ProgramState::Unchanged,
+                Ok(ProtoProgramState::Removed) => ProgramState::Removed,
+                Ok(ProtoProgramState::Conflict) => ProgramState::Conflict,
+                Ok(ProtoProgramState::Inactive) => ProgramState::Inactive,
+                Ok(ProtoProgramState::Blocked) => ProgramState::Blocked,
+                Ok(ProtoProgramState::Failed | ProtoProgramState::Unspecified) | Err(_) => {
+                    ProgramState::Failed
+                }
+            };
+            (program.program.as_str(), state, program.detail.as_str())
+        })
+        .collect()
 }
 
 /// Sends the current inventory snapshot to the controller.
@@ -604,6 +693,52 @@ async fn send_inventory(
 
 /// Resolves with the next inventory snapshot, and never resolves once the
 /// refresher has stopped, so the controller stream keeps running without it.
+/// The next reconcile tick outcome; never resolves when the tick is off or
+/// has stopped.
+async fn next_tick_status(
+    statuses: &mut Option<watch::Receiver<Option<TickStatus>>>,
+) -> TickStatus {
+    if let Some(statuses) = statuses.as_mut() {
+        while statuses.changed().await.is_ok() {
+            if let Some(tick) = statuses.borrow_and_update().clone() {
+                return tick;
+            }
+        }
+    }
+    std::future::pending().await
+}
+
+/// Makes a pushed configuration the current one for the reconcile tick if it
+/// parses, whether or not its apply then succeeds; a push that does not
+/// parse leaves the current configuration as it is.
+fn replace_current_config(
+    current: &watch::Sender<Option<CurrentConfig>>,
+    config: &agentdesktop_proto::fleet::DaemonConfig,
+) {
+    if let Ok(parsed) = parse_pushed_config(config) {
+        current.send_replace(Some(CurrentConfig {
+            revision: Some(config.revision),
+            config: Arc::new(parsed),
+        }));
+    }
+}
+
+/// Hash, UTF-8 and parse checks of a pushed configuration.
+fn parse_pushed_config(
+    config: &agentdesktop_proto::fleet::DaemonConfig,
+) -> anyhow::Result<agentdesktop_core::config::DaemonConfig> {
+    let actual_hash = Sha256::digest(&config.yaml);
+    if actual_hash.as_slice() != config.sha256 {
+        bail!("configuration hash does not match payload");
+    }
+    debug!(
+        revision = config.revision,
+        "verified daemon configuration hash"
+    );
+    let yaml = std::str::from_utf8(&config.yaml).context("configuration is not UTF-8")?;
+    config::parse_daemon(yaml)
+}
+
 async fn next_inventory(
     discovered: &mut watch::Receiver<Arc<AgentDiscovery>>,
 ) -> Arc<AgentDiscovery> {
@@ -958,7 +1093,7 @@ mod tests {
         }
     }
 
-    // --- Tick reporting dedup (PR 5, AC6) ------------------------------------
+    // --- Tick reporting dedup --------------------------------------------------
 
     fn program_report(
         state: crate::reconcile::ProgramState,
@@ -1112,5 +1247,30 @@ mod tests {
         assert_eq!(status.state, super::ConfigState::Failed as i32);
         assert_eq!(status.error, "disk full");
         assert!(status.programs_reported);
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn only_a_push_that_parses_replaces_the_current_configuration() {
+        use sha2::{Digest, Sha256};
+        let pushed = |revision: u64, yaml: &str| agentdesktop_proto::fleet::DaemonConfig {
+            revision,
+            yaml: yaml.as_bytes().to_vec(),
+            sha256: Sha256::digest(yaml.as_bytes()).to_vec(),
+        };
+        let (current, receiver) = tokio::sync::watch::channel(None);
+        super::replace_current_config(&current, &pushed(1, "programs: {}\n"));
+        assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(1));
+        // Does not parse (unknown key): the current configuration stays.
+        super::replace_current_config(&current, &pushed(2, "notAKey: 1\n"));
+        assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(1));
+        // Wrong hash: stays.
+        let mut tampered = pushed(3, "programs: {}\n");
+        tampered.sha256 = vec![0; 32];
+        super::replace_current_config(&current, &tampered);
+        assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(1));
+        // Parses (its apply may still fail later): replaced.
+        super::replace_current_config(&current, &pushed(4, "programs:\n  grok: {}\n"));
+        assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(4));
     }
 }

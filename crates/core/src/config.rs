@@ -91,11 +91,13 @@ pub struct DaemonStartupConfig {
     /// Local loopback LLM proxy.
     #[serde(default)]
     pub llm_proxy: LlmProxyStartupConfig,
-    /// Interval between periodic re-applies of the current configuration,
-    /// which repair drift (a managed file deleted or edited by hand, a fixed
-    /// conflict, a loosened mode) without rewriting anything unchanged.
-    /// Defaults to `5m`, must be greater than zero, read at startup only
-    /// (restart the daemon after changing it).
+    /// Opt-in interval between periodic re-applies of the current
+    /// configuration, which repair drift (a managed file deleted or edited by
+    /// hand, a fixed conflict, a loosened mode) without rewriting anything
+    /// unchanged. Unset means no periodic re-apply; a controller-managed
+    /// device still re-applies the controller's configuration on every
+    /// reconnect. Must be greater than zero; read at startup only (restart the
+    /// daemon after changing it).
     #[serde(default, with = "humantime_serde::option")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub reconcile_interval: Option<Duration>,
@@ -1149,6 +1151,16 @@ fn parse_local_daemon(contents: &str) -> anyhow::Result<DaemonConfig> {
     }
     if config.inventory_interval.is_zero() {
         anyhow::bail!("inventoryInterval must be greater than zero");
+    }
+    if config
+        .daemon
+        .as_ref()
+        .and_then(|daemon| daemon.reconcile_interval)
+        .is_some_and(|interval| interval.is_zero())
+    {
+        anyhow::bail!(
+            "daemon.reconcileInterval must be greater than zero (leave it unset for no periodic re-apply)"
+        );
     }
     validate_daemon(
         config.llm_gateway.as_ref(),

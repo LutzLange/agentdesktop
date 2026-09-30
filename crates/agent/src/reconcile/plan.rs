@@ -161,7 +161,13 @@ impl ReconcilePlan {
                     .map_err(|error| (error, ApplyStop::PrivateDir(dir.clone())))?;
             }
         }
+        let observed = self.observed.into_inner();
         for (index, change) in self.operations.into_inner().into_iter().enumerate() {
+            if let Some(contents) = &change.contents
+                && already_in_place(&change.path, contents, change.permissions, &observed)
+            {
+                continue;
+            }
             let result = (|| -> anyhow::Result<()> {
                 match change.contents {
                     Some(contents) => {
@@ -315,7 +321,35 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-// --- No-op writes skipped (PR 5, AC5) --------------------------------------
+// --- No-op writes skipped ----------------------------------------------------
+
+/// Whether a planned write would change nothing: the file already holds the
+/// planned bytes (as observed when planning, which the apply has just
+/// verified) and, on Unix, grants no permission bit outside the planned
+/// mode. A file looser than planned is rewritten; a stricter one is left.
+fn already_in_place(
+    path: &Path,
+    contents: &[u8],
+    permissions: u32,
+    observed: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+) -> bool {
+    if observed.get(path).and_then(Option::as_deref) != Some(contents) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(path) {
+            Ok(metadata) => metadata.permissions().mode() & !permissions & 0o777 == 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = permissions;
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {

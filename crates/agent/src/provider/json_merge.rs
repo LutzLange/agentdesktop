@@ -170,8 +170,12 @@ pub(super) fn plan_merge_with(
     let mut contents = serde_json::to_vec_pretty(&combined)
         .with_context(|| format!("serialize merged {display_name}"))?;
     contents.push(b'\n');
+    // An unchanged file that grants more than `options.mode` is rewritten
+    // with the same bytes at that mode (the plan skips identical writes
+    // otherwise).
+    let looser = current_mode(path).is_some_and(|mode| mode & !options.mode & 0o777 != 0);
     let action = match existing.as_deref() {
-        Some(existing) if existing == contents => "unchanged",
+        Some(existing) if existing == contents && !looser => "unchanged",
         Some(_) => "update",
         None => "create",
     };
@@ -885,7 +889,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"42\n");
     }
 
-    // --- No-op writes skipped (PR 5, AC5) ------------------------------------
+    // --- No-op writes skipped --------------------------------------------------
 
     #[test]
     #[cfg(unix)]

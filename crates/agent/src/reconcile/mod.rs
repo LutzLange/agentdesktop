@@ -37,10 +37,11 @@ pub use crate::provider::{
 pub struct Reconciler {
     context: ReconcileContext,
     providers: Arc<Vec<Box<dyn Provider>>>,
-    /// Serializes `apply_with_report` across clones (PR 5, AC4): held for
-    /// planning and applying, never across an `.await`. `plan`,
-    /// `plan_with_report` and `dry_run` take no lock.
-    apply_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes applies across clones (a push, the startup apply and a
+    /// reconcile tick never overlap): held for planning and applying, never
+    /// across an `.await`. `plan`, `plan_with_report` and `dry_run` take no
+    /// lock. Holds the report of the last apply, for the tick's log rule.
+    apply_lock: Arc<std::sync::Mutex<Option<ApplyReport>>>,
 }
 
 impl Reconciler {
@@ -95,7 +96,7 @@ impl Reconciler {
                 }),
                 Box::new(Ollama),
             ]),
-            apply_lock: Arc::new(std::sync::Mutex::new(())),
+            apply_lock: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -192,9 +193,26 @@ impl Reconciler {
         }
     }
 
-    /// [`Reconciler::plan_with_report`] followed by [`AttributedPlan::apply`].
+    /// [`Reconciler::plan_with_report`] followed by [`AttributedPlan::apply`],
+    /// under the apply lock.
     pub fn apply_with_report(&self, config: &DaemonConfig) -> (ApplyReport, anyhow::Result<()>) {
-        self.plan_with_report(config).apply()
+        let (_, report, result) = self.apply_after_previous(config);
+        (report, result)
+    }
+
+    /// Like [`Reconciler::apply_with_report`], also returning the report of
+    /// the apply before this one (from any source), read under the same lock.
+    pub(crate) fn apply_after_previous(
+        &self,
+        config: &DaemonConfig,
+    ) -> (Option<ApplyReport>, ApplyReport, anyhow::Result<()>) {
+        let mut last = self
+            .apply_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (report, result) = self.plan_with_report(config).apply();
+        let previous = last.replace(report.clone());
+        (previous, report, result)
     }
 }
 
@@ -300,8 +318,44 @@ impl ApplyReport {
 /// `Removed` to `Unchanged` is not itself a difference. `previous: None`
 /// (nothing has been applied yet) always logs.
 pub(crate) fn should_log(previous: Option<&ApplyReport>, current: &ApplyReport) -> bool {
-    let _ = (previous, current);
-    todo!("PR 5 AC6: gate a tick's outcome lines on a real difference from the last apply")
+    let Some(previous) = previous else {
+        return true;
+    };
+    outcomes_differ(
+        &outcome_keys(&previous.programs),
+        &outcome_keys(&current.programs),
+    )
+}
+
+/// `(program, state, detail)` of each outcome, for [`outcomes_differ`].
+pub(crate) fn outcome_keys(programs: &[ProgramOutcome]) -> Vec<(&str, ProgramState, &str)> {
+    programs
+        .iter()
+        .map(|outcome| (outcome.program, outcome.state, outcome.detail.as_str()))
+        .collect()
+}
+
+/// Whether two outcome lists differ by program, state or detail. A program
+/// that settles from applied or removed to unchanged, or a removed program
+/// that is no longer listed, is not a difference: the files are as reported.
+pub(crate) fn outcomes_differ(
+    previous: &[(&str, ProgramState, &str)],
+    current: &[(&str, ProgramState, &str)],
+) -> bool {
+    let changed = current.iter().any(|&(program, state, detail)| {
+        match previous.iter().find(|(before, _, _)| *before == program) {
+            None => true,
+            Some(&(_, before_state, before_detail)) => {
+                let settled = state == ProgramState::Unchanged
+                    && matches!(before_state, ProgramState::Applied | ProgramState::Removed);
+                !settled && (state != before_state || detail != before_detail)
+            }
+        }
+    });
+    let gone = previous.iter().any(|&(program, state, _)| {
+        state != ProgramState::Removed && !current.iter().any(|(now, _, _)| *now == program)
+    });
+    changed || gone
 }
 
 /// The longest detail an outcome carries, in bytes.
@@ -1801,7 +1855,7 @@ programs:
         let _ = fs::remove_dir_all(&root);
     }
 
-    // --- No-op writes skipped, full reconciler (PR 5, AC5) -------------------
+    // --- No-op writes skipped, full reconciler ---------------------------------
 
     fn sidecar_path(path: &Path) -> PathBuf {
         let name = path.file_name().unwrap().to_str().unwrap();
@@ -1957,7 +2011,7 @@ programs:
         let _ = fs::remove_dir_all(&root);
     }
 
-    // --- Serialized applies (PR 5, AC4) --------------------------------------
+    // --- Serialized applies ----------------------------------------------------
 
     /// A provider whose `plan` records that it was entered (in order) and,
     /// only the first time, blocks until `release` is signalled. Later calls
@@ -2058,7 +2112,7 @@ programs:
         );
     }
 
-    // --- Tick logging dedup (PR 5, AC6) --------------------------------------
+    // --- Tick logging dedup ----------------------------------------------------
 
     fn outcome_report(state: ProgramState, detail: &str) -> ApplyReport {
         ApplyReport {
