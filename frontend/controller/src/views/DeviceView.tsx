@@ -129,7 +129,12 @@ export function DeviceView({
                       <code title={program.detail}>{program.detail}</code>
                     )}
                   </span>
-                  <time>{formatTime(program.updated_at)}</time>
+                  <time>
+                    {program.revision !== device.config_revision
+                      ? `r${program.revision} · `
+                      : ""}
+                    {formatTime(program.updated_at)}
+                  </time>
                 </div>
               ))}
             </div>
