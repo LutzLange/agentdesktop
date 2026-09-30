@@ -127,7 +127,7 @@ pub struct DeviceDetail {
 }
 
 /// Bounds on what an agent reports per program, as for telemetry fields.
-fn validate_program_status(status: &ConfigStatus) -> anyhow::Result<()> {
+pub(crate) fn validate_program_status(status: &ConfigStatus) -> anyhow::Result<()> {
     anyhow::ensure!(
         status.programs.len() <= 32,
         "too many programs in configuration status"
@@ -542,6 +542,33 @@ impl Database {
             .await?;
         }
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Stores only the device-wide status (revision, state, error) and keeps
+    /// the program rows and `programs_reported` of the last accepted report.
+    pub async fn update_device_config_state(
+        &self,
+        device_id: &str,
+        status: &ConfigStatus,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO device_config_status
+                (device_id, revision, state, error, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (device_id) DO UPDATE SET
+                revision = excluded.revision,
+                state = excluded.state,
+                error = excluded.error,
+                updated_at = excluded.updated_at",
+        )
+        .bind(device_id)
+        .bind(i64::try_from(status.revision).unwrap_or(i64::MAX))
+        .bind(i64::from(status.state))
+        .bind(&status.error)
+        .bind(unix_time_seconds())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

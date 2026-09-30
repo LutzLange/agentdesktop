@@ -1754,4 +1754,34 @@ programs:
         assert!(!copilot.detail.contains(PAIRING), "{}", copilot.detail);
         let _ = fs::remove_dir_all(&root);
     }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_that_cannot_be_created_fails_its_owner_and_blocks_the_rest() {
+        // SAFETY: geteuid has no preconditions and does not dereference pointers.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores directory permissions.
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let root = new_root("private-dir");
+        let config = parse_daemon(
+            "llmGateway:\n  url: https://gateway.example.com\nprograms:\n  claudeCode: {}\n  vscode:\n    models:\n      gpt-4.1-mini: {}\n",
+        )
+        .unwrap();
+        let reconciler = full_reconciler(&root).with_llm_proxy(Some(proxy_context("PAIRING-PD")));
+        let attributed = reconciler.plan_with_report(&config);
+        // The VS Code profile directory the plan wants to create owner-only
+        // cannot be created any more.
+        fs::create_dir_all(root.join("vscode")).unwrap();
+        fs::set_permissions(root.join("vscode"), fs::Permissions::from_mode(0o500)).unwrap();
+        let (report, result) = attributed.apply();
+        fs::set_permissions(root.join("vscode"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        let state = |program| program_outcome(&report, program).map(|outcome| outcome.state);
+        assert_eq!(state("vscode"), Some(ProgramState::Failed));
+        assert_eq!(state("claude-code"), Some(ProgramState::Blocked));
+        assert!(!root.join("claude").exists(), "nothing is written");
+        let _ = fs::remove_dir_all(&root);
+    }
 }

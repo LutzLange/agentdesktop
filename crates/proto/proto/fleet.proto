@@ -175,8 +175,8 @@ enum ConfigState {
 
 // One managed program's outcome from an apply. `program` is the provider ID
 // (for example `claude-code`, `vscode`); `detail` is at most 1024 bytes and
-// carries paths, fixed reasons and the error chain of the apply (the same
-// text as `ConfigStatus.error`), which does not quote managed file content.
+// carries paths, fixed reasons and error chains of the kind sent in
+// `ConfigStatus.error`, which do not quote managed file content.
 message ProgramStatus {
   string program = 1;
   ProgramState state = 2;

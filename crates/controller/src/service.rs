@@ -510,26 +510,22 @@ async fn handle_agent_message(
 /// Stores a device's configuration status. A per-program report the
 /// controller rejects must not break the stream (the agent would reconnect,
 /// receive the configuration again and send the same report), so the
-/// device-wide status is kept and the program rows are dropped.
+/// device-wide status is stored and the last accepted program rows stay.
+/// Database errors are returned as they are.
 async fn store_config_status(
     database: &Database,
     device_id: &str,
     status: &ConfigStatus,
 ) -> anyhow::Result<()> {
-    let Err(error) = database.update_config_status(device_id, status).await else {
-        return Ok(());
-    };
-    warn!(
-        device_id,
-        error = %format!("{error:#}"),
-        "rejected per-program configuration status; storing the device status without it"
-    );
-    let device_only = ConfigStatus {
-        programs: Vec::new(),
-        programs_reported: false,
-        ..status.clone()
-    };
-    database.update_config_status(device_id, &device_only).await
+    if let Err(error) = crate::database::validate_program_status(status) {
+        warn!(
+            device_id,
+            error = %format!("{error:#}"),
+            "rejected per-program configuration status; storing the device status and keeping the last accepted program status"
+        );
+        return database.update_device_config_state(device_id, status).await;
+    }
+    database.update_config_status(device_id, status).await
 }
 
 fn bearer_credential(metadata: &tonic::metadata::MetadataMap) -> Result<&str, Status> {
@@ -698,6 +694,20 @@ mod tests {
             .enroll_device("device", "host", "issuer", "subject", None)
             .await
             .unwrap();
+        let accepted = ConfigStatus {
+            revision: 2,
+            state: ConfigState::Applied.into(),
+            error: String::new(),
+            programs: vec![ProgramStatus {
+                program: "claude-code".to_owned(),
+                state: ProgramState::Applied.into(),
+                detail: String::new(),
+            }],
+            programs_reported: true,
+        };
+        super::store_config_status(&database, "device", &accepted)
+            .await
+            .unwrap();
         let status = ConfigStatus {
             revision: 3,
             state: ConfigState::Failed.into(),
@@ -715,8 +725,16 @@ mod tests {
         let device = database.get_device("device").await.unwrap().unwrap();
         assert_eq!(device.device.config_revision, Some(3));
         assert_eq!(device.device.config_state, Some(2));
-        assert!(device.programs.is_empty());
-        assert_eq!(device.programs_reported, Some(false));
+        assert_eq!(
+            device
+                .programs
+                .iter()
+                .map(|program| program.program.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude-code"],
+            "the last accepted program rows stay"
+        );
+        assert_eq!(device.programs_reported, Some(true));
         drop(database);
         let _ = std::fs::remove_file(path);
     }
