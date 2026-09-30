@@ -62,6 +62,10 @@ fn options() -> json_merge::MergeOptions {
         keyed_arrays: &[],
         // The file holds the pairing and possibly the user's own secrets.
         redact_diff: true,
+        // The override is the daemon's while managed: a hand edit of the URL
+        // is replaced on the next apply and never becomes "the user's value"
+        // that removal would put back (a stale override breaks Copilot Chat).
+        owned_keys: &[OVERRIDE_KEY],
     }
 }
 

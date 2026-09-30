@@ -559,3 +559,38 @@ fn github_models_removes_the_managed_chat_language_models_entry_through_reconcil
         "chatLanguageModels.json must be cleaned up once githubModels is active"
     );
 }
+
+// Added with the implementation (not part of the spec-derived baseline):
+// a hand edit of the managed URL after the merge is drift, not the user's
+// value; removal must not put it back (lab G3 -> G5 on pr3b-v2).
+#[test]
+fn hand_edited_override_is_replaced_on_reapply_and_not_restored_on_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+    write_user_settings(&path, &serde_json::json!({ "editor.fontSize": 14 }));
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    let managed_url = override_url(listen_addr(), PAIRING);
+
+    // Hand edit of our URL, then a daemon restart (re-apply).
+    let mut edited = read(&path);
+    edited[OVERRIDE_KEY] = Value::String(format!("{managed_url}x"));
+    write_user_settings(&path, &edited);
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    assert_eq!(read(&path)[OVERRIDE_KEY], managed_url, "hand edit replaced");
+
+    // Removal: the key goes; the hand-edited value is not "the user's".
+    let removal = apply_removal(
+        &path,
+        Some((listen_addr(), PAIRING)),
+        Some((&own_models_config(), Some(&gateway))),
+    );
+    removal.apply().unwrap();
+    let remaining = read(&path);
+    assert!(
+        remaining.get(OVERRIDE_KEY).is_none(),
+        "stale override restored: {remaining}"
+    );
+    assert_eq!(remaining["editor.fontSize"], 14);
+}

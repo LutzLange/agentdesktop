@@ -452,7 +452,13 @@ removal; `github.copilot.internal.capiUrl` is the newer alias of the same
 setting and is only added to the ignore list, not written. The file is written
 owner-only (an existing world-readable file is tightened, since the URL
 carries the pairing) and removal keeps the mode it finds; the sidecar is
-`.settings.json.agentdesktop`. The first apply rewrites the file as plain JSON
+`.settings.json.agentdesktop`. VS Code itself saves the file with its own
+default mode (664 with a new inode when a setting is changed in the UI), so the
+URL is readable to the group and others until the daemon's next apply
+tightens it again (a config push or a daemon restart). The override key is the
+daemon's while the program is active: a hand edit of the URL is replaced on
+the next apply and is not kept as the user's value on removal (only a value
+the key had before the first apply comes back). The first apply rewrites the file as plain JSON
 with sorted keys and two-space indentation. The file must stay plain JSON: a
 `settings.json` with comments or trailing commas (the most likely conflict on
 a developer's machine, since VS Code accepts both) is a conflict, not
@@ -491,8 +497,12 @@ verified with Business seats against `api.business.githubcopilot.com`; other
 plans use another host, which a signed-in VS Code shows in its Copilot Chat log
 (the `_ping` requests), so take it from there before writing the route. The
 route validates the controller JWT, restores the client's token as the bearer
-for GitHub and forwards. Its `requestTimeout` bounds request/response
-exchanges; an established WebSocket tunnel is not cut by it.
+for GitHub and forwards. The backend must speak HTTP/1.1 to GitHub (`alpn`):
+with the default ALPN, GitHub answers the forwarded upgrade with `400
+websocket: the client is not using the websocket protocol` and VS Code falls
+back to plain `POST /responses` (turns still answer, without the WebSocket).
+Its `requestTimeout` bounds request/response exchanges; an established
+WebSocket tunnel is not cut by it.
 
 ```yaml
 routes:
@@ -518,7 +528,8 @@ routes:
   backends:
   - host: api.business.githubcopilot.com:443
     policies:
-      backendTLS: {}
+      backendTLS:
+        alpn: [http/1.1]   # the WebSocket upgrade cannot travel over HTTP/2
       backendAuth:
         passthrough: {}
       transformations:
