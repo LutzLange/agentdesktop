@@ -941,4 +941,240 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the loosened file must be tightened");
     }
+
+    // --- PR-8: a merge keeps a stricter file mode --------------------------
+    //
+    // A changing merge writes `(options.mode & 0o700) | (current & options.mode
+    // & 0o077)`, `current` being the mode observed when planning: the owner
+    // bits are always the planned ones, group and other bits can only shrink,
+    // never widen. Expectations with group or other bits assume the default
+    // test umask (022) and say so; 0600 and stricter are umask-independent.
+    // A file the merge creates gets `options.mode` outright (not this
+    // formula); removal keeping the mode it finds is covered by
+    // `removal_keeps_the_file_mode_and_a_recreated_file_counts_as_created`.
+
+    #[cfg(unix)]
+    fn write_with_mode(path: &Path, contents: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    // Criterion 5(a): existing 0600, options.mode 0644 (the default, as
+    // Claude Code uses it), changed content: written 0600, new inode. Red on
+    // the base (today's code writes `options.mode` unconditionally on a
+    // changing merge).
+    #[test]
+    #[cfg(unix)]
+    fn changing_merge_keeps_an_owner_only_file_owner_only_against_a_default_mode_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+        write_with_mode(&path, b"{\"env\":{\"OTHER\":\"1\"}}\n", 0o600);
+        let inode_before = inode_of(&path);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        assert!(plan.render().contains("UPDATE"), "{}", plan.render());
+        plan.apply().unwrap();
+
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "a 0600 file must stay 0600 against a 0644 caller"
+        );
+        assert_ne!(
+            inode_of(&path),
+            inode_before,
+            "a changing merge rewrites the file"
+        );
+    }
+
+    // Criterion 5(b): existing 0640, options.mode 0644, changed: written
+    // 0640 (group bits already narrower than options.mode's are kept; this
+    // assumes the default test umask of 022). Red on the base.
+    #[test]
+    #[cfg(unix)]
+    fn changing_merge_keeps_group_bits_narrower_than_the_options_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+        write_with_mode(&path, b"{\"env\":{\"OTHER\":\"1\"}}\n", 0o640);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        plan.apply().unwrap();
+
+        assert_eq!(
+            mode_of(&path),
+            0o640,
+            "a 0640 file must stay 0640 against a 0644 caller (default test umask 022)"
+        );
+    }
+
+    // Criterion 5(c): existing 0400, options.mode 0644, changed: written
+    // 0600. The owner bits are always the planned ones (0600's owner bits),
+    // even though that widens the owner from r-- to rw-; group and other
+    // stay at 0 either way. Red on the base.
+    #[test]
+    #[cfg(unix)]
+    fn changing_merge_widens_owner_bits_to_the_options_modes_owner_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+        write_with_mode(&path, b"{\"env\":{\"OTHER\":\"1\"}}\n", 0o400);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        plan.apply().unwrap();
+
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "owner bits are always the options mode's owner bits, whatever the existing owner bits were"
+        );
+    }
+
+    // Criterion 5(d) (guard, green on the base): existing 0664, options.mode
+    // 0644, changed: written 0644. Group and other bits never widen past
+    // options.mode (default test umask 022).
+    #[test]
+    #[cfg(unix)]
+    fn changing_merge_narrows_group_and_other_bits_looser_than_the_options_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+        write_with_mode(&path, b"{\"env\":{\"OTHER\":\"1\"}}\n", 0o664);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        plan.apply().unwrap();
+
+        assert_eq!(
+            mode_of(&path),
+            0o644,
+            "group and other bits must never widen past the options mode (default test umask 022)"
+        );
+    }
+
+    // Criterion 5(e) (guard, green on the base): existing 0400 and existing
+    // 0640, options.mode 0600 (as the Copilot CLI and VS Code chat-models
+    // callers use it), changed: written 0600 either way, umask-independent.
+    #[test]
+    #[cfg(unix)]
+    fn changing_merge_with_owner_only_options_always_writes_owner_only_whatever_the_existing_mode()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let options = root_array_options(); // mode 0600
+        for existing_mode in [0o400u32, 0o640u32] {
+            let path = dir
+                .path()
+                .join(format!("chatLanguageModels-{existing_mode:o}.json"));
+            let state = state_path(&path);
+            write_with_mode(&path, b"[{\"name\":\"user-vendor\"}]\n", existing_mode);
+
+            let plan = ReconcilePlan::default();
+            plan_merge_with(
+                &path,
+                &state,
+                json!([{"name": "agentdesktop"}]),
+                false,
+                "chat models",
+                "Test",
+                options,
+                &plan,
+            )
+            .unwrap();
+            plan.apply().unwrap();
+
+            assert_eq!(
+                mode_of(&path),
+                0o600,
+                "an owner-only caller (0600) writes 0600 whatever the existing mode ({existing_mode:o}) was"
+            );
+        }
+    }
+
+    // Criterion 5(f) (guard, green on the base): a file the merge creates
+    // has no bit outside options.mode; the blending formula does not apply
+    // to a created file (non-goal: its mode is not derived from a prior
+    // mode).
+    #[test]
+    #[cfg(unix)]
+    fn a_created_file_has_no_bit_outside_the_options_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        assert!(plan.render().contains("CREATE"), "{}", plan.render());
+        plan.apply().unwrap();
+
+        assert_eq!(
+            mode_of(&path) & !0o644u32 & 0o777,
+            0,
+            "a created file must not have a bit outside options.mode"
+        );
+        assert_eq!(
+            mode_of(&path),
+            0o644,
+            "a created Claude Code settings.json stays at the documented default"
+        );
+    }
+
+    // Criterion 5(g) (guard, green on the base): an unchanged 0600 file
+    // against a 0644 caller is `unchanged`, not rewritten, same inode. A bit
+    // outside options.mode is what forces a rewrite (PR-5's rule); 0600 is
+    // within 0644, so nothing forces one here.
+    #[test]
+    #[cfg(unix)]
+    fn an_unchanged_file_stricter_than_the_options_mode_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let state = state_path(&path);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        plan.apply().unwrap();
+
+        // The user tightens the mode by hand; the managed content does not
+        // change on the next merge.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let inode_before = inode_of(&path);
+
+        let plan = ReconcilePlan::default();
+        plan_merge(&path, &state, managed(), false, "settings", "Test", &plan).unwrap();
+        assert!(
+            !plan.render().to_uppercase().contains("UPDATE")
+                && !plan.render().to_uppercase().contains("CREATE"),
+            "a stricter-than-options file with identical content must be unchanged: {}",
+            plan.render()
+        );
+        plan.apply().unwrap();
+
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the file's own stricter mode must be left alone"
+        );
+        assert_eq!(
+            inode_of(&path),
+            inode_before,
+            "an unchanged file must not be rewritten"
+        );
+    }
 }
