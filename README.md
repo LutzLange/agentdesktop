@@ -579,7 +579,12 @@ outcome changed. Deleting a managed file is then no longer a way to opt out:
 switch the program off in the configuration or stop the daemon instead. The
 tick cannot start a local LLM proxy that was not running when the daemon
 started (restart the daemon for that). Unset means no periodic re-apply; zero
-is rejected. The interval is read at startup only.
+and more than 30 days are rejected. The interval is read at startup only.
+
+Any apply (tick or not) leaves a managed file alone when it already holds the
+planned bytes, and rewrites it with the same bytes when its mode grants more
+than the daemon writes: for example a Claude Code user `settings.json` at
+0664 becomes 0644, a Copilot CLI `providers.json` at 0644 becomes 0600.
 
 ## Start locally, grow into a fleet
 

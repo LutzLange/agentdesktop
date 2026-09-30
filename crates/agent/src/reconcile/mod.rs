@@ -37,11 +37,12 @@ pub use crate::provider::{
 pub struct Reconciler {
     context: ReconcileContext,
     providers: Arc<Vec<Box<dyn Provider>>>,
-    /// Serializes applies across clones (a push, the startup apply and a
-    /// reconcile tick never overlap): held for planning and applying, never
-    /// across an `.await`. `plan`, `plan_with_report` and `dry_run` take no
-    /// lock. Holds the report of the last apply, for the tick's log rule.
-    apply_lock: Arc<std::sync::Mutex<Option<ApplyReport>>>,
+    /// The apply lock and the report of the last apply. Held for planning
+    /// and applying, so a push, the startup apply and a reconcile tick never
+    /// overlap across clones; never held across an `.await`. `plan`,
+    /// `plan_with_report` and `dry_run` take no lock. The report feeds the
+    /// tick's log rule.
+    last_apply: Arc<std::sync::Mutex<Option<ApplyReport>>>,
 }
 
 impl Reconciler {
@@ -96,7 +97,7 @@ impl Reconciler {
                 }),
                 Box::new(Ollama),
             ]),
-            apply_lock: Arc::new(std::sync::Mutex::new(None)),
+            last_apply: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -206,13 +207,29 @@ impl Reconciler {
         &self,
         config: &DaemonConfig,
     ) -> (Option<ApplyReport>, ApplyReport, anyhow::Result<()>) {
+        let (previous, report, result) = self
+            .apply_read_under_lock(|| Some(Arc::new(config.clone())))
+            .expect("a configuration was given");
+        (previous, report, result)
+    }
+
+    /// Takes the apply lock, then reads the configuration to apply, so a
+    /// configuration pushed while this call waited for the lock is the one
+    /// applied (a tick never re-applies an older revision after a push).
+    /// `None` from `read` applies nothing.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn apply_read_under_lock(
+        &self,
+        read: impl FnOnce() -> Option<Arc<DaemonConfig>>,
+    ) -> Option<(Option<ApplyReport>, ApplyReport, anyhow::Result<()>)> {
         let mut last = self
-            .apply_lock
+            .last_apply
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (report, result) = self.plan_with_report(config).apply();
+        let config = read()?;
+        let (report, result) = self.plan_with_report(&config).apply();
         let previous = last.replace(report.clone());
-        (previous, report, result)
+        Some((previous, report, result))
     }
 }
 
@@ -2161,5 +2178,32 @@ programs:
         let previous = outcome_report(ProgramState::Unchanged, "");
         let current = outcome_report(ProgramState::Failed, "boom");
         assert!(super::should_log(Some(&previous), &current));
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn a_program_that_disappears_is_a_difference_unless_it_was_removed() {
+        let both = ApplyReport {
+            programs: vec![
+                ProgramOutcome {
+                    program: "claude-code",
+                    state: ProgramState::Unchanged,
+                    detail: String::new(),
+                },
+                ProgramOutcome {
+                    program: "copilot",
+                    state: ProgramState::Unchanged,
+                    detail: String::new(),
+                },
+            ],
+        };
+        let one = outcome_report(ProgramState::Unchanged, "");
+        assert!(super::should_log(Some(&both), &one), "copilot vanished");
+        let mut removed = both.clone();
+        removed.programs[1].state = ProgramState::Removed;
+        assert!(
+            !super::should_log(Some(&removed), &one),
+            "a removed program that is no longer listed is not news"
+        );
     }
 }

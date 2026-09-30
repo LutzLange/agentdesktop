@@ -1141,6 +1141,9 @@ pub fn parse_daemon(contents: &str) -> anyhow::Result<DaemonConfig> {
     Ok(config)
 }
 
+/// The longest accepted `daemon.reconcileInterval`.
+const MAX_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 fn parse_local_daemon(contents: &str) -> anyhow::Result<DaemonConfig> {
     let config: DaemonConfig =
         crate::serdes::yamlviajson::from_str(contents).context("parse daemon configuration")?;
@@ -1156,10 +1159,10 @@ fn parse_local_daemon(contents: &str) -> anyhow::Result<DaemonConfig> {
         .daemon
         .as_ref()
         .and_then(|daemon| daemon.reconcile_interval)
-        .is_some_and(|interval| interval.is_zero())
+        .is_some_and(|interval| interval.is_zero() || interval > MAX_RECONCILE_INTERVAL)
     {
         anyhow::bail!(
-            "daemon.reconcileInterval must be greater than zero (leave it unset for no periodic re-apply)"
+            "daemon.reconcileInterval must be greater than zero and at most 30 days (leave it unset for no periodic re-apply)"
         );
     }
     validate_daemon(
@@ -1514,6 +1517,18 @@ programs: { claudeCode: { useLlmGateway: false } }
         assert!(
             error.to_string().contains("daemon.reconcileInterval"),
             "unexpected error: {error}"
+        );
+    }
+
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn daemon_reconcile_interval_rejects_more_than_thirty_days() {
+        assert!(super::parse_local_daemon("daemon:\n  reconcileInterval: 30days\n").is_ok());
+        let error = super::parse_local_daemon("daemon:\n  reconcileInterval: 31days\n")
+            .expect_err("an interval beyond 30 days is refused");
+        assert!(
+            error.to_string().contains("daemon.reconcileInterval"),
+            "{error}"
         );
     }
 

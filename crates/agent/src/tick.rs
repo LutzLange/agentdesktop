@@ -87,13 +87,25 @@ pub(crate) async fn run_tick(
     interval: Duration,
     statuses: Option<watch::Sender<Option<TickStatus>>>,
 ) {
-    run_tick_with(current, interval, statuses, move |config| {
-        let (previous, report, result) = reconciler.apply_after_previous(config);
+    let latest = current.clone();
+    run_tick_with(current, interval, statuses, move |_| {
+        // Read again under the apply lock: a push that took the lock first
+        // may have replaced the configuration this tick woke up with.
+        let Some((previous, report, result)) = reconciler.apply_read_under_lock(|| {
+            latest
+                .borrow()
+                .as_ref()
+                .map(|current| Arc::clone(&current.config))
+        }) else {
+            return (ApplyReport::default(), Ok(()));
+        };
+        // Outcome lines and the failure warning only when something changed,
+        // so a conflict that persists does not repeat every interval.
         if crate::reconcile::should_log(previous.as_ref(), &report) {
             report.log();
-        }
-        if let Err(error) = &result {
-            tracing::warn!(error = %format!("{error:#}"), "reconcile tick failed");
+            if let Err(error) = &result {
+                tracing::warn!(error = %format!("{error:#}"), "reconcile tick failed");
+            }
         }
         (report, result)
     })

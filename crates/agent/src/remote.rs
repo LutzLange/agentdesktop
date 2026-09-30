@@ -117,7 +117,7 @@ pub async fn run(
             let refresh_result = tokio::select! {
                 result = refresh_oauth_if_needed(&mut identity, &identity_path) => result,
                 Some(request) = logout.recv() => {
-                    if complete_logout(request, &identity_path, &identity, &enrollment).await {
+                    if complete_logout(request, &identity_path, &identity, &enrollment, &channels.current).await {
                         break;
                     }
                     continue;
@@ -163,7 +163,7 @@ pub async fn run(
                     &mut channels,
                 ) => Some(result),
                 Some(request) = logout.recv() => {
-                    if complete_logout(request, &identity_path, &identity, &enrollment).await {
+                    if complete_logout(request, &identity_path, &identity, &enrollment, &channels.current).await {
                         None
                     } else {
                         continue;
@@ -201,7 +201,7 @@ pub async fn run(
             let logged_out = tokio::select! {
                 _ = time::sleep(delay) => false,
                 Some(request) = logout.recv() => {
-                    complete_logout(request, &identity_path, &identity, &enrollment).await
+                    complete_logout(request, &identity_path, &identity, &enrollment, &channels.current).await
                 }
             };
             if logged_out {
@@ -268,10 +268,14 @@ async fn complete_logout(
     identity_path: &Path,
     identity: &Identity,
     enrollment: &EnrollmentState,
+    current: &watch::Sender<Option<CurrentConfig>>,
 ) -> bool {
     let result = identity::delete(identity_path, &identity.device_id)
         .map_err(|error| format!("remove local organization identity: {error:#}"));
     if result.is_ok() {
+        // The organization's configuration is no longer enforced by the
+        // reconcile tick; the managed files stay until the next configuration.
+        current.send_replace(None);
         enrollment.set("starting").await;
         info!(device_id = %identity.device_id, "logged out local organization session");
     }
@@ -358,6 +362,7 @@ async fn connect(
     // last status sent on it, for deciding whether a tick outcome is news.
     let mut stream_revision = None;
     let mut last_sent: Option<ConfigStatus> = None;
+    let mut pending_persist: Option<(u64, Vec<u8>)> = None;
     let (sender, receiver) = mpsc::channel(16);
     let mut request = Request::new(ReceiverStream::new(receiver));
     authenticate_request(identity, &mut request)?;
@@ -411,6 +416,19 @@ async fn connect(
                 send_inventory(&sender, &snapshot).await?;
             }
             tick = next_tick_status(&mut channels.tick_statuses) => {
+                let mut tick = tick;
+                if tick.error.is_none()
+                    && tick.revision.is_some()
+                    && tick.revision == stream_revision
+                    && let Some((revision, yaml)) = pending_persist.take()
+                {
+                    // A failed save stays visible: the tick is reported as
+                    // failed and the save is retried on the next tick.
+                    if let Err(error) = persist_config(state_dir, &yaml, revision) {
+                        tick.error = Some(format!("{error:#}"));
+                        pending_persist = Some((revision, yaml));
+                    }
+                }
                 if let Some(status) = tick_config_status(last_sent.as_ref(), stream_revision, &tick) {
                     info!(revision = status.revision, "reporting a changed reconcile outcome");
                     last_sent = Some(status.clone());
@@ -428,8 +446,14 @@ async fn connect(
                         "received daemon configuration"
                     );
                     stream_revision = Some(config.revision);
-                    replace_current_config(&channels.current, &config);
-                    let status = apply_daemon_config(state_dir, config, reconciler);
+                    let parsed = replace_current_config(&channels.current, &config);
+                    let parsed_ok = parsed.is_ok();
+                    let status = apply_parsed(state_dir, &config, parsed, reconciler);
+                    // A parsed configuration whose apply failed is the current
+                    // one but not yet saved; a later tick that applies it
+                    // saves it, so a restart does not go back to the previous one.
+                    pending_persist = (parsed_ok && !status.error.is_empty())
+                        .then(|| (config.revision, config.yaml.clone()));
                     last_sent = Some(status.clone());
                     if status.error.is_empty() {
                         info!(revision = status.revision, "applied daemon configuration");
@@ -477,57 +501,83 @@ fn telemetry_to_proto(event: ModelTelemetryEvent) -> TelemetryEvent {
     }
 }
 
+/// Parses and applies a pushed configuration in one step (the connection
+/// loop parses first to update the current configuration).
+#[cfg(test)]
 fn apply_daemon_config(
     state_dir: &Path,
     config: agentdesktop_proto::fleet::DaemonConfig,
     reconciler: &Reconciler,
 ) -> ConfigStatus {
+    let parsed = parse_pushed_config(&config);
+    apply_parsed(state_dir, &config, parsed, reconciler)
+}
+
+/// Applies a pushed configuration already checked by [`parse_pushed_config`]
+/// and persists it once its apply succeeded.
+fn apply_parsed(
+    state_dir: &Path,
+    config: &agentdesktop_proto::fleet::DaemonConfig,
+    parsed: anyhow::Result<agentdesktop_core::config::DaemonConfig>,
+    reconciler: &Reconciler,
+) -> ConfigStatus {
     let mut programs = Vec::new();
     let result = (|| -> anyhow::Result<()> {
-        let daemon_config = parse_pushed_config(&config)?;
+        let daemon_config = parsed?;
         debug!(revision = config.revision, "parsed daemon configuration");
         let (report, applied) = reconciler.apply_with_report(&daemon_config);
         report.log();
-        programs = report
-            .programs
-            .iter()
-            .map(|outcome| ProgramStatus {
-                program: outcome.program.to_owned(),
-                state: program_state_proto(outcome.state).into(),
-                detail: outcome.detail.clone(),
-            })
-            .collect();
+        programs = program_statuses(&report);
         applied?;
-        secure_fs::ensure_private_dir(state_dir)?;
-        let path = state_dir.join("remote-config.yaml");
-        secure_fs::atomic_write(&path, &config.yaml, 0o600)?;
-        info!(
-            revision = config.revision,
-            path = %path.display(),
-            "persisted daemon configuration"
-        );
-        Ok(())
+        persist_config(state_dir, &config.yaml, config.revision)
     })();
-
     // `programs_reported` says this agent reports per-program status; the
     // list is empty when the configuration was not applied at all (hash or
     // parse error), and holds the apply's outcomes otherwise, also when a
     // later step (persisting the configuration) failed.
-    match result {
-        Ok(()) => ConfigStatus {
-            revision: config.revision,
-            state: ConfigState::Applied.into(),
-            error: String::new(),
-            programs,
-            programs_reported: true,
-        },
-        Err(error) => ConfigStatus {
-            revision: config.revision,
-            state: ConfigState::Failed.into(),
-            error: format!("{error:#}"),
-            programs,
-            programs_reported: true,
-        },
+    config_status(
+        config.revision,
+        programs,
+        result.map_err(|error| format!("{error:#}")),
+    )
+}
+
+/// Saves the controller's configuration as the one to restore at startup.
+fn persist_config(state_dir: &Path, yaml: &[u8], revision: u64) -> anyhow::Result<()> {
+    secure_fs::ensure_private_dir(state_dir)?;
+    let path = state_dir.join("remote-config.yaml");
+    secure_fs::atomic_write(&path, yaml, 0o600)?;
+    info!(revision, path = %path.display(), "persisted daemon configuration");
+    Ok(())
+}
+
+fn program_statuses(report: &crate::reconcile::ApplyReport) -> Vec<ProgramStatus> {
+    report
+        .programs
+        .iter()
+        .map(|outcome| ProgramStatus {
+            program: outcome.program.to_owned(),
+            state: program_state_proto(outcome.state).into(),
+            detail: outcome.detail.clone(),
+        })
+        .collect()
+}
+
+fn config_status(
+    revision: u64,
+    programs: Vec<ProgramStatus>,
+    result: Result<(), String>,
+) -> ConfigStatus {
+    let (state, error) = match result {
+        Ok(()) => (ConfigState::Applied, String::new()),
+        Err(error) => (ConfigState::Failed, error),
+    };
+    ConfigStatus {
+        revision,
+        state: state.into(),
+        error,
+        programs,
+        programs_reported: true,
     }
 }
 
@@ -562,33 +612,11 @@ pub(crate) fn tick_config_status(
     if tick.revision.is_none() || tick.revision != stream_revision {
         return None;
     }
-    let revision = tick.revision.unwrap_or_default();
-    let programs: Vec<ProgramStatus> = tick
-        .report
-        .programs
-        .iter()
-        .map(|outcome| ProgramStatus {
-            program: outcome.program.to_owned(),
-            state: program_state_proto(outcome.state).into(),
-            detail: outcome.detail.clone(),
-        })
-        .collect();
-    let status = match &tick.error {
-        None => ConfigStatus {
-            revision,
-            state: ConfigState::Applied.into(),
-            error: String::new(),
-            programs,
-            programs_reported: true,
-        },
-        Some(error) => ConfigStatus {
-            revision,
-            state: ConfigState::Failed.into(),
-            error: error.clone(),
-            programs,
-            programs_reported: true,
-        },
-    };
+    let status = config_status(
+        tick.revision.unwrap_or_default(),
+        program_statuses(&tick.report),
+        tick.error.clone().map_or(Ok(()), Err),
+    );
     let Some(last_sent) = last_sent else {
         return Some(status);
     };
@@ -691,8 +719,6 @@ async fn send_inventory(
     Ok(())
 }
 
-/// Resolves with the next inventory snapshot, and never resolves once the
-/// refresher has stopped, so the controller stream keeps running without it.
 /// The next reconcile tick outcome; never resolves when the tick is off or
 /// has stopped.
 async fn next_tick_status(
@@ -714,13 +740,13 @@ async fn next_tick_status(
 fn replace_current_config(
     current: &watch::Sender<Option<CurrentConfig>>,
     config: &agentdesktop_proto::fleet::DaemonConfig,
-) {
-    if let Ok(parsed) = parse_pushed_config(config) {
-        current.send_replace(Some(CurrentConfig {
-            revision: Some(config.revision),
-            config: Arc::new(parsed),
-        }));
-    }
+) -> anyhow::Result<agentdesktop_core::config::DaemonConfig> {
+    let parsed = parse_pushed_config(config)?;
+    current.send_replace(Some(CurrentConfig {
+        revision: Some(config.revision),
+        config: Arc::new(parsed.clone()),
+    }));
+    Ok(parsed)
 }
 
 /// Hash, UTF-8 and parse checks of a pushed configuration.
@@ -739,6 +765,8 @@ fn parse_pushed_config(
     config::parse_daemon(yaml)
 }
 
+/// Resolves with the next inventory snapshot, and never resolves once the
+/// refresher has stopped, so the controller stream keeps running without it.
 async fn next_inventory(
     discovered: &mut watch::Receiver<Arc<AgentDiscovery>>,
 ) -> Arc<AgentDiscovery> {
@@ -1259,18 +1287,18 @@ mod tests {
             sha256: Sha256::digest(yaml.as_bytes()).to_vec(),
         };
         let (current, receiver) = tokio::sync::watch::channel(None);
-        super::replace_current_config(&current, &pushed(1, "programs: {}\n"));
+        let _ = super::replace_current_config(&current, &pushed(1, "programs: {}\n"));
         assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(1));
         // Does not parse (unknown key): the current configuration stays.
-        super::replace_current_config(&current, &pushed(2, "notAKey: 1\n"));
+        let _ = super::replace_current_config(&current, &pushed(2, "notAKey: 1\n"));
         assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(1));
         // Wrong hash: stays.
         let mut tampered = pushed(3, "programs: {}\n");
         tampered.sha256 = vec![0; 32];
-        super::replace_current_config(&current, &tampered);
+        let _ = super::replace_current_config(&current, &tampered);
         assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(1));
         // Parses (its apply may still fail later): replaced.
-        super::replace_current_config(&current, &pushed(4, "programs:\n  grok: {}\n"));
+        let _ = super::replace_current_config(&current, &pushed(4, "programs:\n  grok: {}\n"));
         assert_eq!(receiver.borrow().as_ref().and_then(|c| c.revision), Some(4));
     }
 }
