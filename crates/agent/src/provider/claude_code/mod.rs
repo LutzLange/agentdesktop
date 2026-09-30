@@ -70,6 +70,10 @@ impl ClaudeCode {
 
 #[async_trait::async_trait]
 impl Provider for ClaudeCode {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
     async fn discover(&self) -> Discovery {
         Discovery {
             agents: discovery::discover(&self.settings_path)
