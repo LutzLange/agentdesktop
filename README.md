@@ -269,6 +269,14 @@ device authorization again. Non-expiring App user tokens are also supported.
 Request bodies remain untouched. The existing Claude credential-helper flow is
 unchanged; the local proxy always uses the gateway identity in `Authorization`.
 
+### GitHub Copilot: a runnable example
+
+[`examples/copilot`](examples/copilot/README.md) runs Dex and Agentgateway
+locally and walks through the Copilot CLI, VS Code on the gateway's models and
+VS Code on GitHub's models, with what to check at each step (drift,
+conflicts, removal) and the settings the GitHub organisation owner controls
+([`examples/copilot/github-side.md`](examples/copilot/github-side.md)).
+
 ### Managed program: GitHub Copilot CLI
 
 `programs.copilot` makes the daemon write the Copilot CLI's BYOK provider
