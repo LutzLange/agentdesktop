@@ -187,6 +187,16 @@ impl ReconcilePlan {
         );
     }
 
+    /// Marks the program that owns this plan inactive: the program uses the
+    /// gateway, a gateway is configured, and the loopback proxy is absent.
+    /// Called by the three proxy-absent warning sites in place of a plain
+    /// `remove` so attribution can surface `ProgramState::Inactive` at the
+    /// right precedence (PR 4, specs/PR-4.md).
+    pub fn inactive(&self, reason: &str) {
+        let _ = reason;
+        todo!("PR 4: ReconcilePlan::inactive - record `reason` as this plan's inactive marker")
+    }
+
     pub(crate) fn record_diff(
         &self,
         display_name: &str,

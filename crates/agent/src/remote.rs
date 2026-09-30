@@ -469,17 +469,35 @@ fn apply_daemon_config(
     })();
 
     match result {
+        // PR 4 (specs/PR-4.md): `programs` is left empty here pending the
+        // switch to `Reconciler::apply_with_report`; `programs_reported` is
+        // this agent's fixed capability flag and is `true` regardless of
+        // whether this particular apply succeeded.
         Ok(()) => ConfigStatus {
             revision: config.revision,
             state: ConfigState::Applied.into(),
             error: String::new(),
+            programs: Vec::new(),
+            programs_reported: true,
         },
         Err(error) => ConfigStatus {
             revision: config.revision,
             state: ConfigState::Failed.into(),
             error: format!("{error:#}"),
+            programs: Vec::new(),
+            programs_reported: true,
         },
     }
+}
+
+/// Maps a [`crate::reconcile::ProgramState`] to its proto enum value
+/// (specs/PR-4.md, criterion 6).
+#[allow(dead_code)]
+fn program_state_proto(
+    state: crate::reconcile::ProgramState,
+) -> agentdesktop_proto::fleet::ProgramState {
+    let _ = state;
+    todo!("PR 4: program_state_proto - map every ProgramState variant to its proto enum value")
 }
 
 /// Sends the current inventory snapshot to the controller.
@@ -838,5 +856,70 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(identity, "identity");
+    }
+
+    // --- PR 4: per-program configuration status (specs/PR-4.md) ------------
+
+    fn test_reconciler(root: &std::path::Path) -> crate::reconcile::Reconciler {
+        crate::reconcile::Reconciler::new(
+            true,
+            root.join("claude/settings.json"),
+            root.join("claude-desktop/settings.json"),
+            root.join("claude-desktop/helper"),
+            root.join("codex/config.toml"),
+            root.join("opencode/config.json"),
+            root.join("opencode/plugin.js"),
+            root.join("grok/managed_config.toml"),
+            Some(root.join("copilot/providers.json")),
+            None,
+            None,
+            root.join("bin/agentdesktop"),
+            root.join("agentdesktop.sock"),
+        )
+    }
+
+    #[test]
+    fn hash_error_reports_empty_programs_and_programs_reported_true() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "agentdesktop-remote-hash-error-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let reconciler = test_reconciler(&state_dir);
+        let config = agentdesktop_proto::fleet::DaemonConfig {
+            revision: 7,
+            yaml: b"programs: {}\n".to_vec(),
+            sha256: vec![0u8; 32],
+        };
+
+        let status = super::apply_daemon_config(&state_dir, config, &reconciler);
+
+        assert_eq!(
+            status.state,
+            agentdesktop_proto::fleet::ConfigState::Failed as i32
+        );
+        assert!(status.error.contains("hash"));
+        assert!(status.programs.is_empty());
+        assert!(status.programs_reported);
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn mapping_every_program_state_to_the_proto_enum() {
+        use crate::reconcile::ProgramState;
+        use agentdesktop_proto::fleet::ProgramState as ProtoProgramState;
+
+        let cases = [
+            (ProgramState::Applied, ProtoProgramState::Applied),
+            (ProgramState::Unchanged, ProtoProgramState::Unchanged),
+            (ProgramState::Removed, ProtoProgramState::Removed),
+            (ProgramState::Conflict, ProtoProgramState::Conflict),
+            (ProgramState::Inactive, ProtoProgramState::Inactive),
+            (ProgramState::Blocked, ProtoProgramState::Blocked),
+            (ProgramState::Failed, ProtoProgramState::Failed),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(super::program_state_proto(state), expected, "{state:?}");
+        }
     }
 }
