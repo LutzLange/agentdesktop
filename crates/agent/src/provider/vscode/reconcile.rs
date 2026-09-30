@@ -103,7 +103,7 @@ pub(super) fn plan(
         return Ok(());
     };
     let Some((listen, pairing)) = proxy else {
-        warn!(
+        tracing::debug!(
             path = %path.display(),
             "programs.vscode is configured but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed chat language models"
         );

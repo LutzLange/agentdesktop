@@ -25,6 +25,7 @@
 |`daemon.openCode`|object|OpenCode paths.|
 |`daemon.openCode.config`|string|Configuration file.|
 |`daemon.openCode.plugin`|string|Credential plugin path.|
+|`daemon.reconcileInterval`|string|Opt-in interval between periodic re-applies of the current<br>configuration, which repair drift (a managed file deleted or edited by<br>hand, a fixed conflict, a loosened mode) without rewriting anything<br>unchanged. Unset means no periodic re-apply; a controller-managed<br>device still re-applies the controller's configuration on every<br>reconnect. Must be greater than zero; read at startup only (restart the<br>daemon after changing it).|
 |`daemon.socket`|string|Local API Unix socket or Windows named pipe.|
 |`daemon.stateDir`|string|Persistent daemon state directory.|
 |`daemon.user`|boolean|Manage the current user’s tool settings instead of system settings.|
