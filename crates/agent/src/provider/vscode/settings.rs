@@ -3,8 +3,13 @@
 //! (`github.copilot.advanced.debug.overrideCapiUrl`) at the loopback proxy's
 //! `/vscode-copilot-capi/<pairing>` route, so VS Code keeps GitHub's own
 //! models and its own Copilot token while the daemon adds the gateway
-//! identity. Mirrors `provider::vscode::reconcile` (the `ownModels` variant,
-//! `chatLanguageModels.json`), merging through `provider::json_merge`.
+//! identity.
+//!
+//! The file is VS Code's JSONC, commonly commented and hand-edited, so it is
+//! edited in place with a lossless syntax tree (`jsonc-parser`): only the
+//! override and the two `settingsSync.ignoredSettings` entries change, every
+//! other byte (comments, order, formatting, line endings) stays as the user
+//! wrote it. The sidecar records only what removal must restore.
 
 use std::{
     net::SocketAddr,
@@ -13,9 +18,13 @@ use std::{
 
 use agentdesktop_core::config::{LlmGatewayConfig, VsCodeConfig, VsCodeCopilotChat};
 use anyhow::Context;
+use jsonc_parser::{
+    ParseOptions,
+    cst::{CstInputValue, CstObject, CstRootNode},
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tracing::warn;
+use serde_json::Value;
+use tracing::{debug, warn};
 
 use super::{VsCode, discovery};
 use crate::provider::json_merge;
@@ -45,32 +54,12 @@ pub(super) fn override_url(listen: SocketAddr, pairing: &str) -> String {
     format!("http://{listen}{}/{pairing}", crate::llm_proxy::CAPI_ROUTE)
 }
 
-/// The managed part of `settings.json`: the CAPI override and the two
-/// `settingsSync.ignoredSettings` entries that keep the override (and its
-/// alias) from being synced to other machines.
-pub(super) fn managed_settings(listen: SocketAddr, pairing: &str) -> Value {
-    json!({
-        OVERRIDE_KEY: override_url(listen, pairing),
-        IGNORED_SETTINGS_KEY: [OVERRIDE_KEY, CAPI_ALIAS_KEY],
-    })
-}
-
-// --- In-place JSONC edit (specs/PR-3c.md) -------------------------------
-//
-// `edit_settings`/`remove_settings` are the pure, filesystem-free core of the
-// in-place edit: a lossless CST edit (`jsonc-parser`) of the user's own text,
-// touching only the override key and the two `settingsSync.ignoredSettings`
-// entries, plus the v2 sidecar that carries what removal must restore. The
-// writer wires these into `plan`/`remove` in place of `json_merge`; this
-// module is the interface contract's compile-only stub for the test author's
-// spec-derived baseline (specs/PR-3c.md, "Interface contract for the test
-// author"): `edit_settings`, `remove_settings` and `read_state` `todo!()`.
-
-/// Why `edit_settings`/`remove_settings` refuse to touch the file (AC2/AC3):
+/// Why `edit_settings`/`remove_settings` refuse to touch the file:
 /// anything beyond VS Code's own JSONC (comments, trailing commas), a
 /// non-object root, `settingsSync.ignoredSettings` present and not an array,
 /// or the override key or `settingsSync.ignoredSettings` appearing more than
-/// once at the root.
+/// once at the root (VS Code would read a different copy than the one
+/// edited).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsConflict {
     Parse,
@@ -79,8 +68,21 @@ pub(super) enum SettingsConflict {
     DuplicateKey,
 }
 
-/// The v2 sidecar (AC4): what removal must restore, without a whole-document
-/// snapshot. `override_before` keeps an explicit JSON `null` as
+impl SettingsConflict {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Parse => {
+                "not valid VS Code JSONC (only comments and trailing commas are accepted beyond JSON)"
+            }
+            Self::NotAnObject => "the top level is not an object",
+            Self::IgnoredNotArray => "settingsSync.ignoredSettings is not an array",
+            Self::DuplicateKey => "a managed key appears more than once",
+        }
+    }
+}
+
+/// The sidecar: what removal must restore, without a copy of the user's
+/// settings. `override_before` keeps an explicit JSON `null` as
 /// `Some(Value::Null)`, distinct from the key being absent (`None`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -107,15 +109,13 @@ where
     Value::deserialize(deserializer).map(Some)
 }
 
-/// The current sidecar version `edit_settings`/`remove_settings` write
-/// (AC4); a sidecar without this shape (PR 3b's `MergeState`, no `version`)
-/// is upgraded by `read_state` (AC7).
+/// The sidecar version `edit_settings` writes; a sidecar without a `version`
+/// (the whole-document `json_merge` state an earlier daemon wrote) is
+/// upgraded by `read_state`.
 pub(super) const SETTINGS_STATE_VERSION: u32 = 2;
 
-/// The outcome of `remove_settings` (AC5): the removal may be a no-op text
-/// (`Unchanged`; distinct from an unchanged `edit_settings`, which returns the
-/// new text unconditionally), rewritten text, or the whole file going away
-/// (a file this daemon created that reduces to nothing but whitespace once
+/// The outcome of `remove_settings`: nothing to change, rewritten text, or
+/// the whole file going away (a file this daemon created that is empty once
 /// the managed keys are taken out).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Removal {
@@ -124,69 +124,316 @@ pub(super) enum Removal {
     Delete,
 }
 
-/// In-place JSONC edit of `settings.json` (AC1-AC4): `text: None` is an
-/// absent file (created as the golden text); an empty or whitespace-only
-/// file is treated as `{}`. Sets the override to `url` (`set_value` in place
-/// when the key exists, `append`ed otherwise) and ensures
-/// `settingsSync.ignoredSettings` holds both `OVERRIDE_KEY` and
-/// `CAPI_ALIAS_KEY`, creating the array when absent and appending only the
-/// missing entries, user entries kept in order. `state` is the previous
-/// sidecar (`None` on a first apply or when it could not be read, AC6); the
-/// returned `SettingsState` is what removal needs afterwards.
+/// VS Code's JSONC: comments and trailing commas, nothing else (VS Code
+/// flags the other JSON5 forms as errors, so a file using them is mid-edit or
+/// broken and is left alone).
+fn vscode_jsonc() -> ParseOptions {
+    ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_non_finite_numbers: false,
+        allow_extended_string_escapes: false,
+    }
+}
+
+/// Parses the text and returns the root (which must outlive every node taken
+/// from it) and its object, checking the shape the edit relies on.
+fn parse_object(text: &str) -> Result<(CstRootNode, CstObject), SettingsConflict> {
+    let root = CstRootNode::parse(text, &vscode_jsonc()).map_err(|_| SettingsConflict::Parse)?;
+    let object = root
+        .object_value_or_create()
+        .ok_or(SettingsConflict::NotAnObject)?;
+    for key in [OVERRIDE_KEY, IGNORED_SETTINGS_KEY] {
+        let count = object
+            .properties()
+            .iter()
+            .filter(|property| property.decoded_name().as_deref() == Some(key))
+            .count();
+        if count > 1 {
+            return Err(SettingsConflict::DuplicateKey);
+        }
+    }
+    if object.get(IGNORED_SETTINGS_KEY).is_some()
+        && object.array_value(IGNORED_SETTINGS_KEY).is_none()
+    {
+        return Err(SettingsConflict::IgnoredNotArray);
+    }
+    Ok((root, object))
+}
+
+/// A `serde_json::Value` as a syntax-tree input value (`jsonc-parser` has no
+/// conversion of its own); numbers keep their JSON text.
+fn input_value(value: &Value) -> CstInputValue {
+    match value {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(value) => CstInputValue::Bool(*value),
+        Value::Number(number) => CstInputValue::Number(number.to_string()),
+        Value::String(text) => CstInputValue::String(text.clone()),
+        Value::Array(items) => CstInputValue::Array(items.iter().map(input_value).collect()),
+        Value::Object(fields) => CstInputValue::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), input_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn is_string(node: &jsonc_parser::cst::CstNode, text: &str) -> bool {
+    node.to_serde_value().as_ref().and_then(Value::as_str) == Some(text)
+}
+
+/// In-place edit of `settings.json`: `text: None` is an absent file (created
+/// as `{}` plus our keys); an empty or whitespace-only file is treated as
+/// `{}`. Sets the override to `url` (in place when the key exists, appended
+/// otherwise) and makes `settingsSync.ignoredSettings` hold both
+/// `OVERRIDE_KEY` and `CAPI_ALIAS_KEY`, creating the array when absent and
+/// appending only the missing entries. `state` is the previous sidecar
+/// (`None` on a first apply or when it could not be read); the returned
+/// state is what removal needs afterwards.
 pub(super) fn edit_settings(
     text: Option<&str>,
     url: &str,
     state: Option<&SettingsState>,
 ) -> Result<(String, SettingsState), SettingsConflict> {
-    let _ = (text, url, state);
-    todo!("writer: in-place JSONC edit of settings.json (specs/PR-3c.md AC1-AC4, AC6, AC7)")
+    let source = match text {
+        Some(text) if !text.trim().is_empty() => text,
+        _ => "{}\n",
+    };
+    let (root, object) = parse_object(source)?;
+
+    let existing = object.get(OVERRIDE_KEY);
+    let existing_value = existing
+        .as_ref()
+        .and_then(|property| property.value())
+        .and_then(|value| value.to_serde_value());
+    // New properties go at the top of the object: appending after the last
+    // one would add a comma to the user's last line, inserting first leaves
+    // every line the user wrote as it was.
+    let mut inserted = 0;
+    match &existing {
+        Some(property) => property.set_value(CstInputValue::String(url.to_owned())),
+        None => {
+            object.insert(
+                inserted,
+                OVERRIDE_KEY,
+                CstInputValue::String(url.to_owned()),
+            );
+            inserted += 1;
+        }
+    }
+
+    let ignored_created_now = object.get(IGNORED_SETTINGS_KEY).is_none();
+    let mut appended = Vec::new();
+    if ignored_created_now {
+        object.insert(
+            inserted,
+            IGNORED_SETTINGS_KEY,
+            CstInputValue::Array(
+                [OVERRIDE_KEY, CAPI_ALIAS_KEY]
+                    .map(|entry| CstInputValue::String(entry.to_owned()))
+                    .to_vec(),
+            ),
+        );
+        appended.extend([OVERRIDE_KEY, CAPI_ALIAS_KEY].map(str::to_owned));
+    } else {
+        let ignored = object
+            .array_value(IGNORED_SETTINGS_KEY)
+            .ok_or(SettingsConflict::IgnoredNotArray)?;
+        for entry in [OVERRIDE_KEY, CAPI_ALIAS_KEY] {
+            if !ignored.elements().iter().any(|node| is_string(node, entry)) {
+                ignored.append(CstInputValue::String(entry.to_owned()));
+                appended.push(entry.to_owned());
+            }
+        }
+    }
+    let only_ours = object
+        .array_value(IGNORED_SETTINGS_KEY)
+        .is_some_and(|ignored| {
+            ignored
+                .elements()
+                .iter()
+                .all(|node| is_string(node, OVERRIDE_KEY) || is_string(node, CAPI_ALIAS_KEY))
+        });
+
+    let new_state = match state {
+        // The first apply's record stays: the value the user had, whether the
+        // daemon created the file and the array. A hand edit of the override
+        // since then is drift, never the user's value.
+        Some(previous) => {
+            let mut added = previous.added_ignored.clone();
+            for entry in appended {
+                if !added.contains(&entry) {
+                    added.push(entry);
+                }
+            }
+            SettingsState {
+                version: SETTINGS_STATE_VERSION,
+                created: previous.created,
+                override_before: previous.override_before.clone(),
+                added_ignored: added,
+                ignored_created: previous.ignored_created,
+            }
+        }
+        None => {
+            // Without a record, an override already equal to our own URL was
+            // written by this daemon: it is not the user's value, our entries
+            // next to it are ours too, and an ignore list holding nothing but
+            // them was created by it.
+            let ours = existing_value.as_ref().and_then(Value::as_str) == Some(url);
+            let added_ignored = if ours {
+                [OVERRIDE_KEY, CAPI_ALIAS_KEY].map(str::to_owned).to_vec()
+            } else {
+                appended
+            };
+            SettingsState {
+                version: SETTINGS_STATE_VERSION,
+                created: text.is_none(),
+                override_before: if ours { None } else { existing_value },
+                added_ignored,
+                ignored_created: ignored_created_now || (ours && only_ours),
+            }
+        }
+    };
+    let edited = root.to_string();
+    Ok((edited, new_state))
 }
 
-/// In-place JSONC removal of the managed keys (AC5-AC7): the override is
-/// restored to `state.override_before` (`set_value` when the property still
-/// exists, appended when the user deleted it meanwhile, removed when there
-/// was none); `state.added_ignored` entries are taken out of
-/// `settingsSync.ignoredSettings`; the array property itself is removed when
-/// `state.ignored_created` and it is now empty. Without a sidecar
-/// (`state: None`), `own_url` is the daemon's own current override URL: an
-/// override equal to it, and the two well-known entries, are removed by
-/// value; an unparseable file is `Ok(Unchanged)` (not a conflict, matching
-/// today's `plan_remove_orphaned`, settings.rs:157-163).
+/// In-place removal of the managed keys. With a sidecar: the override is
+/// restored to `override_before` (in place, keeping a same-line comment;
+/// appended when the user deleted the property meanwhile; removed when there
+/// was none), `added_ignored` entries are taken out, and the array property
+/// goes when the daemon created it and it is now empty. Without a sidecar,
+/// an override equal to `own_url` and our two entries are removed by value,
+/// and an unparseable file is left alone.
 pub(super) fn remove_settings(
     text: &str,
     state: Option<&SettingsState>,
     own_url: Option<&str>,
 ) -> Result<Removal, SettingsConflict> {
-    let _ = (text, state, own_url);
-    todo!("writer: in-place JSONC removal of settings.json (specs/PR-3c.md AC5-AC7)")
-}
-
-/// Reads a sidecar (v2, or PR 3b's `MergeState` upgraded per AC7); `None`
-/// when the bytes are not one of those two shapes (AC6: a warning, not a
-/// hard error, at the call site).
-pub(super) fn read_state(bytes: &[u8]) -> Option<SettingsState> {
-    let _ = bytes;
-    todo!("writer: v2 sidecar read, v1 MergeState upgraded (specs/PR-3c.md AC7)")
-}
-
-fn options() -> json_merge::MergeOptions {
-    json_merge::MergeOptions {
-        mode: FILE_MODE,
-        // Arrays merge and roll back by value, which is what the string
-        // entries in settingsSync.ignoredSettings need.
-        keyed_arrays: &[],
-        // The file holds the pairing and possibly the user's own secrets.
-        redact_diff: true,
-        // The override is the daemon's while managed: a hand edit of the URL
-        // is replaced on the next apply and never becomes "the user's value"
-        // that removal would put back (a stale override breaks Copilot Chat).
-        owned_keys: &[OVERRIDE_KEY],
+    if text.trim().is_empty() {
+        return Ok(match state {
+            Some(state) if state.created => Removal::Delete,
+            _ => Removal::Unchanged,
+        });
     }
+    let (root, object) = match parse_object(text) {
+        Ok(parsed) => parsed,
+        Err(conflict) if state.is_some() => return Err(conflict),
+        Err(_) => return Ok(Removal::Unchanged),
+    };
+
+    let (restore, entries, drop_empty_array) = match state {
+        Some(state) => (
+            Some(state.override_before.clone()),
+            state.added_ignored.clone(),
+            state.ignored_created,
+        ),
+        None => {
+            let current = object
+                .get(OVERRIDE_KEY)
+                .and_then(|property| property.value())
+                .and_then(|value| value.to_serde_value());
+            let Some(own_url) =
+                own_url.filter(|url| current.as_ref().and_then(Value::as_str) == Some(*url))
+            else {
+                return Ok(Removal::Unchanged);
+            };
+            let _ = own_url;
+            (
+                Some(None),
+                [OVERRIDE_KEY, CAPI_ALIAS_KEY].map(str::to_owned).to_vec(),
+                true,
+            )
+        }
+    };
+
+    if let Some(before) = restore {
+        match (object.get(OVERRIDE_KEY), before) {
+            (Some(property), Some(value)) => property.set_value(input_value(&value)),
+            (Some(property), None) => property.remove(),
+            (None, Some(value)) => {
+                object.append(OVERRIDE_KEY, input_value(&value));
+            }
+            (None, None) => {}
+        }
+    }
+    if let Some(ignored) = object.array_value(IGNORED_SETTINGS_KEY) {
+        for node in ignored.elements() {
+            if entries.iter().any(|entry| is_string(&node, entry)) {
+                node.remove();
+            }
+        }
+        if drop_empty_array
+            && ignored.elements().is_empty()
+            && let Some(property) = object.get(IGNORED_SETTINGS_KEY)
+        {
+            property.remove();
+        }
+    }
+
+    let remaining = root.to_string();
+    if state.is_some_and(|state| state.created)
+        && remaining
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            == "{}"
+    {
+        return Ok(Removal::Delete);
+    }
+    Ok(if remaining == text {
+        Removal::Unchanged
+    } else {
+        Removal::Write(remaining)
+    })
+}
+
+/// The whole-document state an earlier daemon wrote through `json_merge`.
+#[derive(Deserialize)]
+struct LegacyMergeState {
+    created: bool,
+    before: Value,
+}
+
+/// Reads a sidecar: the current form, or the earlier whole-document form
+/// upgraded; `None` when the bytes are neither (the caller warns).
+pub(super) fn read_state(bytes: &[u8]) -> Option<SettingsState> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    if value.get("version").is_some() {
+        return serde_json::from_value::<SettingsState>(value)
+            .ok()
+            .filter(|state| state.version == SETTINGS_STATE_VERSION);
+    }
+    let legacy: LegacyMergeState = serde_json::from_value(value).ok()?;
+    let before_ignored = legacy.before.get(IGNORED_SETTINGS_KEY);
+    let held = |entry: &str| {
+        before_ignored
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.iter().any(|value| value == entry))
+    };
+    Some(SettingsState {
+        version: SETTINGS_STATE_VERSION,
+        created: legacy.created,
+        override_before: legacy.before.get(OVERRIDE_KEY).cloned(),
+        added_ignored: [OVERRIDE_KEY, CAPI_ALIAS_KEY]
+            .into_iter()
+            .filter(|entry| !held(entry))
+            .map(str::to_owned)
+            .collect(),
+        ignored_created: before_ignored.is_none(),
+    })
 }
 
 /// Plans the create/update/remove/conflict for the user `settings.json`.
 ///
-/// Merges only when the program is set with `copilotChat: githubModels`,
+/// Edits only when the program is set with `copilotChat: githubModels`,
 /// uses the gateway, the gateway has `proxyUrl` and the loopback proxy is
 /// available; removes the managed keys otherwise (with a warning when the
 /// proxy is the missing part), the same decision shape as `reconcile::plan`.
@@ -203,16 +450,14 @@ pub(super) fn plan(
             if config.copilot_chat == VsCodeCopilotChat::GithubModels && gateway.proxy_url.is_some()
     );
     if !active {
-        remove(path, &state_path, proxy, plan)?;
-        return Ok(());
+        return remove(path, &state_path, proxy, plan);
     }
     let Some((listen, pairing)) = proxy else {
         warn!(
             path = %path.display(),
             "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed settings"
         );
-        remove(path, &state_path, None, plan)?;
-        return Ok(());
+        return remove(path, &state_path, None, plan);
     };
     if let Some(parent) = path
         .parent()
@@ -221,85 +466,128 @@ pub(super) fn plan(
     {
         plan.ensure_private_dir(parent);
     }
-    json_merge::plan_merge_with(
-        path,
-        &state_path,
-        managed_settings(listen, pairing),
-        false,
-        DESCRIPTION,
-        VsCode::DISPLAY_NAME,
-        options(),
-        plan,
-    )
+
+    let existing = read_optional(path, plan)?;
+    let (sidecar, state) = read_sidecar(&state_path, plan)?;
+    let text = match existing.as_deref().map(std::str::from_utf8) {
+        Some(Ok(text)) => Some(text),
+        Some(Err(_)) => return conflict(path, SettingsConflict::Parse, plan),
+        None => None,
+    };
+    let (edited, new_state) =
+        match edit_settings(text, &override_url(listen, pairing), state.as_ref()) {
+            Ok(result) => result,
+            Err(kind) => return conflict(path, kind, plan),
+        };
+
+    // An unchanged file is not rewritten, unless its mode lets others read
+    // it (VS Code saves it 664): then the same bytes are written 0600.
+    let looser = json_merge::current_mode(path).is_some_and(|mode| mode & 0o077 != 0);
+    let action = match text {
+        None => "create",
+        Some(text) if text == edited && !looser => "unchanged",
+        Some(_) => "update",
+    };
+    if action == "unchanged" {
+        plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, action, path);
+    } else {
+        // Redacted: the file holds the pairing and possibly the user's own
+        // secrets.
+        plan.record_diff(VsCode::DISPLAY_NAME, DESCRIPTION, action, path, None, None);
+        plan.write_file(path, edited.as_bytes(), FILE_MODE)?;
+    }
+
+    let mut state_bytes = serde_json::to_vec_pretty(&new_state)
+        .with_context(|| format!("serialize {} {DESCRIPTION} state", VsCode::DISPLAY_NAME))?;
+    state_bytes.push(b'\n');
+    if sidecar.as_deref() != Some(state_bytes.as_slice()) {
+        plan.write_file(&state_path, &state_bytes, 0o600)?;
+    }
+    debug!(provider = VsCode::DISPLAY_NAME, action, path = %path.display(), "planned VS Code settings edit");
+    Ok(())
 }
 
-/// Managed keys are removed through the sidecar when there is one, and by
-/// value (an override pointing at this daemon's listener with its pairing)
-/// when there is none.
+/// Removes the managed keys: through the sidecar when there is one, by value
+/// (an override pointing at this daemon's listener with its pairing) when
+/// there is none. The file keeps its mode.
 fn remove(
     path: &Path,
     state_path: &Path,
     proxy: Option<(SocketAddr, &str)>,
     plan: &ReconcilePlan,
 ) -> anyhow::Result<()> {
-    if !json_merge::plan_remove_with(
-        path,
-        state_path,
-        DESCRIPTION,
-        VsCode::DISPLAY_NAME,
-        options(),
-        plan,
-    )? && let Some((listen, pairing)) = proxy
-    {
-        plan_remove_orphaned(path, &override_url(listen, pairing), plan)?;
+    let (sidecar, state) = read_sidecar(state_path, plan)?;
+    let existing = match read_optional(path, plan) {
+        Ok(existing) => existing,
+        Err(error) if state.is_none() => {
+            warn!(error = %format!("{error:#}"), "skipping the VS Code settings file");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let own_url = proxy.map(|(listen, pairing)| override_url(listen, pairing));
+    if let Some(existing) = existing {
+        let removal = match std::str::from_utf8(&existing) {
+            Ok(text) => remove_settings(text, state.as_ref(), own_url.as_deref()),
+            Err(_) if state.is_some() => Err(SettingsConflict::Parse),
+            Err(_) => Ok(Removal::Unchanged),
+        };
+        match removal {
+            Ok(Removal::Unchanged) => {}
+            Ok(Removal::Write(text)) => {
+                plan.record_diff(
+                    VsCode::DISPLAY_NAME,
+                    DESCRIPTION,
+                    "update",
+                    path,
+                    None,
+                    None,
+                );
+                let mode = json_merge::current_mode(path).unwrap_or(FILE_MODE);
+                plan.write_file(path, text.as_bytes(), mode)?;
+            }
+            Ok(Removal::Delete) => {
+                plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, "remove", path);
+                plan.remove_file(path)
+                    .with_context(|| format!("remove {}", path.display()))?;
+            }
+            Err(kind) => return conflict(path, kind, plan),
+        }
+    }
+    if sidecar.is_some() {
+        plan.remove_file(state_path)
+            .with_context(|| format!("remove {}", state_path.display()))?;
     }
     Ok(())
 }
 
-/// Removal without a sidecar: an override equal to this daemon's own URL was
-/// written for this daemon, so it and the two ignored-settings entries are
-/// taken out; everything else stays, the file keeps its mode and is never
-/// deleted here. An unreadable file is skipped with a warning.
-fn plan_remove_orphaned(path: &Path, own_url: &str, plan: &ReconcilePlan) -> anyhow::Result<()> {
-    let existing = match plan.read(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            warn!(error = %format!("{error:#}"), "skipping the VS Code settings file");
-            return Ok(());
-        }
-    };
-    let Ok(Value::Object(mut current)) = serde_json::from_slice::<Value>(&existing) else {
-        tracing::debug!(
-            path = %path.display(),
-            "VS Code settings file is not a plain JSON object; leaving it alone (no sidecar, nothing known to remove)"
-        );
-        return Ok(());
-    };
-    if current.get(OVERRIDE_KEY).and_then(Value::as_str) != Some(own_url) {
-        return Ok(());
+fn conflict(path: &Path, kind: SettingsConflict, plan: &ReconcilePlan) -> anyhow::Result<()> {
+    warn!(path = %path.display(), reason = kind.reason(), "refusing to change the VS Code settings file");
+    plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, "conflict", path);
+    Ok(())
+}
+
+fn read_optional(path: &Path, plan: &ReconcilePlan) -> anyhow::Result<Option<Vec<u8>>> {
+    match plan.read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
-    current.remove(OVERRIDE_KEY);
-    if let Some(entries) = current
-        .get_mut(IGNORED_SETTINGS_KEY)
-        .and_then(Value::as_array_mut)
-    {
-        entries.retain(|entry| entry != OVERRIDE_KEY && entry != CAPI_ALIAS_KEY);
-        if entries.is_empty() {
-            current.remove(IGNORED_SETTINGS_KEY);
+}
+
+/// The sidecar's bytes and its parsed state; an unreadable sidecar is a
+/// warning (the sidecar-less rules apply and the next write replaces it).
+fn read_sidecar(
+    state_path: &Path,
+    plan: &ReconcilePlan,
+) -> anyhow::Result<(Option<Vec<u8>>, Option<SettingsState>)> {
+    let bytes = read_optional(state_path, plan)?;
+    let state = bytes.as_deref().and_then(|bytes| {
+        let state = read_state(bytes);
+        if state.is_none() {
+            warn!(path = %state_path.display(), "ignoring an unreadable VS Code settings sidecar");
         }
-    }
-    let mut contents = serde_json::to_vec_pretty(&Value::Object(current))
-        .with_context(|| format!("serialize {} {DESCRIPTION}", VsCode::DISPLAY_NAME))?;
-    contents.push(b'\n');
-    plan.record_diff(
-        VsCode::DISPLAY_NAME,
-        DESCRIPTION,
-        "update",
-        path,
-        None,
-        None,
-    );
-    let mode = json_merge::current_mode(path).unwrap_or(FILE_MODE);
-    plan.write_file(path, &contents, mode)
+        state
+    });
+    Ok((bytes, state))
 }

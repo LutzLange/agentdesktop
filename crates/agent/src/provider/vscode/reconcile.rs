@@ -77,7 +77,6 @@ fn options() -> json_merge::MergeOptions {
         keyed_arrays: KEYED,
         // The file holds the pairing.
         redact_diff: true,
-        owned_keys: &[],
     }
 }
 

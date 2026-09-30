@@ -287,11 +287,12 @@ async fn managed_settings_github_models_lifecycle() -> anyhow::Result<()> {
     Container::run("vscode", "crates/agent/src/provider/vscode/testdata/Dockerfile", async |container| {
         let gateway = Gateway::start().await?;
         let (echo_url, mut echo_heads) = websocket_echo().await?;
-        let user_settings = serde_json::json!({
-            "editor.fontSize": 14,
-            IGNORED_KEY: ["workbench.colorTheme"],
-        });
-        container.write(SETTINGS, &serde_json::to_string_pretty(&user_settings)?).await?;
+        // A commented file with a trailing comma, as VS Code users write it:
+        // the daemon edits it in place and the comment must survive.
+        let user_settings = format!(
+            "{{\n  // keep this comment\n  \"editor.fontSize\": 14,\n  \"{IGNORED_KEY}\": [\"workbench.colorTheme\"],\n}}\n"
+        );
+        container.write(SETTINGS, &user_settings).await?;
         container.exec(&["chown", "-R", "tester:tester", "/home/tester/.config"]).await?;
         // VS Code's own default for a settings file it created.
         container.exec(&["chmod", "644", SETTINGS]).await?;
@@ -315,7 +316,9 @@ async fn managed_settings_github_models_lifecycle() -> anyhow::Result<()> {
         info!("Checking the written settings file");
         let pairing = container.exec(&["cat", PAIRING]).await?;
         let pairing = pairing.trim().to_owned();
-        let written: serde_json::Value = serde_json::from_str(&container.exec(&["cat", SETTINGS]).await?)?;
+        let written_text = container.exec(&["cat", SETTINGS]).await?;
+        ensure!(written_text.contains("// keep this comment"), "comment lost on apply: {written_text}");
+        let written = jsonc(&written_text)?;
         let override_url = format!("http://{SETTINGS_LISTEN}/vscode-copilot-capi/{pairing}");
         ensure!(written[OVERRIDE_KEY] == override_url, "override URL: {written}");
         let ignored = written[IGNORED_KEY].as_array().cloned().context("ignoredSettings")?;
@@ -359,7 +362,9 @@ async fn managed_settings_github_models_lifecycle() -> anyhow::Result<()> {
         container.stop_process("daemon").await?;
         container.start_process("daemon", &daemon).await?;
         container.wait_ready(&["agentdesktop", "--socket", SOCKET, "status"]).await?;
-        let remaining: serde_json::Value = serde_json::from_str(&container.exec(&["cat", SETTINGS]).await?)?;
+        let remaining_text = container.exec(&["cat", SETTINGS]).await?;
+        ensure!(remaining_text.contains("// keep this comment"), "comment lost on removal: {remaining_text}");
+        let remaining = jsonc(&remaining_text)?;
         ensure!(remaining.get(OVERRIDE_KEY).is_none(), "override not removed: {remaining}");
         ensure!(remaining[IGNORED_KEY] == serde_json::json!(["workbench.colorTheme"]), "user ignoredSettings entry not kept alone: {remaining}");
         ensure!(remaining["editor.fontSize"] == 14, "user setting lost on removal: {remaining}");
@@ -369,4 +374,12 @@ async fn managed_settings_github_models_lifecycle() -> anyhow::Result<()> {
         Ok(())
     })
     .await
+}
+
+/// Parses VS Code's JSONC (comments, trailing commas) into a value.
+fn jsonc(text: &str) -> anyhow::Result<serde_json::Value> {
+    let root = jsonc_parser::cst::CstRootNode::parse(text, &Default::default())?;
+    root.value()
+        .and_then(|value| value.to_serde_value())
+        .context("settings.json holds no JSON value")
 }

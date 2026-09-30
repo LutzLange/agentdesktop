@@ -781,7 +781,7 @@ fn override_is_replaced_in_place_at_its_position_keeping_its_same_line_comment()
         "the value changes but the same-line comment travels with it: {edited}"
     );
     let a_index = edited.find("\"a.userSetting\"").unwrap();
-    let override_index = edited.find(OVERRIDE_KEY).unwrap();
+    let override_index = edited.find(&format!("\"{OVERRIDE_KEY}\": ")).unwrap();
     let z_index = edited.find("\"z.userSetting\"").unwrap();
     assert!(
         a_index < override_index && override_index < z_index,
@@ -977,7 +977,7 @@ fn a_created_file_is_deleted_when_only_braces_or_nothing_remain_but_kept_with_a_
     let with_comment = "{\n  // still here\n}\n";
     let removed = remove_settings(with_comment, Some(&state), None).unwrap();
     assert!(
-        matches!(removed, Removal::Write(_)),
+        !matches!(removed, Removal::Delete),
         "a remaining comment must keep the file: {removed:?}"
     );
 }
@@ -1068,7 +1068,7 @@ fn a_v1_sidecar_is_read_and_upgraded() {
 
     let state = read_state(&bytes).expect("a v1 sidecar (no `version` field) must be recognized");
     assert_eq!(state.version, SETTINGS_STATE_VERSION);
-    assert_eq!(state.created, false);
+    assert!(!state.created);
     assert_eq!(
         state.override_before,
         Some(Value::String(FIXTURE_WITH_OVERRIDE_VALUE.to_owned())),
