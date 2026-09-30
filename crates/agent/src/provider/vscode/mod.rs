@@ -44,6 +44,10 @@ pub fn default_vscode_settings_path(home: &std::path::Path) -> PathBuf {
 
 #[async_trait::async_trait]
 impl Provider for VsCode {
+    fn id(&self) -> &'static str {
+        Self::ID
+    }
+
     async fn discover(&self) -> Discovery {
         Discovery {
             agents: discovery::discover().into_iter().collect(),

@@ -24,6 +24,10 @@ pub mod vscode;
 /// An integration with a developer tool or local model runtime.
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
+    /// The provider's ID (the inventory's agent kind and the program key in
+    /// configuration status reports).
+    fn id(&self) -> &'static str;
+
     async fn discover(&self) -> Discovery;
 
     /// Propose configuration changes, including cleanup when disabled.

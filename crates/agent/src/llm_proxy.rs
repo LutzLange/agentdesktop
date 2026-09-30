@@ -3293,13 +3293,16 @@ mod tests {
             let key = format!("vscode-copilot\u{0}http://{address}/\u{0}agentgateway");
             // Inserted directly (bypassing `insert`'s expiry-margin floor,
             // which would otherwise refuse to cache anything this close to
-            // expiry) so the tunnel has time to open before the deadline.
+            // expiry). The cache reuses the entry for a minute, so the
+            // request always gets it however slowly it arrives; the
+            // credential itself expires in 300 ms, and that is the deadline
+            // the tunnel must close at.
             cache.entries.lock().unwrap().insert(
                 key,
                 CachedCredential {
                     credential: "short-lived".to_owned(),
                     device_id: "device-test".to_owned(),
-                    valid_until: std::time::Instant::now() + Duration::from_millis(300),
+                    valid_until: std::time::Instant::now() + Duration::from_secs(60),
                     valid_until_unix: now_unix() + 60,
                     expires: std::time::Instant::now() + Duration::from_millis(300),
                     expires_unix: now_unix() + 60,
