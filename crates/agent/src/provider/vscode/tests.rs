@@ -180,7 +180,7 @@ fn daemon_vscode_config_overrides_the_default_path() {
     );
 }
 
-// --- githubModels config validation (specs/PR-3b.md AC1) --------------------
+// --- githubModels config validation -----------------------------------------
 
 #[test]
 fn config_rejects_github_models_with_a_non_empty_models_map() {
@@ -646,9 +646,11 @@ fn system_mode_rejects_a_configured_program_before_writing_anything() {
     for provider in [
         VsCode {
             chat_models_path: None,
+            settings_path: None,
         },
         VsCode {
             chat_models_path: Some(path.clone()),
+            settings_path: Some(path.with_file_name("settings.json")),
         },
     ] {
         let error = match provider.plan(&context(false), &config) {

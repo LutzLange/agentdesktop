@@ -1,13 +1,9 @@
 //! Tests for VS Code's user `settings.json` management under the
-//! `githubModels` variant of `copilotChat` (specs/PR-3b.md): the spec-derived
-//! baseline (written before the implementation), mirroring
-//! `provider::vscode::tests` (specs/PR-3a.md, `chatLanguageModels.json`)
-//! wherever the shape is shared. `settings::settings_path`, `managed_settings`
-//! and `plan` are all `todo!()` stubs (see `settings.rs`), so every test that
-//! calls them fails on that panic today; that is expected until the writer
-//! fills them in. `github_models_removes_the_managed_chat_language_models_entry_through_reconcile_plan`
-//! is the exception: it exercises PR-3a's already-implemented
-//! `reconcile::plan`, not this module, and should pass today.
+//! `githubModels` variant of `copilotChat`, mirroring `provider::vscode::tests`
+//! (`chatLanguageModels.json`) wherever the shape is shared.
+//! `github_models_removes_the_managed_chat_language_models_entry_through_reconcile_plan`
+//! exercises `reconcile::plan` with a `githubModels` config, which must plan a
+//! removal of the custom-models entry.
 
 use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
 
@@ -17,7 +13,7 @@ use serde_json::{Value, json};
 use super::settings::{managed_settings, plan, settings_path};
 use crate::reconcile::ReconcilePlan;
 
-/// The two keys the daemon owns in `settings.json` (AC4).
+/// The two keys the daemon owns in `settings.json`.
 const OVERRIDE_KEY: &str = "github.copilot.advanced.debug.overrideCapiUrl";
 const CAPI_ALIAS_KEY: &str = "github.copilot.internal.capiUrl";
 const IGNORED_SETTINGS_KEY: &str = "settingsSync.ignoredSettings";
@@ -114,7 +110,7 @@ fn write_user_settings(path: &std::path::Path, document: &Value) {
     fs::write(path, serde_json::to_vec_pretty(document).unwrap()).unwrap();
 }
 
-// --- Fresh apply (AC4) -------------------------------------------------------
+// --- Fresh apply -------------------------------------------------------
 
 #[test]
 fn fresh_file_gets_both_managed_keys_and_is_owner_only() {
@@ -146,7 +142,7 @@ fn fresh_file_gets_both_managed_keys_and_is_owner_only() {
     );
 }
 
-// --- User content survives re-apply and re-pairing (AC4) --------------------
+// --- User content survives re-apply and re-pairing --------------------
 
 #[test]
 fn user_keys_and_a_user_ignored_settings_entry_survive_reapply_and_repairing() {
@@ -204,7 +200,7 @@ fn user_keys_and_a_user_ignored_settings_entry_survive_reapply_and_repairing() {
     assert!(ignored.contains(&"some.other.userSetting".to_owned()));
 }
 
-// --- Removal: one test per trigger (AC4), each keeping the user's keys -----
+// --- Removal: one test per trigger, each keeping the user's keys -----
 
 #[test]
 fn removal_program_absent_keeps_user_keys() {
@@ -359,7 +355,7 @@ fn removal_of_a_created_and_emptied_file_deletes_it() {
     assert!(!super::super::json_merge::state_path(&path).exists());
 }
 
-// --- File mode (AC4) ---------------------------------------------------------
+// --- File mode ---------------------------------------------------------
 
 #[cfg(unix)]
 #[test]
@@ -392,7 +388,7 @@ fn mode_0644_becomes_0600_on_merge_and_removal_keeps_the_mode_it_finds() {
     );
 }
 
-// --- Redaction (AC4) ---------------------------------------------------------
+// --- Redaction ---------------------------------------------------------
 
 #[test]
 fn redaction_keeps_the_pairing_out_of_render() {
@@ -416,7 +412,7 @@ fn redaction_keeps_the_pairing_out_of_render() {
     );
 }
 
-// --- Pre-existing user override (AC4, json_merge rollback) -----------------
+// --- Pre-existing user override (json_merge rollback) -----------------
 
 #[test]
 fn preexisting_user_override_capi_url_is_overwritten_and_restored() {
@@ -446,7 +442,7 @@ fn preexisting_user_override_capi_url_is_overwritten_and_restored() {
     );
 }
 
-// --- Comment / trailing comma conflicts (AC4) -------------------------------
+// --- Comment / trailing comma conflicts -------------------------------
 
 #[test]
 fn comment_and_trailing_comma_conflicts() {
@@ -482,7 +478,7 @@ fn comment_and_trailing_comma_conflicts() {
     }
 }
 
-// --- settings_path per OS (AC4) ----------------------------------------------
+// --- settings_path per OS ----------------------------------------------
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -511,7 +507,7 @@ fn settings_path_on_windows() {
     );
 }
 
-// --- managed_settings shape (AC4) -------------------------------------------
+// --- managed_settings shape -------------------------------------------
 
 #[test]
 fn managed_settings_carries_both_keys() {
@@ -524,7 +520,7 @@ fn managed_settings_carries_both_keys() {
 }
 
 // --- githubModels removes the managed chatLanguageModels.json entry, through
-// PR-3a's already-implemented reconcile::plan (AC1). Unlike every test above,
+// the existing reconcile::plan. Unlike every test above,
 // this one exercises real (non-stub) code and should pass today. -----------
 
 #[test]

@@ -97,6 +97,7 @@ export type SandboxConfigDocument = {
 export type DaemonConfigDocument = {
   llmGateway?: {
     url: string;
+    proxyUrl?: string;
     authentication?: {
       type: string;
       audience?: string;

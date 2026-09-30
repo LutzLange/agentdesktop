@@ -3,7 +3,7 @@ use std::{convert::Infallible, net::SocketAddr, path::Path, sync::Arc, time::Dur
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     HeaderMap, Method, Request, Response, StatusCode, Uri,
     body::Incoming,
@@ -98,6 +98,23 @@ impl CredentialCache {
             .map(|entry| entry.credential.clone())
     }
 
+    /// The monotonic deadline of a cached credential, if one is still valid.
+    /// A tunnel opened with the credential closes at this deadline.
+    fn deadline(&self, key: &str, device_id: &str) -> Option<std::time::Instant> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .get(key)
+            .filter(|entry| {
+                entry.device_id == device_id
+                    && std::time::Instant::now() < entry.valid_until
+                    && now_unix() < entry.valid_until_unix
+            })
+            .map(|entry| entry.valid_until)
+    }
+
     /// Remember a freshly fetched credential until the earlier of its expiry
     /// margin and the cache TTL.
     fn insert(
@@ -187,7 +204,7 @@ pub(crate) struct ProxyRoute {
     pub upstream: Upstream,
 }
 
-/// VS Code Copilot Chat's CAPI pass-through route (specs/PR-3b.md,
+/// VS Code Copilot Chat's CAPI pass-through route (the target of
 /// `github.copilot.advanced.debug.overrideCapiUrl`): the pairing travels as
 /// the first path segment after the prefix instead of in `PAIRING_HEADER`,
 /// because VS Code sends these requests itself and has no setting that adds a
@@ -232,12 +249,71 @@ pub(crate) const ROUTES: &[ProxyRoute] = &[
 /// reports. `None` when the first segment is missing or empty (bare prefix,
 /// `/`, or `//...`).
 ///
-/// Writer: called from `forward` for `CAPI_ROUTE` only, before the ordinary
-/// `PAIRING_HEADER` check, comparing the returned pairing segment in constant
-/// time and stripping it before the request is forwarded (AC2).
+/// Called from `forward` for `CAPI_ROUTE` only, in place of the `PAIRING_HEADER`
+/// check; the segment is compared in constant time and stripped before the
+/// request is forwarded.
 pub(crate) fn split_path_pairing(rest: &str) -> Option<(&str, &str)> {
-    let _ = rest;
-    todo!("writer: extract and strip the CAPI route's path-pairing segment (specs/PR-3b.md AC2)")
+    let without_slash = rest.strip_prefix('/')?;
+    let (segment, remainder) = match without_slash.find('/') {
+        Some(index) => (&without_slash[..index], &without_slash[index..]),
+        None => (without_slash, "/"),
+    };
+    (!segment.is_empty()).then_some((segment, remainder))
+}
+
+/// Whether the request asks for a WebSocket upgrade: `Connection` lists the
+/// `upgrade` token and `Upgrade` lists `websocket`, both case-insensitive.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let lists = |name: &str, token: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|item| item.trim().eq_ignore_ascii_case(token))
+    };
+    lists(CONNECTION.as_str(), "upgrade") && lists("upgrade", "websocket")
+}
+
+/// The tunnel an upgraded request leaves behind. The connection task awaits it
+/// after hyper hands the connection over, so every tunnel runs under the
+/// server's JoinSet and dropping the server closes it.
+type PendingTunnel =
+    Arc<std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>>;
+
+/// Relay bytes between the two upgraded connections until one side closes or
+/// the gateway credential the tunnel was opened with reaches its deadline.
+async fn run_tunnel(
+    inbound: hyper::upgrade::OnUpgrade,
+    outbound: hyper::upgrade::OnUpgrade,
+    deadline: Option<std::time::Instant>,
+) {
+    let (inbound, outbound) = match tokio::try_join!(inbound, outbound) {
+        Ok(streams) => streams,
+        Err(error) => {
+            tracing::debug!(%error, "LLM proxy upgrade did not complete");
+            return;
+        }
+    };
+    let mut inbound = TokioIo::new(inbound);
+    let mut outbound = TokioIo::new(outbound);
+    let relay = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+    let expiry = async move {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        result = relay => {
+            if let Err(error) = result {
+                tracing::debug!(%error, "LLM proxy tunnel closed with an error");
+            }
+        }
+        () = expiry => {
+            tracing::info!("LLM proxy tunnel closed: the gateway credential it was opened with expired");
+        }
+    }
 }
 
 /// Runtime settings of the proxy listener.
@@ -375,13 +451,16 @@ pub(crate) async fn serve_with_cache(
                 let config = config.clone();
                 let cache = cache.clone();
                 connections.spawn(async move {
+                    let pending: PendingTunnel = Arc::default();
+                    let slot = pending.clone();
                     let service = service_fn(move |request| {
                         let client = client.clone();
                         let state = state.clone();
                         let config = config.clone();
                         let cache = cache.clone();
+                        let slot = slot.clone();
                         async move {
-                            let response = match forward(request, &client, &state, &config, &cache).await {
+                            let response = match forward(request, &client, &state, &config, &cache, &slot).await {
                                 Ok(response) => response,
                                 Err(error) => {
                                     tracing::warn!(status = %error.status, code = error.code, message = %error.message, "LLM proxy request failed");
@@ -392,9 +471,20 @@ pub(crate) async fn serve_with_cache(
                         }
                     });
                     if let Err(error) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service).await
+                        .serve_connection(TokioIo::new(stream), service)
+                        .with_upgrades()
+                        .await
                     {
                         tracing::debug!(%error, "LLM proxy connection closed");
+                    }
+                    // An upgraded connection leaves its tunnel here; awaiting it
+                    // in this task keeps it under the server's JoinSet.
+                    let tunnel = pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(tunnel) = tunnel {
+                        tunnel.await;
                     }
                 });
             }
@@ -417,6 +507,14 @@ pub(crate) struct ProxyError {
 }
 
 impl ProxyError {
+    fn pairing_invalid() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "pairing_invalid",
+            "agentdesktop proxy: pairing value missing or wrong; re-apply the managed configuration",
+        )
+    }
+
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -583,11 +681,12 @@ fn upstream_base(gateway: &LlmGatewayConfig, upstream: Upstream) -> &url::Url {
 }
 
 async fn forward(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     client: &ProxyClient,
     state: &AppState,
     config: &ProxyConfig,
     cache: &CredentialCache,
+    tunnel_slot: &PendingTunnel,
 ) -> Result<Response<ProxyBody>, ProxyError> {
     if !host_is_loopback(request.headers()) {
         return Err(ProxyError::new(
@@ -611,33 +710,54 @@ async fn forward(
             "agentdesktop proxy: OPTIONS is not supported",
         ));
     }
-    // The pairing value is required on every route and travels only in its own
-    // header: Authorization keeps one meaning (the client's own token, used by the
-    // pass-through shapes) and the pairing is never mistaken for a credential.
-    // Checked before anything that reads configuration, so an unpaired caller
-    // learns nothing about this device and costs it no work.
-    let offered = request
-        .headers()
-        .get(PAIRING_HEADER)
-        .and_then(|value| value.to_str().ok());
-    if !offered
-        .is_some_and(|offered| constant_time_eq(offered.as_bytes(), config.pairing.as_bytes()))
-    {
-        return Err(ProxyError::new(
-            StatusCode::FORBIDDEN,
-            "pairing_invalid",
-            "agentdesktop proxy: pairing value missing or wrong; re-apply the managed configuration",
-        ));
-    }
-    // Pure string checks on the path run before any configuration is read.
+    // Pure string work on the path first; no configuration is read yet.
     let path_and_query = request
         .uri()
         .path_and_query()
-        .map_or("/", |path| path.as_str());
+        .map_or("/", |path| path.as_str())
+        .to_owned();
     let (path, query) = match path_and_query.split_once('?') {
         Some((path, query)) => (path, Some(query)),
-        None => (path_and_query, None),
+        None => (path_and_query.as_str(), None),
     };
+    // The pairing value is required on every route. It travels in its own
+    // header, so Authorization keeps one meaning (the client's own token on the
+    // pass-through shapes) and the pairing is never mistaken for a credential.
+    // The CAPI route's client (VS Code) cannot add a header, so there the
+    // pairing is the first path segment and the header is ignored. Checked
+    // before anything that reads configuration, so an unpaired caller learns
+    // nothing about this device and costs it no work.
+    let pairing_ok =
+        |offered: &str| constant_time_eq(offered.as_bytes(), config.pairing.as_bytes());
+    let capi_rest = match match_route(path) {
+        Some((route, rest)) if route.prefix == CAPI_ROUTE => {
+            let Some((segment, remainder)) = split_path_pairing(rest) else {
+                return Err(ProxyError::pairing_invalid());
+            };
+            if !pairing_ok(segment) {
+                return Err(ProxyError::pairing_invalid());
+            }
+            Some(remainder.to_owned())
+        }
+        _ => {
+            let offered = request
+                .headers()
+                .get(PAIRING_HEADER)
+                .and_then(|value| value.to_str().ok());
+            if !offered.is_some_and(pairing_ok) {
+                return Err(ProxyError::pairing_invalid());
+            }
+            None
+        }
+    };
+    let websocket = is_websocket_upgrade(request.headers());
+    if websocket && capi_rest.is_none() {
+        return Err(ProxyError::new(
+            StatusCode::BAD_REQUEST,
+            "upgrade_not_supported",
+            "agentdesktop proxy: WebSocket upgrades are supported on the /vscode-copilot-capi route only",
+        ));
+    }
     if path_escapes_base(path) {
         return Err(ProxyError::new(
             StatusCode::BAD_REQUEST,
@@ -692,7 +812,7 @@ async fn forward(
                 route.client_id.to_owned(),
                 Some(route.credential),
                 upstream_base(gateway, route.upstream),
-                rest,
+                capi_rest.as_deref().unwrap_or(rest),
             )
         }
         // No prefix: the original hand-configured shape. Credential mode comes
@@ -729,6 +849,13 @@ async fn forward(
     // both places.
     let client_credential = bearer_or_header(request.headers(), "x-llm-token")
         .filter(|value| !constant_time_eq(value.as_bytes(), config.pairing.as_bytes()));
+    // GitHub's health ping carries no credential and needs none: on the CAPI
+    // route a GET without one is forwarded as is instead of being refused.
+    let credential_less_ping = capi_rest.as_deref() == Some("/_ping")
+        && request.method() == Method::GET
+        && client_credential.is_none();
+    // The inbound upgrade handle is taken before the body is consumed.
+    let inbound_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
 
     // Buffer the body (capped) so the request can be retried once with a fresh
     // credential; the response is streamed as it arrives.
@@ -761,6 +888,16 @@ async fn forward(
     let mut request = Request::from_parts(parts, ());
 
     strip_hop_headers(request.headers_mut());
+    if websocket {
+        // The upgrade is the point of the request: put back the two hop headers
+        // that carry it (the Sec-WebSocket-* headers are end-to-end and stay).
+        request
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        request
+            .headers_mut()
+            .insert("upgrade", HeaderValue::from_static("websocket"));
+    }
     for header in [
         AUTHORIZATION.as_str(),
         "x-api-key",
@@ -775,6 +912,7 @@ async fn forward(
     // so the prefix is added in exactly one place.
     let upstream_token = match credential_mode {
         Some(RouteCredential::Gateway) => None,
+        Some(RouteCredential::Passthrough) if credential_less_ping => None,
         Some(RouteCredential::Passthrough) => Some(client_credential.ok_or_else(|| {
             ProxyError::new(
                 StatusCode::UNAUTHORIZED,
@@ -982,6 +1120,43 @@ async fn forward(
             cache.insert(key, device_id, fetched);
         }
         let mut response = response;
+        if websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            // The upstream accepted the upgrade. The 101 goes back with its
+            // Connection/Upgrade/Sec-WebSocket-* headers (they are the upgrade),
+            // and the tunnel between the two upgraded connections is handed to
+            // the connection task. It closes when either side closes or when
+            // the gateway credential it was opened with reaches its deadline.
+            let deadline = match (&cache_key, &fetched_now) {
+                (Some((key, device_id)), None) if from_cache => cache.deadline(key, device_id),
+                (_, Some(fetched)) => Some(
+                    std::time::Instant::now()
+                        + Duration::from_secs(
+                            fetched.expires_at_unix_seconds.saturating_sub(now_unix()),
+                        ),
+                ),
+                _ => None,
+            };
+            let outbound_upgrade = hyper::upgrade::on(&mut response);
+            let inbound_upgrade = inbound_upgrade.ok_or_else(|| {
+                ProxyError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "agentdesktop_unavailable",
+                    "agentdesktop proxy: upgrade handle missing",
+                )
+            })?;
+            *tunnel_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::pin(run_tunnel(
+                inbound_upgrade,
+                outbound_upgrade,
+                deadline,
+            )));
+            return Ok(response.map(|_| {
+                Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed()
+            }));
+        }
         strip_hop_headers(response.headers_mut());
         return Ok(response.map(BodyExt::boxed));
     }
@@ -2221,16 +2396,7 @@ mod tests {
         (dir, state)
     }
 
-    // --- vscode-copilot-capi: path pairing, /_ping and the WebSocket tunnel
-    // (specs/PR-3b.md AC2, AC3, AC7). Spec-derived baseline: the interface
-    // contract only adds `CAPI_ROUTE` to `ROUTES` and a `split_path_pairing`
-    // stub (`todo!()`, never called yet); `forward`'s path-pairing
-    // extraction, the ping-without-credential exception, `upgrade_not_supported`
-    // and the tunnel itself are the writer's, so most of the tests below fail
-    // against the stub, not just at a `todo!()` panic (`match_route` already
-    // matches `CAPI_ROUTE` as an ordinary `Passthrough`/`ProxyUrl` route, so a
-    // request reaches the existing header-pairing and credential logic before
-    // any CAPI-specific behaviour would apply).
+    // --- vscode-copilot-capi: path pairing, /_ping and the WebSocket tunnel.
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},

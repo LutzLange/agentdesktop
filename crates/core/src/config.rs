@@ -131,7 +131,7 @@ pub struct ToolConfigPath {
 }
 
 /// VS Code paths: own type (not the shared `ToolConfigPath`) because the
-/// `githubModels` variant of `copilotChat` (specs/PR-3b.md) manages a second
+/// `githubModels` variant of `copilotChat` manages a second
 /// file, the user's `settings.json`, alongside `chatLanguageModels.json`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -144,7 +144,7 @@ pub struct VsCodeStartupConfig {
     pub config: Option<PathBuf>,
     /// The user `settings.json` to manage (the `githubModels` variant of
     /// `copilotChat`). Defaults to that file inside the per-OS VS Code user
-    /// profile directory. // writer: resolve settings path
+    /// profile directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<PathBuf>,
 }
@@ -859,7 +859,7 @@ impl CopilotConfig {
 /// `copilotChat: ownModels` this is `chatLanguageModels.json`, pointing
 /// Copilot Chat's built-in "Custom Endpoint" model provider at the local LLM
 /// proxy's `/vscode-copilot` route; under `copilotChat: githubModels`
-/// (specs/PR-3b.md) it is the user `settings.json`, pointing Copilot Chat's
+/// it is the user `settings.json`, pointing Copilot Chat's
 /// CAPI endpoint at the loopback proxy's `/vscode-copilot-capi/<pairing>`
 /// route so VS Code keeps GitHub's own models and its own Copilot token while
 /// the daemon adds the gateway identity. See `provider::vscode::reconcile`
@@ -875,7 +875,7 @@ pub struct VsCodeConfig {
     pub use_llm_gateway: bool,
     /// Which Copilot Chat model source VS Code is pointed at: agentdesktop's
     /// own custom models (`ownModels`), or GitHub's own models reached
-    /// through the gateway (`githubModels`, specs/PR-3b.md).
+    /// through the gateway (`githubModels`).
     #[serde(default)]
     pub copilot_chat: VsCodeCopilotChat,
     /// Custom model entries exposed to VS Code's Copilot Chat model picker,
@@ -897,11 +897,11 @@ pub enum VsCodeCopilotChat {
     /// route (VS Code's "Custom Endpoint" provider).
     #[default]
     OwnModels,
-    /// GitHub's own models, reached through the gateway with the user's
-    /// GitHub Copilot token forwarded (specs/PR-3b.md): the daemon points
-    /// `github.copilot.advanced.debug.overrideCapiUrl` at the loopback
-    /// proxy's `/vscode-copilot-capi/<pairing>` route in the user
-    /// `settings.json`.
+    /// GitHub's own models, reached through the gateway's pass-through route
+    /// (`llmGateway.proxyUrl`) with the user's GitHub Copilot token forwarded:
+    /// the daemon points `github.copilot.advanced.debug.overrideCapiUrl` in
+    /// the user `settings.json` at the loopback proxy's
+    /// `/vscode-copilot-capi/<pairing>` route. `models` must be empty.
     GithubModels,
 }
 
