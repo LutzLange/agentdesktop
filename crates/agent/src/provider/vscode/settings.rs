@@ -7,9 +7,10 @@
 //!
 //! The file is VS Code's JSONC, commonly commented and hand-edited, so it is
 //! edited in place with a lossless syntax tree (`jsonc-parser`): only the
-//! override and the two `settingsSync.ignoredSettings` entries change, every
-//! other byte (comments, order, formatting, line endings) stays as the user
-//! wrote it. The sidecar records only what removal must restore.
+//! override and the two `settingsSync.ignoredSettings` entries change, and
+//! comments, key order, indentation, line endings and a leading byte-order
+//! mark stay as the user wrote them (a single-line object is expanded to one
+//! property per line). The sidecar records only what removal must restore.
 
 use std::{
     net::SocketAddr,
@@ -374,7 +375,7 @@ pub(super) fn remove_settings(
         Err(conflict) if state.is_some() => return Err(conflict),
         Err(_) => {
             debug!(
-                "VS Code settings file is not VS Code JSONC; leaving it alone (no sidecar, nothing known to remove)"
+                "VS Code settings file is not valid VS Code JSONC; leaving it alone (no sidecar, nothing known to remove)"
             );
             return Ok(Removal::Unchanged);
         }
@@ -430,9 +431,10 @@ pub(super) fn remove_settings(
         }
     }
 
-    let remaining = format!("{bom}{root}");
+    let body = root.to_string();
+    let remaining = format!("{bom}{body}");
     if state.is_some_and(|state| state.created)
-        && remaining
+        && body
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect::<String>()
@@ -585,7 +587,13 @@ fn remove(
         let removal = match std::str::from_utf8(&existing) {
             Ok(text) => remove_settings(text, state.as_ref(), own_url.as_deref()),
             Err(_) if state.is_some() => Err(SettingsConflict::Parse),
-            Err(_) => Ok(Removal::Unchanged),
+            Err(_) => {
+                debug!(
+                    path = %path.display(),
+                    "VS Code settings file is not UTF-8; leaving it alone (no sidecar, nothing known to remove)"
+                );
+                Ok(Removal::Unchanged)
+            }
         };
         match removal {
             Ok(Removal::Unchanged) => {
