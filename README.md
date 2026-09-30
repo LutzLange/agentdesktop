@@ -574,8 +574,7 @@ Every interval the daemon re-applies the current configuration (the local
 file, or the last configuration the controller pushed). A managed file that
 was deleted or edited by hand comes back, a file whose mode was loosened is
 tightened, and a conflict that was fixed is applied. Nothing is written when
-nothing changed, and a tick reports to the controller and logs only when the
-outcome changed. Deleting a managed file is then no longer a way to opt out:
+nothing changed, and a tick reports to the controller and logs its outcome lines only when the outcome changed; a provider warning that explains a conflict (for example the file it refuses to change) repeats with every apply until the conflict is fixed. Deleting a managed file is then no longer a way to opt out:
 switch the program off in the configuration or stop the daemon instead. The
 tick cannot start a local LLM proxy that was not running when the daemon
 started (restart the daemon for that). Unset means no periodic re-apply; zero

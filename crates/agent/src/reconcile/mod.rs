@@ -236,7 +236,7 @@ impl Reconciler {
 /// The reason recorded for a program that uses the gateway while the local
 /// LLM proxy is absent.
 pub(crate) const PROXY_ABSENT_REASON: &str =
-    "local LLM proxy not available; see llmProxy.error in daemon-info";
+    "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen";
 
 /// A program's outcome, by precedence (highest first): Failed > Conflict >
 /// Blocked > Inactive > Applied/Removed > Unchanged.
@@ -296,7 +296,8 @@ pub struct ApplyReport {
 
 impl ApplyReport {
     /// One log line per program whose state is not applied or unchanged; a
-    /// program that failed, conflicted or was blocked is a warning.
+    /// program that failed, conflicted, was blocked or is inactive is a
+    /// warning.
     pub fn log(&self) {
         for outcome in &self.programs {
             // Inactive is a warning too: the program is configured for the
