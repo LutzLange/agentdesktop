@@ -55,6 +55,10 @@ url.workspace = true
 
 [dev-dependencies]
 futures-util = "0.3"
+# Hand-rolled RFC 6455 handshake for the vscode-copilot-capi WebSocket
+# tunnel tests (llm_proxy.rs): Sec-WebSocket-Accept is
+# base64(sha1(key + the RFC 6455 GUID)).
+sha1 = "0.11"
 tempfile = "3"
 testcontainers = "0.28"
 tracing-subscriber.workspace = true

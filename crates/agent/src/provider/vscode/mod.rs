@@ -8,7 +8,10 @@ use crate::reconcile::ReconcilePlan;
 
 pub(super) mod discovery;
 pub(crate) mod reconcile;
+pub(super) mod settings;
 
+#[cfg(test)]
+mod settings_tests;
 #[cfg(test)]
 mod tests;
 

@@ -180,6 +180,57 @@ fn daemon_vscode_config_overrides_the_default_path() {
     );
 }
 
+// --- githubModels config validation (specs/PR-3b.md AC1) --------------------
+
+#[test]
+fn config_rejects_github_models_with_a_non_empty_models_map() {
+    let error = parse_programs(
+        "programs:\n  vscode:\n    copilotChat: githubModels\n    models:\n      x: {}\n",
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not allowed when copilotChat is githubModels"),
+        "{error:#}"
+    );
+    parse_programs("programs:\n  vscode:\n    copilotChat: githubModels\n")
+        .expect("githubModels with no models is valid");
+}
+
+#[test]
+fn config_rejects_github_models_without_proxy_url_only_when_the_gateway_is_used() {
+    // The gateway is used (useLlmGateway defaults to true) and configured,
+    // but llmGateway.proxyUrl is unset: rejected.
+    let error = parse_programs(
+        "llmGateway:\n  url: https://gateway.example\nprograms:\n  vscode:\n    copilotChat: githubModels\n",
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("llmGateway.proxyUrl"),
+        "{error:#}"
+    );
+
+    // useLlmGateway: false: the gateway is configured but not used by this
+    // program, so no proxyUrl is required.
+    parse_programs(
+        "llmGateway:\n  url: https://gateway.example\nprograms:\n  vscode:\n    copilotChat: githubModels\n    useLlmGateway: false\n",
+    )
+    .expect("githubModels with useLlmGateway: false needs no proxyUrl");
+
+    // No top-level llmGateway at all: same, no proxyUrl required.
+    parse_programs("programs:\n  vscode:\n    copilotChat: githubModels\n")
+        .expect("githubModels with no llmGateway needs no proxyUrl");
+}
+
+#[test]
+fn config_accepts_github_models_when_both_the_gateway_and_proxy_url_are_set() {
+    // Both values matched in validate_daemon: use_llm_gateway true, gateway
+    // configured, and llmGateway.proxyUrl set.
+    parse_programs(
+        "llmGateway:\n  url: https://gateway.example\n  proxyUrl: https://gateway.example/copilot-proxy\nprograms:\n  vscode:\n    copilotChat: githubModels\n",
+    )
+    .expect("githubModels with llmGateway.proxyUrl set is valid");
+}
+
 // --- chat_models_path per OS (criterion 2) ----------------------------------
 
 #[cfg(target_os = "linux")]
