@@ -235,8 +235,7 @@ impl Reconciler {
 
 /// The reason recorded for a program that uses the gateway while the local
 /// LLM proxy is absent.
-pub(crate) const PROXY_ABSENT_REASON: &str =
-    "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen";
+pub(crate) const PROXY_ABSENT_REASON: &str = "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen";
 
 /// A program's outcome, by precedence (highest first): Failed > Conflict >
 /// Blocked > Inactive > Applied/Removed > Unchanged.
