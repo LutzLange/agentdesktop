@@ -157,9 +157,10 @@ message ConfigStatus {
   uint64 revision = 1;
   ConfigState state = 2;
   string error = 3;
-  // Per-program outcomes of this apply (PR 4). Empty on a hash or parse
-  // error, alongside every other agent that does not report per-program
-  // status: `programs_reported` distinguishes the two.
+  // Per-program outcomes of this apply, in the agent's provider order. Empty
+  // when the configuration was not applied at all (hash or parse error), and
+  // from agents that do not report per-program status: `programs_reported`
+  // distinguishes the two.
   repeated ProgramStatus programs = 4;
   // Whether this agent version reports per-program status at all. An older
   // agent never sets this field, so it reads back as `false`.
@@ -172,8 +173,9 @@ enum ConfigState {
   CONFIG_STATE_FAILED = 2;
 }
 
-// One managed program's outcome from an apply (PR 4, per-program
-// configuration status).
+// One managed program's outcome from an apply. `program` is the provider ID
+// (for example `claude-code`, `vscode`); `detail` is at most 1024 bytes and
+// carries paths, fixed reasons and error chains, never file content.
 message ProgramStatus {
   string program = 1;
   ProgramState state = 2;

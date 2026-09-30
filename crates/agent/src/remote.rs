@@ -28,9 +28,9 @@ use agentdesktop_core::{
 };
 use agentdesktop_proto::fleet::{
     AgentMessage, ConfigState, ConfigStatus, Discovery, Heartbeat, Hello, Inventory,
-    LlmGatewayCredentialRequest, RenewDeviceCertificateRequest, SessionNewEvent, TelemetryEvent,
-    ToolUseEvent, agent_message, controller_message, fleet_agent_client::FleetAgentClient,
-    telemetry_event,
+    LlmGatewayCredentialRequest, ProgramState as ProtoProgramState, ProgramStatus,
+    RenewDeviceCertificateRequest, SessionNewEvent, TelemetryEvent, ToolUseEvent, agent_message,
+    controller_message, fleet_agent_client::FleetAgentClient, telemetry_event,
 };
 
 use crate::{
@@ -443,6 +443,7 @@ fn apply_daemon_config(
     config: agentdesktop_proto::fleet::DaemonConfig,
     reconciler: &Reconciler,
 ) -> ConfigStatus {
+    let mut programs = Vec::new();
     let result = (|| -> anyhow::Result<()> {
         let actual_hash = Sha256::digest(&config.yaml);
         if actual_hash.as_slice() != config.sha256 {
@@ -456,7 +457,18 @@ fn apply_daemon_config(
         let yaml = std::str::from_utf8(&config.yaml).context("configuration is not UTF-8")?;
         let daemon_config = config::parse_daemon(yaml)?;
         debug!(revision = config.revision, "parsed daemon configuration");
-        reconciler.apply(&daemon_config)?;
+        let (report, applied) = reconciler.apply_with_report(&daemon_config);
+        report.log();
+        programs = report
+            .programs
+            .iter()
+            .map(|outcome| ProgramStatus {
+                program: outcome.program.to_owned(),
+                state: program_state_proto(outcome.state).into(),
+                detail: outcome.detail.clone(),
+            })
+            .collect();
+        applied?;
         secure_fs::ensure_private_dir(state_dir)?;
         let path = state_dir.join("remote-config.yaml");
         secure_fs::atomic_write(&path, &config.yaml, 0o600)?;
@@ -468,36 +480,40 @@ fn apply_daemon_config(
         Ok(())
     })();
 
+    // `programs_reported` says this agent reports per-program status; the
+    // list is empty when the configuration was not applied at all (hash or
+    // parse error), and holds the apply's outcomes otherwise, also when a
+    // later step (persisting the configuration) failed.
     match result {
-        // PR 4 (specs/PR-4.md): `programs` is left empty here pending the
-        // switch to `Reconciler::apply_with_report`; `programs_reported` is
-        // this agent's fixed capability flag and is `true` regardless of
-        // whether this particular apply succeeded.
         Ok(()) => ConfigStatus {
             revision: config.revision,
             state: ConfigState::Applied.into(),
             error: String::new(),
-            programs: Vec::new(),
+            programs,
             programs_reported: true,
         },
         Err(error) => ConfigStatus {
             revision: config.revision,
             state: ConfigState::Failed.into(),
             error: format!("{error:#}"),
-            programs: Vec::new(),
+            programs,
             programs_reported: true,
         },
     }
 }
 
-/// Maps a [`crate::reconcile::ProgramState`] to its proto enum value
-/// (specs/PR-4.md, criterion 6).
-#[allow(dead_code)]
-fn program_state_proto(
-    state: crate::reconcile::ProgramState,
-) -> agentdesktop_proto::fleet::ProgramState {
-    let _ = state;
-    todo!("PR 4: program_state_proto - map every ProgramState variant to its proto enum value")
+/// The proto value of a program's outcome.
+fn program_state_proto(state: crate::reconcile::ProgramState) -> ProtoProgramState {
+    use crate::reconcile::ProgramState;
+    match state {
+        ProgramState::Applied => ProtoProgramState::Applied,
+        ProgramState::Unchanged => ProtoProgramState::Unchanged,
+        ProgramState::Removed => ProtoProgramState::Removed,
+        ProgramState::Conflict => ProtoProgramState::Conflict,
+        ProgramState::Inactive => ProtoProgramState::Inactive,
+        ProgramState::Blocked => ProtoProgramState::Blocked,
+        ProgramState::Failed => ProtoProgramState::Failed,
+    }
 }
 
 /// Sends the current inventory snapshot to the controller.

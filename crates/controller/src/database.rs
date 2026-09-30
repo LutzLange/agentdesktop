@@ -3,7 +3,9 @@ use sqlx::{AnyPool, any::AnyPoolOptions};
 use std::{collections::BTreeMap, path::PathBuf};
 
 use agentdesktop_core::model::{LocalModel, McpServer, ModelRuntime, Skill};
-use agentdesktop_proto::fleet::{ConfigStatus, Hello, Inventory, TelemetryEvent, telemetry_event};
+use agentdesktop_proto::fleet::{
+    ConfigStatus, Hello, Inventory, ProgramState, TelemetryEvent, telemetry_event,
+};
 use serde::Serialize;
 
 #[derive(Clone)]
@@ -116,17 +118,73 @@ pub struct DeviceDetail {
     pub discoveries: Vec<DeviceDiscovery>,
     pub model_runtimes: Vec<ModelRuntime>,
     pub recent_events: Vec<TelemetryEventRecord>,
-    /// Per-program configuration status, ordered by `position`
-    /// (specs/PR-4.md, criterion 9).
+    /// Per-program configuration status, in the order the agent reported it.
     pub programs: Vec<ProgramStatusRecord>,
     /// `None` when this device has no configuration status at all; `Some(_)`
     /// once one has been reported, reflecting the reporting agent's
-    /// `ConfigStatus.programs_reported` (specs/PR-4.md, criterion 9).
+    /// `ConfigStatus.programs_reported`.
     pub programs_reported: Option<bool>,
 }
 
-/// One managed program's stored configuration status
-/// (specs/PR-4.md, criterion 9).
+/// Bounds on what an agent reports per program, as for telemetry fields.
+fn validate_program_status(status: &ConfigStatus) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        status.programs.len() <= 32,
+        "too many programs in configuration status"
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for program in &status.programs {
+        anyhow::ensure!(
+            !program.program.is_empty()
+                && program.program.len() <= 64
+                && program
+                    .program
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "invalid program in configuration status"
+        );
+        anyhow::ensure!(
+            seen.insert(program.program.as_str()),
+            "duplicate program in configuration status"
+        );
+        anyhow::ensure!(
+            program.detail.len() <= 2048,
+            "program detail too long in configuration status"
+        );
+    }
+    Ok(())
+}
+
+/// The stored name of a program state; values this controller does not know
+/// are `unspecified`.
+fn program_state_name(state: i64) -> &'static str {
+    match i32::try_from(state)
+        .ok()
+        .and_then(|state| ProgramState::try_from(state).ok())
+    {
+        Some(ProgramState::Applied) => "applied",
+        Some(ProgramState::Unchanged) => "unchanged",
+        Some(ProgramState::Removed) => "removed",
+        Some(ProgramState::Conflict) => "conflict",
+        Some(ProgramState::Inactive) => "inactive",
+        Some(ProgramState::Blocked) => "blocked",
+        Some(ProgramState::Failed) => "failed",
+        Some(ProgramState::Unspecified) | None => "unspecified",
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ProgramStatusRow {
+    program: String,
+    state: i64,
+    detail: String,
+    revision: i64,
+    updated_at: i64,
+}
+
+/// One managed program's stored configuration status. `revision` is the
+/// controller revision the report answered; it does not change across hot
+/// reloads of the same revision.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProgramStatusRecord {
     pub program: String,
@@ -336,15 +394,38 @@ impl Database {
             .map(|discovery: &DeviceDiscovery| discovery.kind.clone())
             .collect();
         let recent_events = self.recent_telemetry(device_id, 50).await?;
-        // PR 4 (specs/PR-4.md): reading `device_program_status` and
-        // `device_config_status.programs_reported` is not wired here yet.
+        let programs_reported: Option<i64> = sqlx::query_scalar(
+            "SELECT programs_reported FROM device_config_status WHERE device_id = $1",
+        )
+        .bind(device_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load configuration status reporting")?;
+        let rows: Vec<ProgramStatusRow> = sqlx::query_as(
+            "SELECT program, state, detail, revision, updated_at FROM device_program_status
+             WHERE device_id = $1 ORDER BY position ASC",
+        )
+        .bind(device_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("load program configuration status")?;
+        let programs = rows
+            .into_iter()
+            .map(|row| ProgramStatusRecord {
+                program: row.program,
+                state: program_state_name(row.state).to_owned(),
+                detail: row.detail,
+                revision: row.revision,
+                updated_at: row.updated_at,
+            })
+            .collect();
         Ok(Some(DeviceDetail {
             device,
             discoveries,
             model_runtimes,
             recent_events,
-            programs: Vec::new(),
-            programs_reported: None,
+            programs,
+            programs_reported: programs_reported.map(|reported| reported != 0),
         }))
     }
 
@@ -469,41 +550,53 @@ impl Database {
         device_id: &str,
         status: &ConfigStatus,
     ) -> anyhow::Result<()> {
+        validate_program_status(status)?;
+        let now = unix_time_seconds();
+        let revision = i64::try_from(status.revision).unwrap_or(i64::MAX);
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO device_config_status
-                (device_id, revision, state, error, updated_at)
-             VALUES ($1, $2, $3, $4, $5)
+                (device_id, revision, state, error, updated_at, programs_reported)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (device_id) DO UPDATE SET
                 revision = excluded.revision,
                 state = excluded.state,
                 error = excluded.error,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                programs_reported = excluded.programs_reported",
         )
         .bind(device_id)
-        .bind(i64::try_from(status.revision).unwrap_or(i64::MAX))
+        .bind(revision)
         .bind(i64::from(status.state))
         .bind(&status.error)
-        .bind(unix_time_seconds())
-        .execute(&self.pool)
+        .bind(now)
+        .bind(i64::from(status.programs_reported))
+        .execute(&mut *transaction)
         .await?;
-        self.replace_program_status(device_id, status).await
-    }
-
-    /// Validates `status.programs` and replaces this device's per-program
-    /// status rows, and sets `device_config_status.programs_reported`, in
-    /// one transaction (specs/PR-4.md, criteria 7 and 8): rejects a status
-    /// with more than 32 programs, a `program` longer than 64 bytes or
-    /// outside `[a-z0-9-]`, or a `detail` longer than 2048 bytes, the same
-    /// bounds `insert_telemetry` applies to its own fields.
-    async fn replace_program_status(
-        &self,
-        _device_id: &str,
-        _status: &ConfigStatus,
-    ) -> anyhow::Result<()> {
-        todo!(
-            "PR 4: replace_program_status - validate bounds, then replace device_program_status \
-             rows and set device_config_status.programs_reported in one transaction"
-        )
+        // The report replaces the previous one: a program missing from it is
+        // gone from the table.
+        sqlx::query("DELETE FROM device_program_status WHERE device_id = $1")
+            .bind(device_id)
+            .execute(&mut *transaction)
+            .await?;
+        for (position, program) in status.programs.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO device_program_status
+                    (device_id, program, position, revision, state, detail, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(device_id)
+            .bind(&program.program)
+            .bind(i64::try_from(position).unwrap_or(i64::MAX))
+            .bind(revision)
+            .bind(i64::from(program.state))
+            .bind(&program.detail)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn insert_telemetry(

@@ -133,15 +133,58 @@ impl Reconciler {
     }
 
     /// Plans every provider like [`Reconciler::plan`], but a provider whose
-    /// `plan` errors is recorded as `ProgramState::Failed` instead of
-    /// aborting the rest (specs/PR-4.md, criterion 4).
+    /// `plan` fails is recorded as failed and the others are still planned,
+    /// so each program's outcome is known. Nothing is written here.
     pub fn plan_with_report(&self, config: &DaemonConfig) -> AttributedPlan {
-        let _ = config;
-        todo!(
-            "PR 4: Reconciler::plan_with_report - plan every provider, attributing operations \
-             and observed paths to the provider that produced them, recording a Failed outcome \
-             for a provider whose plan() errors and continuing with the rest"
-        )
+        let configured = configured_programs(&config.programs);
+        let mut plan = ReconcilePlan::default();
+        let mut entries: Vec<ProgramEntry> = Vec::new();
+        let mut first_error = None;
+        for provider in self.providers.iter() {
+            let program = provider.id();
+            let mut entry = ProgramEntry {
+                program,
+                configured: configured.contains(&program),
+                failed: None,
+                changes: false,
+                conflicts: Vec::new(),
+                inactive: None,
+                paths: Vec::new(),
+                operations: 0..0,
+            };
+            match provider.plan(&self.context, config) {
+                Err(error) => {
+                    entry.failed = Some(format!("{error:#}"));
+                    first_error.get_or_insert(error);
+                }
+                Ok(own) => {
+                    let summary = own.summary();
+                    entry.changes = summary.changes;
+                    entry.conflicts = summary.conflicts;
+                    entry.inactive = summary.inactive;
+                    entry.paths = summary.paths;
+                    let start = plan.operation_count();
+                    if let Err((error, path)) = plan.append_attributed(own) {
+                        // Both programs of the disagreement fail.
+                        for other in entries
+                            .iter_mut()
+                            .filter(|other| other.paths.contains(&path))
+                        {
+                            other.failed.get_or_insert_with(|| format!("{error:#}"));
+                        }
+                        entry.failed = Some(format!("{error:#}"));
+                        first_error.get_or_insert(error);
+                    }
+                    entry.operations = start..plan.operation_count();
+                }
+            }
+            entries.push(entry);
+        }
+        AttributedPlan {
+            plan,
+            entries,
+            first_error,
+        }
     }
 
     /// [`Reconciler::plan_with_report`] followed by [`AttributedPlan::apply`].
@@ -150,14 +193,18 @@ impl Reconciler {
     }
 }
 
-/// The precedence-ranked terminal state of one program's outcome from an
-/// attributed apply, highest first: Failed > Conflict > Blocked > Inactive >
-/// Applied/Removed > Unchanged (specs/PR-4.md, criterion 2).
+/// The reason recorded for a program that uses the gateway while the local
+/// LLM proxy is absent.
+pub(crate) const PROXY_ABSENT_REASON: &str =
+    "local LLM proxy not available; see llmProxy.error in daemon-info";
+
+/// A program's outcome, by precedence (highest first): Failed > Conflict >
+/// Blocked > Inactive > Applied/Removed > Unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramState {
-    /// The program's operations were written by this apply.
+    /// The program is configured and its files were changed by this apply.
     Applied,
-    /// The program is configured; nothing needed to be written.
+    /// The program is configured; nothing needed to change.
     Unchanged,
     /// The program is not configured; its managed content was removed by
     /// this apply.
@@ -167,59 +214,243 @@ pub enum ProgramState {
     /// The program uses the gateway, a gateway is configured, and the
     /// loopback proxy is absent.
     Inactive,
-    /// The program had operations, but none of them was written because the
+    /// The program had changes, but none of them was written because the
     /// apply was refused or stopped.
     Blocked,
-    /// The program's plan errored, its append failed, one of its writes
-    /// failed, or one of its observed files changed before the apply.
+    /// The program's plan failed, it disagreed with another program's plan,
+    /// one of its writes failed, or one of its files changed before the
+    /// apply.
     Failed,
 }
 
-/// One program's outcome from an attributed apply
-/// (specs/PR-4.md, criterion 1).
+impl ProgramState {
+    /// Lowercase name, as logged and stored.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Unchanged => "unchanged",
+            Self::Removed => "removed",
+            Self::Conflict => "conflict",
+            Self::Inactive => "inactive",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One program's outcome from an apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramOutcome {
-    /// The provider ID (`Provider::ID` on the concrete provider), for
-    /// example `"claude-code"` or `"vscode"`.
+    /// The provider ID, for example `"claude-code"` or `"vscode"`.
     pub program: &'static str,
     pub state: ProgramState,
     pub detail: String,
 }
 
 /// Every reported program's outcome from one apply, in provider
-/// registration order (specs/PR-4.md, criterion 1 and 3).
+/// registration order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyReport {
     pub programs: Vec<ProgramOutcome>,
 }
 
-/// A plan attributed to the providers that produced it, ready to apply with
-/// per-program reporting (specs/PR-4.md, criterion 4 and 5). Opaque: the
-/// shape here is a placeholder for the implementation.
-#[allow(dead_code)]
-pub struct AttributedPlan {
-    plan: ReconcilePlan,
-    programs: Vec<&'static str>,
-}
-
-impl AttributedPlan {
-    /// Applies with today's all-or-nothing rules (a failed plan or any
-    /// conflict means nothing is written) and returns the first error as
-    /// today, alongside the per-program report (specs/PR-4.md, criterion 4).
-    pub fn apply(self) -> (ApplyReport, anyhow::Result<()>) {
-        todo!(
-            "PR 4: AttributedPlan::apply - apply with per-program attribution, precedence and \
-             detail truncation to 1024 bytes"
-        )
+impl ApplyReport {
+    /// One log line per program whose state is not applied or unchanged.
+    pub fn log(&self) {
+        for outcome in &self.programs {
+            if !matches!(
+                outcome.state,
+                ProgramState::Applied | ProgramState::Unchanged
+            ) {
+                tracing::info!(
+                    program = outcome.program,
+                    state = outcome.state.as_str(),
+                    detail = %outcome.detail,
+                    "program configuration outcome"
+                );
+            }
+        }
     }
 }
 
-/// The provider IDs reported as configured for `programs`: an exhaustive
-/// destructure of [`ProgramsConfig`], so a new key does not compile until it
-/// is mapped here (specs/PR-4.md, criterion 3).
+/// The longest detail an outcome carries, in bytes.
+const DETAIL_LIMIT: usize = 1024;
+
+fn truncate_detail(mut detail: String) -> String {
+    if detail.len() > DETAIL_LIMIT {
+        let mut end = DETAIL_LIMIT;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    detail
+}
+
+struct ProgramEntry {
+    program: &'static str,
+    configured: bool,
+    failed: Option<String>,
+    changes: bool,
+    conflicts: Vec<String>,
+    inactive: Option<String>,
+    paths: Vec<PathBuf>,
+    operations: std::ops::Range<usize>,
+}
+
+impl ProgramEntry {
+    /// The outcome when this program's own part did not fail or conflict:
+    /// `written` says whether its changes reached the disk.
+    fn settled(&self, written: bool, blocked_by: &str) -> Option<(ProgramState, String)> {
+        if self.changes && !written {
+            return Some((ProgramState::Blocked, format!("not applied: {blocked_by}")));
+        }
+        if let Some(reason) = &self.inactive {
+            return Some((ProgramState::Inactive, reason.clone()));
+        }
+        match (self.changes, self.configured) {
+            (true, true) => Some((ProgramState::Applied, String::new())),
+            (true, false) => Some((ProgramState::Removed, String::new())),
+            (false, true) => Some((ProgramState::Unchanged, String::new())),
+            (false, false) => None,
+        }
+    }
+}
+
+/// A plan with each program's part identified, ready to apply with
+/// per-program reporting.
+pub struct AttributedPlan {
+    plan: ReconcilePlan,
+    entries: Vec<ProgramEntry>,
+    first_error: Option<anyhow::Error>,
+}
+
+impl AttributedPlan {
+    /// Applies with the all-or-nothing rules of [`ReconcilePlan::apply`] (a
+    /// failed plan or any conflict means nothing is written) and returns the
+    /// same first error, alongside each program's outcome.
+    pub fn apply(self) -> (ApplyReport, anyhow::Result<()>) {
+        let Self {
+            plan,
+            entries,
+            first_error,
+        } = self;
+        // The first program, in registration order, that stops the apply.
+        let first_bad = entries.iter().find_map(|entry| {
+            if entry.failed.is_some() {
+                Some(format!("{} failed", entry.program))
+            } else if !entry.conflicts.is_empty() {
+                Some(format!("{} conflicted", entry.program))
+            } else {
+                None
+            }
+        });
+        let refused = |result: anyhow::Result<()>, blocked_by: &str| {
+            let programs = entries
+                .iter()
+                .filter_map(|entry| {
+                    let (state, detail) = if let Some(detail) = &entry.failed {
+                        (ProgramState::Failed, detail.clone())
+                    } else if !entry.conflicts.is_empty() {
+                        (ProgramState::Conflict, entry.conflicts.join("; "))
+                    } else {
+                        entry.settled(false, blocked_by)?
+                    };
+                    Some(outcome(entry.program, state, detail))
+                })
+                .collect();
+            (ApplyReport { programs }, result)
+        };
+        if let Some(error) = first_error {
+            return refused(Err(error), first_bad.as_deref().unwrap_or_default());
+        }
+        if let Some(blocked_by) = first_bad {
+            // Only conflicts are left; the plan refuses without writing.
+            return refused(plan.apply(), &blocked_by);
+        }
+        let (result, owners_failed, written_upto) = match plan.apply_tracked() {
+            Ok(()) => (Ok(()), None, usize::MAX),
+            Err((error, stop)) => {
+                let detail = format!("{error:#}");
+                let failed: Vec<&'static str> = match &stop {
+                    plan::ApplyStop::Conflict => Vec::new(),
+                    plan::ApplyStop::Observed(path) => entries
+                        .iter()
+                        .filter(|entry| entry.paths.contains(path))
+                        .map(|entry| entry.program)
+                        .collect(),
+                    plan::ApplyStop::PrivateDir(dir) => entries
+                        .iter()
+                        .filter(|entry| entry.paths.iter().any(|path| path.starts_with(dir)))
+                        .map(|entry| entry.program)
+                        .collect(),
+                    plan::ApplyStop::Operation(index) => entries
+                        .iter()
+                        .filter(|entry| entry.operations.contains(index))
+                        .map(|entry| entry.program)
+                        .collect(),
+                };
+                let upto = match stop {
+                    plan::ApplyStop::Operation(index) => index,
+                    _ => 0,
+                };
+                (Err(error), Some((failed, detail)), upto)
+            }
+        };
+        let blocked_by = owners_failed
+            .as_ref()
+            .and_then(|(failed, _)| failed.first())
+            .map(|program| format!("{program} failed"))
+            .unwrap_or_default();
+        let programs = entries
+            .iter()
+            .filter_map(|entry| {
+                if let Some((failed, detail)) = &owners_failed
+                    && failed.contains(&entry.program)
+                {
+                    return Some(outcome(entry.program, ProgramState::Failed, detail.clone()));
+                }
+                let written = entry.operations.end <= written_upto;
+                let (state, detail) = entry.settled(written, &blocked_by)?;
+                Some(outcome(entry.program, state, detail))
+            })
+            .collect();
+        (ApplyReport { programs }, result)
+    }
+}
+
+fn outcome(program: &'static str, state: ProgramState, detail: String) -> ProgramOutcome {
+    ProgramOutcome {
+        program,
+        state,
+        detail: truncate_detail(detail),
+    }
+}
+
+/// The provider IDs of the configured programs. The destructure is
+/// exhaustive, so a new program key does not compile until it is mapped.
 pub fn configured_programs(programs: &ProgramsConfig) -> Vec<&'static str> {
-    let _ = programs;
-    todo!("PR 4: configured_programs - map each configured ProgramsConfig key to its provider ID")
+    let ProgramsConfig {
+        claude_code,
+        claude_desktop,
+        codex,
+        open_code,
+        grok,
+        copilot,
+        vscode,
+    } = programs;
+    [
+        (claude_code.is_some(), ClaudeCode::ID),
+        (claude_desktop.is_some(), ClaudeDesktop::ID),
+        (codex.is_some(), Codex::ID),
+        (open_code.is_some(), OpenCode::ID),
+        (grok.is_some(), Grok::ID),
+        (copilot.is_some(), Copilot::ID),
+        (vscode.is_some(), VsCode::ID),
+    ]
+    .into_iter()
+    .filter_map(|(configured, id)| configured.then_some(id))
+    .collect()
 }
 
 #[derive(Default)]
@@ -886,6 +1117,10 @@ programs:
 
     #[async_trait::async_trait]
     impl crate::provider::Provider for FailWithMessage {
+        fn id(&self) -> &'static str {
+            "fail-with-message"
+        }
+
         async fn discover(&self) -> agentdesktop_core::model::Discovery {
             agentdesktop_core::model::Discovery {
                 agents: Vec::new(),
