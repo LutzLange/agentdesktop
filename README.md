@@ -447,7 +447,7 @@ display keeps working.
 
 The file lives in the VS Code user profile directory next to
 `chatLanguageModels.json` (Linux `~/.config/Code/User/settings.json`); the
-local startup setting `daemon.vscode.settings` overrides it. The daemon merges
+local startup setting `daemon.vscode.settings` overrides it. The daemon adds
 its two keys and keeps every other setting; user entries in
 `settingsSync.ignoredSettings` are kept, ours are added by value. A user's own
 `overrideCapiUrl` is overwritten while the program is active and restored on
@@ -467,9 +467,12 @@ comes back).
 
 The daemon edits the file in place: the override and the two ignore entries
 are the only text it changes (new properties go at the top of the object),
-and comments, trailing commas, key order, indentation and line endings stay
-as they are; removal takes out exactly what the apply added, so a file the
-daemon only added keys to returns to its earlier bytes. The sidecar holds no
+and comments, trailing commas, key order, indentation, line endings and a
+leading byte-order mark stay as they are; removal takes out exactly what the apply added, so a file the
+daemon only added keys to returns to its earlier content. One exception: a
+file written on a single line (`{ "a": 1 }`) is expanded to one property per
+line when keys are added and stays expanded after removal; VS Code itself
+always writes one property per line. The sidecar holds no
 copy of the file, only the override's earlier value and which ignore entries
 the daemon added. A conflict (the file is not valid VS Code JSONC, meaning
 anything beyond comments and trailing commas such as a missing comma or a

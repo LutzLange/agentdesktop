@@ -115,10 +115,9 @@ fn write_user_settings(path: &std::path::Path, document: &Value) {
 }
 
 // --- Helpers for the pure-function (`edit_settings`/`remove_settings`)
-// baseline: the strict VS Code JSONC grammar (AC1, comments and trailing
-// commas, nothing else of JSON5's permissive defaults) and a
-// comment-tolerant way to check semantic content without caring about
-// formatting.
+// tests: the strict VS Code JSONC grammar (comments and trailing commas,
+// nothing else of JSON5's permissive defaults) and a comment-tolerant way to
+// check semantic content without caring about formatting.
 
 fn vscode_parse_options() -> ParseOptions {
     ParseOptions {
@@ -495,7 +494,7 @@ fn preexisting_user_override_capi_url_is_overwritten_and_restored() {
     );
 }
 
-// --- Comments and trailing commas are preserved, not a conflict (AC1) --
+// --- Comments and trailing commas are preserved, not a conflict ------
 //
 // Under the old whole-document `json_merge`, a commented or trailing-comma
 // file was a conflict (formatting would be lost silently); the in-place CST
@@ -567,12 +566,6 @@ fn settings_path_on_windows() {
     );
 }
 
-// Ledger: `managed_settings_carries_both_keys` is dropped here (AC9): the CST
-// edit (`edit_settings`) does not build a whole managed document the way
-// `json_merge` did, so nothing but this test used `managed_settings` once
-// `plan` is rewired to call `edit_settings`/`remove_settings`. `managed_settings`
-// itself is left for the writer to remove or keep (AC9's call).
-
 // --- githubModels removes the managed chatLanguageModels.json entry, through
 // the existing reconcile::plan. Unlike every test above,
 // this one exercises real (non-stub) code and should pass today. -----------
@@ -600,9 +593,9 @@ fn github_models_removes_the_managed_chat_language_models_entry_through_reconcil
     changes.apply().unwrap();
     assert!(path.exists());
 
-    // `copilotChat` switches to `githubModels`: the writer calls
-    // `reconcile::plan` with `configured = None`, since this file has nothing
-    // to manage under that variant. It must plan (and apply) a removal.
+    // `copilotChat` switches to `githubModels`: `reconcile::plan` is called
+    // with `configured = None`, since this file has nothing to manage under
+    // that variant. It must plan (and apply) a removal.
     let changes = ReconcilePlan::default();
     chat_models_plan(&path, Some((listen_addr(), PAIRING)), None, &changes).unwrap();
     assert!(!changes.has_conflicts(), "{}", changes.render());
@@ -614,10 +607,8 @@ fn github_models_removes_the_managed_chat_language_models_entry_through_reconcil
     );
 }
 
-// Rewritten against the v2 sidecar (AC9 ledger: these used to go through
-// `plan`/`apply` and `json_merge`'s now-removed `owned_keys`; they exercise
-// `edit_settings`/`remove_settings` directly, chained the way the writer's
-// `plan`/`remove` must chain them across a re-apply).
+// Owned override: these exercise `edit_settings`/`remove_settings` directly,
+// chained the way `plan` chains them across a re-apply.
 
 // A hand edit of the managed URL after the first apply is drift, not the
 // user's value; a re-apply replaces it and removal must not put it back
@@ -702,9 +693,8 @@ fn user_override_from_before_the_first_apply_survives_a_hand_edit_and_returns_on
 }
 
 // =========================================================================
-// Spec-derived baseline (specs/PR-3c.md AC1-AC7): pure-function tests on
-// `edit_settings`/`remove_settings`/`read_state`, no filesystem. These fail
-// on the `todo!()` stubs until the writer fills them in.
+// Pure-function tests on `edit_settings`/`remove_settings`/`read_state`, no
+// filesystem.
 // =========================================================================
 
 /// Comments (line and block), a trailing comma, CRLF, and a user key on
@@ -727,7 +717,7 @@ fn an_absent_file_is_created_as_the_exact_golden_text() {
         format!(
             "{{\n  \"{OVERRIDE_KEY}\": \"{MANAGED_URL}\",\n  \"{IGNORED_SETTINGS_KEY}\": [\"{OVERRIDE_KEY}\", \"{CAPI_ALIAS_KEY}\"]\n}}\n"
         ),
-        "AC1's golden text is fixed exactly"
+        "the golden text is fixed exactly"
     );
     assert!(state.created, "the file did not exist before this apply");
     assert!(state.ignored_created);
@@ -982,7 +972,7 @@ fn a_created_file_is_deleted_when_only_braces_or_nothing_remain_but_kept_with_a_
     );
 }
 
-// --- Conflicts (AC2/AC3) -------------------------------------------------
+// --- Conflicts -----------------------------------------------------------
 
 #[test]
 fn edit_settings_conflicts() {
@@ -1053,7 +1043,7 @@ fn remove_settings_with_a_sidecar_treats_an_unparseable_file_as_a_conflict() {
     );
 }
 
-// --- read_state (AC7): v1 MergeState upgraded ----------------------------
+// --- read_state: the earlier whole-document sidecar upgraded --------------
 
 #[test]
 fn a_v1_sidecar_is_read_and_upgraded() {
@@ -1090,7 +1080,7 @@ fn read_state_is_none_for_bytes_that_are_neither_v1_nor_v2() {
     assert!(read_state(b"not json at all").is_none());
 }
 
-// --- SettingsState's own serde shape (AC3/AC4: exact camelCase, deny_unknown_fields,
+// --- SettingsState's own serde shape (exact camelCase, deny_unknown_fields,
 // an explicit null override_before kept distinct from an absent one) -----
 
 #[test]
@@ -1137,12 +1127,8 @@ fn settings_state_serializes_camelcase_and_keeps_an_explicit_null_override_befor
 }
 
 // =========================================================================
-// Plan-level tests (existing helpers): the v2 sidecar and in-place edit
-// through `plan`/`apply`, once the writer rewires `plan`/`remove` to call
-// `edit_settings`/`remove_settings`. Several of these currently fail against
-// the old `json_merge`-based `plan` (genuinely unimplemented behaviour, not
-// a test bug): commented/looser-mode files still conflict or aren't
-// tightened, and the sidecar is still PR 3b's `MergeState`.
+// Plan-level tests (existing helpers): the v2 sidecar and the in-place edit
+// through `plan`/`apply`.
 // =========================================================================
 
 #[test]
@@ -1266,7 +1252,7 @@ fn sidecar_less_reapply_then_removal_clears_the_override_and_both_entries() {
     let state_path = super::super::json_merge::state_path(&path);
     fs::remove_file(&state_path).unwrap();
 
-    // Re-apply without a sidecar (AC6): the existing override, equal to our
+    // Re-apply without a sidecar: the existing override, equal to our
     // own URL, must not become "the user's value" to restore later.
     apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
 
@@ -1335,6 +1321,87 @@ fn redaction_keeps_the_pairing_out_of_the_sidecar_too() {
     let sidecar = fs::read_to_string(&state_path).unwrap();
     assert!(
         !sidecar.contains(PAIRING),
-        "the sidecar must not carry the pairing value, unlike PR 3b's `MergeState` snapshot: {sidecar}"
+        "the sidecar must not carry the pairing value: {sidecar}"
+    );
+}
+
+// Added with the implementation (not part of the spec-derived baseline).
+#[test]
+fn an_earlier_daemon_url_is_ours_not_the_users_value() {
+    let stale = "http://127.0.0.1:18099/vscode-copilot-capi/OLD-PAIRING";
+    let fixture = format!("{{\n  \"{OVERRIDE_KEY}\": \"{stale}\"\n}}\n");
+    let (edited, state) = edit_settings(Some(&fixture), MANAGED_URL, None).unwrap();
+    assert_eq!(
+        state.override_before, None,
+        "a loopback CAPI URL is never the user's own"
+    );
+    assert!(
+        !serde_json::to_string(&state)
+            .unwrap()
+            .contains("OLD-PAIRING")
+    );
+    assert_eq!(parse_jsonc(&edited)[OVERRIDE_KEY], MANAGED_URL);
+    // Sidecar-less removal takes a stale one out as well.
+    assert!(matches!(
+        remove_settings(&fixture, None, Some(MANAGED_URL)).unwrap(),
+        Removal::Write(remaining) if parse_jsonc(&remaining).get(OVERRIDE_KEY).is_none()
+    ));
+    // A user's own non-loopback URL stays theirs.
+    let users = format!(
+        "{{\n  \"{OVERRIDE_KEY}\": \"https://capi.example.invalid/vscode-copilot-capi/x\"\n}}\n"
+    );
+    let (_, state) = edit_settings(Some(&users), MANAGED_URL, None).unwrap();
+    assert!(state.override_before.is_some());
+}
+
+// Added with the implementation (not part of the spec-derived baseline).
+#[test]
+fn a_byte_order_mark_is_kept_and_edited_around() {
+    let fixture = "\u{feff}{\n  \"a\": 1\n}\n";
+    let (edited, state) = edit_settings(Some(fixture), MANAGED_URL, None).unwrap();
+    assert!(edited.starts_with('\u{feff}'), "{edited:?}");
+    assert_eq!(
+        parse_jsonc(edited.trim_start_matches('\u{feff}'))[OVERRIDE_KEY],
+        MANAGED_URL
+    );
+    assert_eq!(
+        remove_settings(&edited, Some(&state), None).unwrap(),
+        Removal::Write(fixture.to_owned())
+    );
+}
+
+// Added with the implementation (not part of the spec-derived baseline).
+#[test]
+fn a_list_or_file_recreated_by_a_reapply_goes_again_on_removal() {
+    // The user had an ignore list and deleted it after the first apply; the
+    // re-apply recreates it, so removal takes it out rather than leaving [].
+    let fixture = format!("{{\n  \"a\": 1,\n  \"{IGNORED_SETTINGS_KEY}\": [\"x\"]\n}}\n");
+    let (_, first) = edit_settings(Some(&fixture), MANAGED_URL, None).unwrap();
+    let (edited, state) =
+        edit_settings(Some("{\n  \"a\": 1\n}\n"), MANAGED_URL, Some(&first)).unwrap();
+    assert!(state.ignored_created);
+    let Removal::Write(remaining) = remove_settings(&edited, Some(&state), None).unwrap() else {
+        panic!("user key a must remain");
+    };
+    assert!(
+        parse_jsonc(&remaining).get(IGNORED_SETTINGS_KEY).is_none(),
+        "{remaining}"
+    );
+    // The user deleted the whole file; the re-apply recreated it.
+    let (recreated, state) = edit_settings(None, MANAGED_URL, Some(&first)).unwrap();
+    assert!(state.created);
+    assert_eq!(
+        remove_settings(&recreated, Some(&state), None).unwrap(),
+        Removal::Delete
+    );
+}
+
+// Added with the implementation (not part of the spec-derived baseline).
+#[test]
+fn a_duplicated_ignore_list_is_a_conflict() {
+    let text = format!("{{ \"{IGNORED_SETTINGS_KEY}\": [], \"{IGNORED_SETTINGS_KEY}\": [] }}");
+    assert_eq!(
+        edit_settings(Some(&text), MANAGED_URL, None),
+        Err(SettingsConflict::DuplicateKey)
     );
 }

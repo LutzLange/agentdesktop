@@ -202,6 +202,15 @@ pub(super) fn edit_settings(
     url: &str,
     state: Option<&SettingsState>,
 ) -> Result<(String, SettingsState), SettingsConflict> {
+    // A UTF-8 byte-order mark (Windows PowerShell 5.1 writes one) is kept as
+    // it is and edited around.
+    let (bom, text) = match text {
+        Some(text) => {
+            let (bom, rest) = split_bom(text);
+            (bom, Some(rest))
+        }
+        None => ("", None),
+    };
     let source = match text {
         Some(text) if !text.trim().is_empty() => text,
         _ => "{}\n",
@@ -243,6 +252,7 @@ pub(super) fn edit_settings(
         );
         appended.extend([OVERRIDE_KEY, CAPI_ALIAS_KEY].map(str::to_owned));
     } else {
+        // `parse_object` has already checked that the property is an array.
         let ignored = object
             .array_value(IGNORED_SETTINGS_KEY)
             .ok_or(SettingsConflict::IgnoredNotArray)?;
@@ -275,10 +285,12 @@ pub(super) fn edit_settings(
             }
             SettingsState {
                 version: SETTINGS_STATE_VERSION,
-                created: previous.created,
+                // A file or list the user deleted and this apply recreated is
+                // the daemon's too.
+                created: previous.created || text.is_none(),
                 override_before: previous.override_before.clone(),
                 added_ignored: added,
-                ignored_created: previous.ignored_created,
+                ignored_created: previous.ignored_created || ignored_created_now,
             }
         }
         None => {
@@ -286,7 +298,10 @@ pub(super) fn edit_settings(
             // written by this daemon: it is not the user's value, our entries
             // next to it are ours too, and an ignore list holding nothing but
             // them was created by it.
-            let ours = existing_value.as_ref().and_then(Value::as_str) == Some(url);
+            let ours = existing_value
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == url || is_daemon_capi_url(value));
             let added_ignored = if ours {
                 [OVERRIDE_KEY, CAPI_ALIAS_KEY].map(str::to_owned).to_vec()
             } else {
@@ -301,8 +316,36 @@ pub(super) fn edit_settings(
             }
         }
     };
-    let edited = root.to_string();
+    let edited = format!("{bom}{root}");
     Ok((edited, new_state))
+}
+
+fn split_bom(text: &str) -> (&str, &str) {
+    match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
+    }
+}
+
+/// Whether an override value points at an agentdesktop loopback CAPI route
+/// (`http://<loopback>:<port>/vscode-copilot-capi/<pairing>`): the daemon's
+/// own URL, or one an earlier listen address or pairing left behind. Such a
+/// value is never the user's own setting.
+fn is_daemon_capi_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return false;
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let loopback = authority
+        .parse::<SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback())
+        || authority
+            .rsplit_once(':')
+            .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"));
+    loopback
+        && path
+            .strip_prefix(crate::llm_proxy::CAPI_ROUTE)
+            .is_some_and(|tail| tail.starts_with('/') && tail.len() > 1)
 }
 
 /// In-place removal of the managed keys. With a sidecar: the override is
@@ -317,6 +360,8 @@ pub(super) fn remove_settings(
     state: Option<&SettingsState>,
     own_url: Option<&str>,
 ) -> Result<Removal, SettingsConflict> {
+    let original = text;
+    let (bom, text) = split_bom(text);
     if text.trim().is_empty() {
         return Ok(match state {
             Some(state) if state.created => Removal::Delete,
@@ -326,12 +371,19 @@ pub(super) fn remove_settings(
     let (root, object) = match parse_object(text) {
         Ok(parsed) => parsed,
         Err(conflict) if state.is_some() => return Err(conflict),
-        Err(_) => return Ok(Removal::Unchanged),
+        Err(_) => {
+            debug!(
+                "VS Code settings file is not VS Code JSONC; leaving it alone (no sidecar, nothing known to remove)"
+            );
+            return Ok(Removal::Unchanged);
+        }
     };
 
+    // What the override goes back to (`None`: removed), which entries come
+    // out of the ignore list, and whether an emptied list goes too.
     let (restore, entries, drop_empty_array) = match state {
         Some(state) => (
-            Some(state.override_before.clone()),
+            state.override_before.clone(),
             state.added_ignored.clone(),
             state.ignored_created,
         ),
@@ -340,22 +392,23 @@ pub(super) fn remove_settings(
                 .get(OVERRIDE_KEY)
                 .and_then(|property| property.value())
                 .and_then(|value| value.to_serde_value());
-            let Some(own_url) =
-                own_url.filter(|url| current.as_ref().and_then(Value::as_str) == Some(*url))
-            else {
+            let ours = current
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|value| own_url == Some(value) || is_daemon_capi_url(value));
+            if !ours {
                 return Ok(Removal::Unchanged);
-            };
-            let _ = own_url;
+            }
             (
-                Some(None),
+                None,
                 [OVERRIDE_KEY, CAPI_ALIAS_KEY].map(str::to_owned).to_vec(),
                 true,
             )
         }
     };
 
-    if let Some(before) = restore {
-        match (object.get(OVERRIDE_KEY), before) {
+    {
+        match (object.get(OVERRIDE_KEY), restore) {
             (Some(property), Some(value)) => property.set_value(input_value(&value)),
             (Some(property), None) => property.remove(),
             (None, Some(value)) => {
@@ -378,7 +431,7 @@ pub(super) fn remove_settings(
         }
     }
 
-    let remaining = root.to_string();
+    let remaining = format!("{bom}{root}");
     if state.is_some_and(|state| state.created)
         && remaining
             .chars()
@@ -388,7 +441,7 @@ pub(super) fn remove_settings(
     {
         return Ok(Removal::Delete);
     }
-    Ok(if remaining == text {
+    Ok(if remaining == original {
         Removal::Unchanged
     } else {
         Removal::Write(remaining)
@@ -488,6 +541,14 @@ pub(super) fn plan(
         Some(text) if text == edited && !looser => "unchanged",
         Some(_) => "update",
     };
+    // The sidecar is written first: if the apply stops between the two
+    // writes, the record of the user's own value already exists.
+    let mut state_bytes = serde_json::to_vec_pretty(&new_state)
+        .with_context(|| format!("serialize {} {DESCRIPTION} state", VsCode::DISPLAY_NAME))?;
+    state_bytes.push(b'\n');
+    if sidecar.as_deref() != Some(state_bytes.as_slice()) {
+        plan.write_file(&state_path, &state_bytes, FILE_MODE)?;
+    }
     if action == "unchanged" {
         plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, action, path);
     } else {
@@ -497,12 +558,6 @@ pub(super) fn plan(
         plan.write_file(path, edited.as_bytes(), FILE_MODE)?;
     }
 
-    let mut state_bytes = serde_json::to_vec_pretty(&new_state)
-        .with_context(|| format!("serialize {} {DESCRIPTION} state", VsCode::DISPLAY_NAME))?;
-    state_bytes.push(b'\n');
-    if sidecar.as_deref() != Some(state_bytes.as_slice()) {
-        plan.write_file(&state_path, &state_bytes, 0o600)?;
-    }
     debug!(provider = VsCode::DISPLAY_NAME, action, path = %path.display(), "planned VS Code settings edit");
     Ok(())
 }
@@ -533,7 +588,9 @@ fn remove(
             Err(_) => Ok(Removal::Unchanged),
         };
         match removal {
-            Ok(Removal::Unchanged) => {}
+            Ok(Removal::Unchanged) => {
+                plan.record(VsCode::DISPLAY_NAME, DESCRIPTION, "unchanged", path);
+            }
             Ok(Removal::Write(text)) => {
                 plan.record_diff(
                     VsCode::DISPLAY_NAME,

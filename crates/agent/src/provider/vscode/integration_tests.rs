@@ -378,7 +378,19 @@ async fn managed_settings_github_models_lifecycle() -> anyhow::Result<()> {
 
 /// Parses VS Code's JSONC (comments, trailing commas) into a value.
 fn jsonc(text: &str) -> anyhow::Result<serde_json::Value> {
-    let root = jsonc_parser::cst::CstRootNode::parse(text, &Default::default())?;
+    let options = jsonc_parser::ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_non_finite_numbers: false,
+        allow_extended_string_escapes: false,
+    };
+    let root = jsonc_parser::cst::CstRootNode::parse(text, &options)?;
     root.value()
         .and_then(|value| value.to_serde_value())
         .context("settings.json holds no JSON value")
