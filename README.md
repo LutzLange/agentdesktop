@@ -447,7 +447,7 @@ display keeps working.
 
 The file lives in the VS Code user profile directory next to
 `chatLanguageModels.json` (Linux `~/.config/Code/User/settings.json`); the
-local startup setting `daemon.vscode.settings` overrides it. The daemon merges
+local startup setting `daemon.vscode.settings` overrides it. The daemon adds
 its two keys and keeps every other setting; user entries in
 `settingsSync.ignoredSettings` are kept, ours are added by value. A user's own
 `overrideCapiUrl` is overwritten while the program is active and restored on
@@ -458,16 +458,29 @@ carries the pairing) and removal keeps the mode it finds; the sidecar is
 `.settings.json.agentdesktop`. VS Code itself saves the file with its own
 default mode (664 with a new inode when a setting is changed in the UI), so the
 URL is readable to the group and others until the daemon's next apply
-tightens it again (a config push or a daemon restart). The override key is the
-daemon's while the program is active: a hand edit of the URL is replaced on
-the next apply and is not kept as the user's value on removal (only a value
-the key had before the first apply comes back). The first apply rewrites the file as plain JSON
-with sorted keys and two-space indentation. The file must stay plain JSON: a
-`settings.json` with comments or trailing commas (the most likely conflict on
-a developer's machine, since VS Code accepts both) is a conflict, not
-rewritten without them, and a conflict blocks every managed file on the device
-until it is resolved (and stops the daemon at startup); the fix is to remove
-the comments and trailing commas and re-apply. Removal (program
+tightens it again (a config push or a daemon restart); an unchanged file
+looser than 0600 is tightened on the next apply without being rewritten
+otherwise. The override key is the daemon's while the program is active: a
+hand edit of the URL is replaced on the next apply and is not kept as the
+user's value on removal (only a value the key had before the first apply
+comes back).
+
+The daemon edits the file in place: the override and the two ignore entries
+are the only text it changes (new properties go at the top of the object),
+and comments, trailing commas, key order, indentation, line endings and a
+leading byte-order mark stay as they are; removal takes out exactly what the apply added, so a file the
+daemon only added keys to returns to its earlier content. One exception: a
+file written on a single line (`{ "a": 1 }`) is expanded to one property per
+line when keys are added and stays expanded after removal; VS Code itself
+always writes one property per line. The sidecar holds no
+copy of the file, only the override's earlier value and which ignore entries
+the daemon added. A conflict (the file is not valid VS Code JSONC, meaning
+anything beyond comments and trailing commas such as a missing comma or a
+single-quoted string; the top level is not an object;
+`settingsSync.ignoredSettings` is not an array; or a managed key appears twice)
+leaves the file untouched and blocks every managed file on the device until it
+is resolved (and stops the daemon at startup); fix the file in VS Code and
+re-apply. Removal (program
 absent, `ownModels`, `useLlmGateway: false`, no gateway, no `proxyUrl`, or no
 proxy, with a warning) takes the key and the two entries out and deletes the
 file only if the daemon created it. Restart VS Code after an apply that changes
