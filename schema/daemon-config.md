@@ -14,6 +14,8 @@
 |`daemon.claudeDesktop.credentialHelper`|string|Credential helper path.|
 |`daemon.codex`|object|Codex paths.|
 |`daemon.codex.config`|string|Configuration file.|
+|`daemon.copilot`|object|GitHub Copilot CLI paths (`config` = the `providers.json` to manage;<br>defaults to `COPILOT_PROVIDERS_CONFIG`, `$COPILOT_HOME/providers.json`,<br>then `~/.copilot/providers.json`).|
+|`daemon.copilot.config`|string|Configuration file.|
 |`daemon.grok`|object|Grok Build paths.|
 |`daemon.grok.config`|string|Configuration file.|
 |`daemon.llmProxy`|object|Local loopback LLM proxy.|
@@ -26,6 +28,9 @@
 |`daemon.socket`|string|Local API Unix socket or Windows named pipe.|
 |`daemon.stateDir`|string|Persistent daemon state directory.|
 |`daemon.user`|boolean|Manage the current user’s tool settings instead of system settings.|
+|`daemon.vscode`|object|VS Code paths (`config` = the `chatLanguageModels.json` to manage under<br>the `ownModels` variant of `copilotChat`, `settings` = the user<br>`settings.json` to manage under the `githubModels` variant; each<br>defaults to its file inside the per-OS VS Code user profile<br>directory).|
+|`daemon.vscode.config`|string|`chatLanguageModels.json` to manage (the `ownModels` variant of<br>`copilotChat`). Defaults to that file inside the per-OS VS Code user<br>profile directory.|
+|`daemon.vscode.settings`|string|The user `settings.json` to manage (the `githubModels` variant of<br>`copilotChat`). Defaults to that file inside the per-OS VS Code user<br>profile directory.|
 |`inventoryInterval`|string|Interval between inventory refreshes. Defaults to `15m`, and must be<br>greater than zero.<br><br>Discovery walks user home directories and developer-tool configuration<br>files, so this trades inventory freshness against local disk activity.|
 |`llmGateway`|object|LLM gateway used by managed developer tools.|
 |`llmGateway.authentication`|object|Authentication mechanism used when connecting to this gateway.|
@@ -53,6 +58,11 @@
 |`programs.codex`|object|Codex managed configuration.|
 |`programs.codex.managedConfig`|object|Arbitrary values written to Codex's organization-managed TOML configuration.<br><br>Use Codex's native snake_case configuration keys. TOML has no null value,<br>so null values cannot be reconciled.|
 |`programs.codex.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
+|`programs.copilot`|object|GitHub Copilot CLI managed configuration.|
+|`programs.copilot.models`|object|Copilot CLI model entries, keyed by the model ID the CLI shows<br>(`copilot --model agentdesktop/<id>`).<br><br>At least one is required when a top-level `llmGateway` is configured.|
+|`programs.copilot.models.*.modelId`|string|The CLI's `modelId` for the entry. Defaults to the entry's ID. The<br>name sent to the gateway is `wireModel` when that pass-through key is<br>set, else this one.|
+|`programs.copilot.models.*.provider`|enum|Which managed provider entry serves the model.<br>Possible values: `agentdesktop`, `agentdesktop-anthropic`.|
+|`programs.copilot.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
 |`programs.grok`|object|Grok Build managed configuration.|
 |`programs.grok.managedConfig`|object|Arbitrary values written to Grok's organization-managed TOML configuration.<br><br>Use Grok's native snake_case configuration keys. TOML has no null value,<br>so null values cannot be reconciled.|
 |`programs.grok.model`|string|Catalog ID and API model used when pointing Grok at the LLM gateway.<br><br>This is required when a top-level `llmGateway` is configured. If `models`<br>is empty, agentdesktop creates a catalog entry with this ID.|
@@ -63,6 +73,15 @@
 |`programs.openCode.model`|string|Model ID selected from `models` when using the LLM gateway.<br><br>This is required when a top-level `llmGateway` is configured.|
 |`programs.openCode.models`|object|Models exposed by the managed LLM gateway provider, keyed by model ID.<br><br>Each value is an arbitrary OpenCode model configuration object. At least<br>one model is required when a top-level `llmGateway` is configured.|
 |`programs.openCode.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
+|`programs.vscode`|object|VS Code Copilot Chat managed configuration (own models through the<br>loopback proxy, or GitHub's models through the gateway).|
+|`programs.vscode.copilotChat`|enum|Which Copilot Chat model source VS Code is pointed at: agentdesktop's<br>own custom models (`ownModels`), or GitHub's own models reached<br>through the gateway (`githubModels`).<br>Possible values: `ownModels`, `githubModels`.|
+|`programs.vscode.models`|object|Custom model entries exposed to VS Code's Copilot Chat model picker,<br>keyed by the model ID VS Code sends as `model`. Only meaningful under<br>`copilotChat: ownModels`; `githubModels` rejects a non-empty map.<br><br>At least one is required when a top-level `llmGateway` is configured<br>and `copilotChat` is `ownModels`.|
+|`programs.vscode.models.*.maxInputTokens`|integer|Maximum input tokens accepted by the model.|
+|`programs.vscode.models.*.maxOutputTokens`|integer|Maximum output tokens produced by the model.|
+|`programs.vscode.models.*.name`|string|Display name shown in VS Code's model picker. Defaults to<br>`"<id> (agentdesktop)"`.|
+|`programs.vscode.models.*.toolCalling`|boolean|Whether the model supports tool calling.|
+|`programs.vscode.models.*.vision`|boolean|Whether the model supports image input.|
+|`programs.vscode.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
 |`sandbox`|object|Local execution sandbox required for managed developer tools.|
 |`sandbox.filesystem`|object|Filesystem access available to sandboxed commands.|
 |`sandbox.filesystem.denied`|[]string|Paths sandboxed commands may neither read nor modify.|
