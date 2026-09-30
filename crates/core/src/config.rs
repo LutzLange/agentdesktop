@@ -577,7 +577,8 @@ pub struct ProgramsConfig {
     /// GitHub Copilot CLI managed configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copilot: Option<CopilotConfig>,
-    /// VS Code (Copilot Chat, own models) managed configuration.
+    /// VS Code Copilot Chat managed configuration (own models through the
+    /// loopback proxy, or GitHub's models through the gateway).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vscode: Option<VsCodeConfig>,
 }
@@ -1366,8 +1367,9 @@ fn validate_daemon(
                 }
             }
             VsCodeCopilotChat::GithubModels => {
-                let gateway_used = vscode.use_llm_gateway && llm_gateway.is_some();
-                if gateway_used && llm_gateway.is_some_and(|gateway| gateway.proxy_url.is_none()) {
+                if vscode.use_llm_gateway
+                    && llm_gateway.is_some_and(|gateway| gateway.proxy_url.is_none())
+                {
                     anyhow::bail!(
                         "VS Code copilotChat githubModels requires llmGateway.proxyUrl when the gateway is used"
                     );

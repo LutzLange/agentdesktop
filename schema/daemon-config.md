@@ -73,7 +73,7 @@
 |`programs.openCode.model`|string|Model ID selected from `models` when using the LLM gateway.<br><br>This is required when a top-level `llmGateway` is configured.|
 |`programs.openCode.models`|object|Models exposed by the managed LLM gateway provider, keyed by model ID.<br><br>Each value is an arbitrary OpenCode model configuration object. At least<br>one model is required when a top-level `llmGateway` is configured.|
 |`programs.openCode.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
-|`programs.vscode`|object|VS Code (Copilot Chat, own models) managed configuration.|
+|`programs.vscode`|object|VS Code Copilot Chat managed configuration (own models through the<br>loopback proxy, or GitHub's models through the gateway).|
 |`programs.vscode.copilotChat`|enum|Which Copilot Chat model source VS Code is pointed at: agentdesktop's<br>own custom models (`ownModels`), or GitHub's own models reached<br>through the gateway (`githubModels`).<br>Possible values: `ownModels`, `githubModels`.|
 |`programs.vscode.models`|object|Custom model entries exposed to VS Code's Copilot Chat model picker,<br>keyed by the model ID VS Code sends as `model`. Only meaningful under<br>`copilotChat: ownModels`; `githubModels` rejects a non-empty map.<br><br>At least one is required when a top-level `llmGateway` is configured<br>and `copilotChat` is `ownModels`.|
 |`programs.vscode.models.*.maxInputTokens`|integer|Maximum input tokens accepted by the model.|

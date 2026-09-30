@@ -437,9 +437,10 @@ check, `GET /_ping` every few seconds, carries no credential and is forwarded
 without `x-llm-token`. Auto and agent mode open a WebSocket (`GET /responses`)
 that the proxy tunnels: the gateway identity is checked once, at the upgrade,
 and the tunnel stays open until either side closes it or the gateway
-credential it was opened with expires (a re-enrollment or logout does not cut
-an open conversation). Quota headers from GitHub pass through, so VS Code's
-usage display keeps working.
+credential it was opened with expires (its own expiry, typically the
+controller JWT's; a re-enrollment or logout does not cut an open
+conversation). Quota headers from GitHub pass through, so VS Code's usage
+display keeps working.
 
 The file lives in the VS Code user profile directory next to
 `chatLanguageModels.json` (Linux `~/.config/Code/User/settings.json`); the
@@ -447,12 +448,17 @@ local startup setting `daemon.vscode.settings` overrides it. The daemon merges
 its two keys and keeps every other setting; user entries in
 `settingsSync.ignoredSettings` are kept, ours are added by value. A user's own
 `overrideCapiUrl` is overwritten while the program is active and restored on
-removal. The file is written owner-only (an existing world-readable file is
-tightened, since the URL carries the pairing) and removal keeps the mode it
-finds; the sidecar is `.settings.json.agentdesktop`. The file must stay plain
-JSON: a `settings.json` with comments or trailing commas is a conflict, not
+removal; `github.copilot.internal.capiUrl` is the newer alias of the same
+setting and is only added to the ignore list, not written. The file is written
+owner-only (an existing world-readable file is tightened, since the URL
+carries the pairing) and removal keeps the mode it finds; the sidecar is
+`.settings.json.agentdesktop`. The first apply rewrites the file as plain JSON
+with sorted keys and two-space indentation. The file must stay plain JSON: a
+`settings.json` with comments or trailing commas (the most likely conflict on
+a developer's machine, since VS Code accepts both) is a conflict, not
 rewritten without them, and a conflict blocks every managed file on the device
-until it is resolved (and stops the daemon at startup). Removal (program
+until it is resolved (and stops the daemon at startup); the fix is to remove
+the comments and trailing commas and re-apply. Removal (program
 absent, `ownModels`, `useLlmGateway: false`, no gateway, no `proxyUrl`, or no
 proxy, with a warning) takes the key and the two entries out and deletes the
 file only if the daemon created it. Restart VS Code after an apply that changes
@@ -463,22 +469,29 @@ refuses the program.
 Caveats. `github.copilot.advanced.debug.overrideCapiUrl` is an undocumented
 setting of the Copilot Chat extension; if a VS Code release drops it, the
 fallback is VS Code's HTTP proxy setting with the gateway as the proxy, which
-this program does not manage. The override stays in `settings.json` if the
-daemon is removed without first removing the program (or switching to
-`ownModels`): Copilot Chat then fails until the key is deleted by hand. Because
-the setting is per user profile, the program suits devices with one VS Code
-user; on a shared device every user needs their own user-mode daemon. Which of
-GitHub's models the picker offers is decided by the organisation's Copilot
-policy, not by the daemon.
+this program does not manage. While the daemon is not running, the override
+stays in `settings.json` and VS Code keeps sending its requests to the
+loopback port: they fail, and they carry the user's Copilot session token
+(`tid=`), the GitHub OAuth token (`gho_`, on `/agents/*`) and the pairing
+value, so another local user who binds that port in the meantime receives
+them. Use the program on devices with a single VS Code user, stop VS Code (or
+switch the program to `ownModels` and let the daemon apply it) before stopping
+or removing the daemon, and delete the key by hand if the daemon is removed
+with the override in place: Copilot Chat fails until then. Which of GitHub's
+models the picker offers is decided by the organisation's Copilot policy, not
+by the daemon.
 
-Upgrade note: `copilotChat: githubModels`, `llmGateway.proxyUrl` on this program
-and `daemon.vscode.settings` are new. Upgrade the controller first, then the
-daemons, then push the value; an older controller rejects the value.
+Upgrade note: `copilotChat: githubModels` (which requires the existing
+`llmGateway.proxyUrl`) and `daemon.vscode.settings` are new. Upgrade the
+controller first, then the daemons, then push the value; an older controller
+rejects the value.
 
-A gateway route for `proxyUrl` (Solo Enterprise for AgentGateway standalone,
-Business host; Enterprise Cloud tenants use `api.enterprise.githubcopilot.com`):
-the route validates the controller JWT, restores the client's token as the
-bearer for GitHub and forwards. Its `requestTimeout` bounds request/response
+A gateway route for `proxyUrl` (Solo Enterprise for AgentGateway standalone),
+verified with Business seats against `api.business.githubcopilot.com`; other
+plans use another host, which a signed-in VS Code shows in its Copilot Chat log
+(the `_ping` requests), so take it from there before writing the route. The
+route validates the controller JWT, restores the client's token as the bearer
+for GitHub and forwards. Its `requestTimeout` bounds request/response
 exchanges; an established WebSocket tunnel is not cut by it.
 
 ```yaml
@@ -494,7 +507,7 @@ routes:
       issuer: agentdesktop-controller
       audiences: [agentgateway]
       jwks:
-        url: http://<controller>/.well-known/jwks.json
+        url: https://<controller>/.well-known/jwks.json
     urlRewrite:
       authority:
         full: api.business.githubcopilot.com

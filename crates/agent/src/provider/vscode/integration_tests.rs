@@ -330,6 +330,9 @@ async fn managed_settings_github_models_lifecycle() -> anyhow::Result<()> {
         info!("Checking that a request with the URL's pairing segment reaches the gateway with the client token moved");
         let url = format!("{override_url}/v1/messages");
         let status = container.exec_as("tester", &["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-H", "authorization: Bearer tid=x", "-H", "content-type: application/json", "-X", "POST", &url, "-d", "{\"model\":\"gpt-4.1\"}"], Duration::from_secs(15)).await?;
+        // The stub rejects any token but its own with 401, which the proxy
+        // passes through (a client token was forwarded, so no retry).
+        ensure!(status.trim() == "401", "expected the stub's 401 passed through, got {status}");
         let requests = gateway.requests();
         let upstream = requests.iter().find(|request| request["path"] == "/v1/messages").with_context(|| format!("no request reached the gateway (client saw {status}): {requests:?}"))?;
         ensure!(upstream["authorization"].is_null(), "the client's Authorization must not reach the gateway as is: {upstream}");

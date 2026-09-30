@@ -151,6 +151,10 @@ fn plan_remove_orphaned(path: &Path, own_url: &str, plan: &ReconcilePlan) -> any
         }
     };
     let Ok(Value::Object(mut current)) = serde_json::from_slice::<Value>(&existing) else {
+        tracing::debug!(
+            path = %path.display(),
+            "VS Code settings file is not a plain JSON object; leaving it alone (no sidecar, nothing known to remove)"
+        );
         return Ok(());
     };
     if current.get(OVERRIDE_KEY).and_then(Value::as_str) != Some(own_url) {

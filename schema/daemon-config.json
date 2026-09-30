@@ -633,7 +633,7 @@
           ]
         },
         "vscode": {
-          "description": "VS Code (Copilot Chat, own models) managed configuration.",
+          "description": "VS Code Copilot Chat managed configuration (own models through the\nloopback proxy, or GitHub's models through the gateway).",
           "anyOf": [
             {
               "$ref": "#/$defs/VsCodeConfig"

@@ -72,6 +72,29 @@ struct CachedCredential {
     /// suspend, the wall clock can jump; neither alone is trusted.
     valid_until: std::time::Instant,
     valid_until_unix: u64,
+    /// The credential's own expiry (the controller JWT `exp`), on both clocks:
+    /// a tunnel opened with the credential runs until then, not until the
+    /// cache stops reusing it.
+    expires: std::time::Instant,
+    expires_unix: u64,
+}
+
+/// A point in time on both clocks (see `CachedCredential`): a tunnel closes
+/// when either says the credential has expired.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    monotonic: std::time::Instant,
+    unix: u64,
+}
+
+impl Deadline {
+    fn from_unix(expires_unix: u64) -> Self {
+        Self {
+            monotonic: std::time::Instant::now()
+                + Duration::from_secs(expires_unix.saturating_sub(now_unix())),
+            unix: expires_unix,
+        }
+    }
 }
 
 fn now_unix() -> u64 {
@@ -83,24 +106,16 @@ fn now_unix() -> u64 {
 
 impl CredentialCache {
     /// A cached credential for the key and device, if one is still valid.
+    #[cfg(test)]
     fn get(&self, key: &str, device_id: &str) -> Option<String> {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries
-            .get(key)
-            .filter(|entry| {
-                entry.device_id == device_id
-                    && std::time::Instant::now() < entry.valid_until
-                    && now_unix() < entry.valid_until_unix
-            })
-            .map(|entry| entry.credential.clone())
+        self.lookup(key, device_id)
+            .map(|(credential, _)| credential)
     }
 
-    /// The monotonic deadline of a cached credential, if one is still valid.
-    /// A tunnel opened with the credential closes at this deadline.
-    fn deadline(&self, key: &str, device_id: &str) -> Option<std::time::Instant> {
+    /// A cached credential together with its own expiry, read in one go so a
+    /// tunnel opened with it always gets the deadline of the credential it
+    /// was actually opened with.
+    fn lookup(&self, key: &str, device_id: &str) -> Option<(String, Deadline)> {
         let entries = self
             .entries
             .lock()
@@ -112,7 +127,15 @@ impl CredentialCache {
                     && std::time::Instant::now() < entry.valid_until
                     && now_unix() < entry.valid_until_unix
             })
-            .map(|entry| entry.valid_until)
+            .map(|entry| {
+                (
+                    entry.credential.clone(),
+                    Deadline {
+                        monotonic: entry.expires,
+                        unix: entry.expires_unix,
+                    },
+                )
+            })
     }
 
     /// Remember a freshly fetched credential until the earlier of its expiry
@@ -140,6 +163,8 @@ impl CredentialCache {
                     device_id: device_id.to_owned(),
                     valid_until: std::time::Instant::now() + lifetime,
                     valid_until_unix: now + lifetime.as_secs(),
+                    expires: std::time::Instant::now() + remaining,
+                    expires_unix: fetched.expires_at_unix_seconds,
                 },
             );
         } else {
@@ -202,6 +227,13 @@ pub(crate) struct ProxyRoute {
     pub client_id: &'static str,
     pub credential: RouteCredential,
     pub upstream: Upstream,
+    /// The pairing is the first path segment after the prefix (the header is
+    /// ignored): for a client that cannot add a header to its requests.
+    pub pairing_in_path: bool,
+    /// WebSocket upgrades are tunnelled instead of refused.
+    pub tunnels_upgrades: bool,
+    /// A credential-less `GET /_ping` is forwarded without `x-llm-token`.
+    pub credential_less_ping: bool,
 }
 
 /// VS Code Copilot Chat's CAPI pass-through route (the target of
@@ -220,24 +252,36 @@ pub(crate) const ROUTES: &[ProxyRoute] = &[
         client_id: "vscode-copilot",
         credential: RouteCredential::Passthrough,
         upstream: Upstream::ProxyUrl,
+        pairing_in_path: false,
+        tunnels_upgrades: false,
+        credential_less_ping: false,
     },
     ProxyRoute {
         prefix: CAPI_ROUTE,
         client_id: "vscode-copilot",
         credential: RouteCredential::Passthrough,
         upstream: Upstream::ProxyUrl,
+        pairing_in_path: true,
+        tunnels_upgrades: true,
+        credential_less_ping: true,
     },
     ProxyRoute {
         prefix: "/vscode-copilot",
         client_id: "vscode-copilot",
         credential: RouteCredential::Gateway,
         upstream: Upstream::Url,
+        pairing_in_path: false,
+        tunnels_upgrades: false,
+        credential_less_ping: false,
     },
     ProxyRoute {
         prefix: "/copilot-cli",
         client_id: "copilot-cli",
         credential: RouteCredential::Gateway,
         upstream: Upstream::Url,
+        pairing_in_path: false,
+        tunnels_upgrades: false,
+        credential_less_ping: false,
     },
 ];
 
@@ -286,7 +330,7 @@ type PendingTunnel =
 async fn run_tunnel(
     inbound: hyper::upgrade::OnUpgrade,
     outbound: hyper::upgrade::OnUpgrade,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<Deadline>,
 ) {
     let (inbound, outbound) = match tokio::try_join!(inbound, outbound) {
         Ok(streams) => streams,
@@ -299,9 +343,18 @@ async fn run_tunnel(
     let mut outbound = TokioIo::new(outbound);
     let relay = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
     let expiry = async move {
-        match deadline {
-            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
-            None => std::future::pending().await,
+        let Some(deadline) = deadline else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        // The monotonic clock does not advance across a suspend, so the wall
+        // clock is checked as well, at most every 10 s.
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline.monotonic || now_unix() >= deadline.unix {
+                return;
+            }
+            tokio::time::sleep((deadline.monotonic - now).min(Duration::from_secs(10))).await;
         }
     };
     tokio::select! {
@@ -729,8 +782,9 @@ async fn forward(
     // nothing about this device and costs it no work.
     let pairing_ok =
         |offered: &str| constant_time_eq(offered.as_bytes(), config.pairing.as_bytes());
+    let matched_route = match_route(path).map(|(route, _)| route);
     let capi_rest = match match_route(path) {
-        Some((route, rest)) if route.prefix == CAPI_ROUTE => {
+        Some((route, rest)) if route.pairing_in_path => {
             let Some((segment, remainder)) = split_path_pairing(rest) else {
                 return Err(ProxyError::pairing_invalid());
             };
@@ -751,7 +805,7 @@ async fn forward(
         }
     };
     let websocket = is_websocket_upgrade(request.headers());
-    if websocket && capi_rest.is_none() {
+    if websocket && !matched_route.is_some_and(|route| route.tunnels_upgrades) {
         return Err(ProxyError::new(
             StatusCode::BAD_REQUEST,
             "upgrade_not_supported",
@@ -851,7 +905,8 @@ async fn forward(
         .filter(|value| !constant_time_eq(value.as_bytes(), config.pairing.as_bytes()));
     // GitHub's health ping carries no credential and needs none: on the CAPI
     // route a GET without one is forwarded as is instead of being refused.
-    let credential_less_ping = capi_rest.as_deref() == Some("/_ping")
+    let credential_less_ping = matched_route.is_some_and(|route| route.credential_less_ping)
+        && capi_rest.as_deref() == Some("/_ping")
         && request.method() == Method::GET
         && client_credential.is_none();
     // The inbound upgrade handle is taken before the body is consumed.
@@ -1015,13 +1070,17 @@ async fn forward(
         // has not rejected it, so a bad token is never handed to later requests.
         let mut fetched_now: Option<agentdesktop_core::model::LlmGatewayCredential> = None;
         let mut attempt_credential: Option<String> = None;
+        // The expiry of a cached credential, read together with it: a later
+        // lookup could miss an entry that expired or was invalidated meanwhile.
+        let mut cached_deadline: Option<Deadline> = None;
         if authenticated {
             let cached = cache_key
                 .as_ref()
-                .and_then(|(key, device_id)| cache.get(key, device_id));
+                .and_then(|(key, device_id)| cache.lookup(key, device_id));
             let credential = match cached {
-                Some(credential) => {
+                Some((credential, deadline)) => {
                     from_cache = true;
+                    cached_deadline = Some(deadline);
                     credential
                 }
                 None => {
@@ -1121,21 +1180,27 @@ async fn forward(
         }
         let mut response = response;
         if websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS {
-            // The upstream accepted the upgrade. The 101 goes back with its
-            // Connection/Upgrade/Sec-WebSocket-* headers (they are the upgrade),
-            // and the tunnel between the two upgraded connections is handed to
-            // the connection task. It closes when either side closes or when
-            // the gateway credential it was opened with reaches its deadline.
-            let deadline = match (&cache_key, &fetched_now) {
-                (Some((key, device_id)), None) if from_cache => cache.deadline(key, device_id),
-                (_, Some(fetched)) => Some(
-                    std::time::Instant::now()
-                        + Duration::from_secs(
-                            fetched.expires_at_unix_seconds.saturating_sub(now_unix()),
-                        ),
-                ),
-                _ => None,
-            };
+            // The upstream accepted the upgrade. The 101 goes back with the
+            // hop headers stripped except the two that carry the upgrade
+            // (the Sec-WebSocket-* headers are end-to-end and stay), and the
+            // tunnel between the two upgraded connections is handed to the
+            // connection task. It closes when either side closes or when the
+            // gateway credential it was opened with expires (its own expiry,
+            // not the cache's reuse window). Without a gateway credential
+            // (no authentication configured) there is no deadline.
+            let deadline = cached_deadline.or_else(|| {
+                fetched_now
+                    .as_ref()
+                    .map(|fetched| Deadline::from_unix(fetched.expires_at_unix_seconds))
+            });
+            let upgrade_value = response.headers().get("upgrade").cloned();
+            strip_hop_headers(response.headers_mut());
+            response
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+            if let Some(value) = upgrade_value {
+                response.headers_mut().insert("upgrade", value);
+            }
             let outbound_upgrade = hyper::upgrade::on(&mut response);
             let inbound_upgrade = inbound_upgrade.ok_or_else(|| {
                 ProxyError::new(
@@ -3203,6 +3268,8 @@ mod tests {
                     device_id: "device-test".to_owned(),
                     valid_until: std::time::Instant::now() + Duration::from_millis(300),
                     valid_until_unix: now_unix() + 60,
+                    expires: std::time::Instant::now() + Duration::from_millis(300),
+                    expires_unix: now_unix() + 60,
                 },
             );
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

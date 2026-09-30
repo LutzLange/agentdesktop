@@ -679,3 +679,59 @@ fn config_rejects_reserved_and_secret_keys_in_any_case() {
     parse_programs("programs:\n  vscode:\n    models:\n      x:\n        apiKeyHint: y\n")
         .expect("a key that merely starts like a reserved one passes");
 }
+
+// Added with the implementation (not part of the spec-derived baseline).
+#[test]
+fn github_models_through_the_provider_removes_the_chat_models_entry_and_writes_settings() {
+    use super::VsCode;
+    use crate::provider::{Provider, ReconcileContext};
+    let dir = tempfile::tempdir().unwrap();
+    let chat_models = dir.path().join("chatLanguageModels.json");
+    let settings = dir.path().join("settings.json");
+    let pairing: std::sync::Arc<str> = "PAIRING-FIXTURE".into();
+    let context = ReconcileContext {
+        merge_user_settings: true,
+        credential_helper: dir.path().join("agentdesktop"),
+        socket: dir.path().join("agentdesktop.sock"),
+        llm_proxy: Some(crate::llm_proxy::LlmProxyContext {
+            address: "127.0.0.1:4000".parse().unwrap(),
+            pairing: pairing.clone(),
+        }),
+    };
+    let provider = VsCode {
+        chat_models_path: Some(chat_models.clone()),
+        settings_path: Some(settings.clone()),
+    };
+    // First `ownModels`: the custom-models entry exists.
+    let own = parse_programs(
+        "llmGateway:\n  url: https://gateway.example\n  proxyUrl: https://gateway.example/copilot-proxy\nprograms:\n  vscode:\n    models:\n      gpt-4.1-mini: {}\n",
+    )
+    .unwrap();
+    provider.plan(&context, &own).unwrap().apply().unwrap();
+    assert!(chat_models.exists());
+    assert!(!settings.exists());
+    // Then `githubModels`: the entry goes (the file was ours, so it is deleted)
+    // and the settings override arrives.
+    let github = parse_programs(
+        "llmGateway:\n  url: https://gateway.example\n  proxyUrl: https://gateway.example/copilot-proxy\nprograms:\n  vscode:\n    copilotChat: githubModels\n",
+    )
+    .unwrap();
+    provider.plan(&context, &github).unwrap().apply().unwrap();
+    assert!(
+        !chat_models.exists(),
+        "the daemon-created custom-models file is removed under githubModels"
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        written["github.copilot.advanced.debug.overrideCapiUrl"],
+        "http://127.0.0.1:4000/vscode-copilot-capi/PAIRING-FIXTURE"
+    );
+    // And back to `ownModels`: the override goes, the entry returns.
+    provider.plan(&context, &own).unwrap().apply().unwrap();
+    assert!(chat_models.exists());
+    assert!(
+        !settings.exists(),
+        "a settings file the daemon created and emptied is deleted"
+    );
+}
