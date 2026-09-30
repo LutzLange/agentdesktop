@@ -28,8 +28,9 @@
 |`daemon.socket`|string|Local API Unix socket or Windows named pipe.|
 |`daemon.stateDir`|string|Persistent daemon state directory.|
 |`daemon.user`|boolean|Manage the current user’s tool settings instead of system settings.|
-|`daemon.vscode`|object|VS Code paths (`config` = the `chatLanguageModels.json` to manage;<br>defaults to `chatLanguageModels.json` inside the per-OS VS Code user<br>profile directory).|
-|`daemon.vscode.config`|string|Configuration file.|
+|`daemon.vscode`|object|VS Code paths (`config` = the `chatLanguageModels.json` to manage under<br>the `ownModels` variant of `copilotChat`, `settings` = the user<br>`settings.json` to manage under the `githubModels` variant; each<br>defaults to its file inside the per-OS VS Code user profile<br>directory).|
+|`daemon.vscode.config`|string|`chatLanguageModels.json` to manage (the `ownModels` variant of<br>`copilotChat`). Defaults to that file inside the per-OS VS Code user<br>profile directory.|
+|`daemon.vscode.settings`|string|The user `settings.json` to manage (the `githubModels` variant of<br>`copilotChat`). Defaults to that file inside the per-OS VS Code user<br>profile directory.|
 |`inventoryInterval`|string|Interval between inventory refreshes. Defaults to `15m`, and must be<br>greater than zero.<br><br>Discovery walks user home directories and developer-tool configuration<br>files, so this trades inventory freshness against local disk activity.|
 |`llmGateway`|object|LLM gateway used by managed developer tools.|
 |`llmGateway.authentication`|object|Authentication mechanism used when connecting to this gateway.|
@@ -72,9 +73,9 @@
 |`programs.openCode.model`|string|Model ID selected from `models` when using the LLM gateway.<br><br>This is required when a top-level `llmGateway` is configured.|
 |`programs.openCode.models`|object|Models exposed by the managed LLM gateway provider, keyed by model ID.<br><br>Each value is an arbitrary OpenCode model configuration object. At least<br>one model is required when a top-level `llmGateway` is configured.|
 |`programs.openCode.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
-|`programs.vscode`|object|VS Code (Copilot Chat, own models) managed configuration.|
-|`programs.vscode.copilotChat`|enum|Which Copilot Chat model source VS Code is pointed at. Only<br>`ownModels` is available for now.<br>Possible values: `ownModels`.|
-|`programs.vscode.models`|object|Custom model entries exposed to VS Code's Copilot Chat model picker,<br>keyed by the model ID VS Code sends as `model`.<br><br>At least one is required when a top-level `llmGateway` is configured.|
+|`programs.vscode`|object|VS Code Copilot Chat managed configuration (own models through the<br>loopback proxy, or GitHub's models through the gateway).|
+|`programs.vscode.copilotChat`|enum|Which Copilot Chat model source VS Code is pointed at: agentdesktop's<br>own custom models (`ownModels`), or GitHub's own models reached<br>through the gateway (`githubModels`).<br>Possible values: `ownModels`, `githubModels`.|
+|`programs.vscode.models`|object|Custom model entries exposed to VS Code's Copilot Chat model picker,<br>keyed by the model ID VS Code sends as `model`. Only meaningful under<br>`copilotChat: ownModels`; `githubModels` rejects a non-empty map.<br><br>At least one is required when a top-level `llmGateway` is configured<br>and `copilotChat` is `ownModels`.|
 |`programs.vscode.models.*.maxInputTokens`|integer|Maximum input tokens accepted by the model.|
 |`programs.vscode.models.*.maxOutputTokens`|integer|Maximum output tokens produced by the model.|
 |`programs.vscode.models.*.name`|string|Display name shown in VS Code's model picker. Defaults to<br>`"<id> (agentdesktop)"`.|

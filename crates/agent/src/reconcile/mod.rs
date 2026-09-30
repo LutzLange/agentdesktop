@@ -27,7 +27,7 @@ pub use crate::provider::{
     copilot::default_copilot_providers_path,
     grok::default_grok_managed_config_path,
     opencode::{default_open_code_managed_config_path, default_open_code_plugin_path},
-    vscode::default_vscode_chat_models_path,
+    vscode::{default_vscode_chat_models_path, default_vscode_settings_path},
 };
 
 #[derive(Clone)]
@@ -49,6 +49,7 @@ impl Reconciler {
         grok_managed_config_path: PathBuf,
         copilot_providers_path: Option<PathBuf>,
         vscode_chat_models_path: Option<PathBuf>,
+        vscode_settings_path: Option<PathBuf>,
         credential_helper: PathBuf,
         socket: PathBuf,
     ) -> Self {
@@ -76,6 +77,7 @@ impl Reconciler {
                 }),
                 Box::new(VsCode {
                     chat_models_path: vscode_chat_models_path,
+                    settings_path: vscode_settings_path,
                 }),
                 Box::new(Cursor),
                 Box::new(Grok {
@@ -293,6 +295,7 @@ programs:
             root.join("grok/managed_config.toml"),
             Some(root.join("copilot/providers.json")),
             None,
+            None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
         );
@@ -332,6 +335,7 @@ programs:
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
             Some(root.join("copilot/providers.json")),
+            None,
             None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
@@ -373,6 +377,7 @@ programs:
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
             Some(providers.clone()),
+            None,
             None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
@@ -428,6 +433,7 @@ programs:
             root.join("grok/managed_config.toml"),
             Some(root.join("copilot/providers.json")),
             Some(chat_models.clone()),
+            Some(chat_models.with_file_name("settings.json")),
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
         )
@@ -477,6 +483,7 @@ programs:
             root.join("opencode/config.json"),
             root.join("opencode/plugin.js"),
             root.join("grok/managed_config.toml"),
+            None,
             None,
             None,
             root.join("bin/agentdesktop"),
@@ -539,6 +546,7 @@ programs:
             root.join("grok/managed_config.toml"),
             Some(root.join("copilot/providers.json")),
             None,
+            None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
         );
@@ -581,6 +589,7 @@ programs:
                 root.join("opencode/plugin.js"),
                 root.join("grok/managed_config.toml"),
                 Some(root.join("copilot/providers.json")),
+                None,
                 None,
                 root.join("bin/agentdesktop"),
                 root.join("agentdesktop.sock"),

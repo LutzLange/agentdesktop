@@ -48,6 +48,12 @@ pub(super) struct MergeOptions {
     /// Record actions without file content, for a file that holds secrets:
     /// the dry-run report then shows the action and the path only.
     pub(super) redact_diff: bool,
+    /// Top-level keys of the managed object that belong to the daemon once a
+    /// sidecar exists: a hand edit of their value after the merge is drift
+    /// (replaced on the next apply, dropped on removal), not a new value of the
+    /// user's to keep. The value the key had before the first merge stays the
+    /// user's and comes back on removal.
+    pub(super) owned_keys: &'static [&'static str],
 }
 
 impl Default for MergeOptions {
@@ -56,6 +62,25 @@ impl Default for MergeOptions {
             mode: 0o644,
             keyed_arrays: &[],
             redact_diff: false,
+            owned_keys: &[],
+        }
+    }
+}
+
+/// For each owned key, replaces whatever the file holds now with the value
+/// the key had before the first merge (or removes it when it had none).
+fn restore_owned_keys(target: &mut Value, before: &Value, owned_keys: &[&str]) {
+    let Some(object) = target.as_object_mut() else {
+        return;
+    };
+    for key in owned_keys {
+        match before.get(key) {
+            Some(original) => {
+                object.insert((*key).to_owned(), original.clone());
+            }
+            None => {
+                object.remove(*key);
+            }
         }
     }
 }
@@ -151,6 +176,7 @@ pub(super) fn plan_merge_with(
 
     if let Some(previous) = previous.as_ref() {
         combined = rollback_overlay(&combined, &previous.before, &previous.after);
+        restore_owned_keys(&mut combined, &previous.before, options.owned_keys);
     } else if legacy_owned {
         combined = empty_root();
     }
@@ -269,6 +295,7 @@ pub(super) fn plan_remove_with(
         }
     };
     let mut settings = rollback_overlay(&settings, &state.before, &state.after);
+    restore_owned_keys(&mut settings, &state.before, options.owned_keys);
     // Keyed elements the last merge added are removed by key, so an element
     // edited in place after the merge goes too.
     for keyed in options.keyed_arrays {
@@ -704,6 +731,7 @@ mod tests {
             mode: 0o600,
             keyed_arrays: ROOT_KEYED,
             redact_diff: true,
+            owned_keys: &[],
         }
     }
 

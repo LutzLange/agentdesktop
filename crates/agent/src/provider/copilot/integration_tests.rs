@@ -45,7 +45,7 @@ async fn user_mode_providers_lifecycle() -> anyhow::Result<()> {
                 });
                 if with_program {
                     document["programs"]["copilot"] =
-                        json!({ "models": [{ "id": "gpt-4.1", "wireModel": "gpt-4.1-mini" }] });
+                        json!({ "models": { "gpt-4.1": { "wireModel": "gpt-4.1-mini" } } });
                 }
                 serde_json::to_string_pretty(&document).unwrap()
             };

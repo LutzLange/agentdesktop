@@ -3,7 +3,7 @@ use std::{convert::Infallible, net::SocketAddr, path::Path, sync::Arc, time::Dur
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::{
     HeaderMap, Method, Request, Response, StatusCode, Uri,
     body::Incoming,
@@ -72,6 +72,29 @@ struct CachedCredential {
     /// suspend, the wall clock can jump; neither alone is trusted.
     valid_until: std::time::Instant,
     valid_until_unix: u64,
+    /// The credential's own expiry (the controller JWT `exp`), on both clocks:
+    /// a tunnel opened with the credential runs until then, not until the
+    /// cache stops reusing it.
+    expires: std::time::Instant,
+    expires_unix: u64,
+}
+
+/// A point in time on both clocks (see `CachedCredential`): a tunnel closes
+/// when either says the credential has expired.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    monotonic: std::time::Instant,
+    unix: u64,
+}
+
+impl Deadline {
+    fn from_unix(expires_unix: u64) -> Self {
+        Self {
+            monotonic: std::time::Instant::now()
+                + Duration::from_secs(expires_unix.saturating_sub(now_unix())),
+            unix: expires_unix,
+        }
+    }
 }
 
 fn now_unix() -> u64 {
@@ -83,7 +106,16 @@ fn now_unix() -> u64 {
 
 impl CredentialCache {
     /// A cached credential for the key and device, if one is still valid.
+    #[cfg(test)]
     fn get(&self, key: &str, device_id: &str) -> Option<String> {
+        self.lookup(key, device_id)
+            .map(|(credential, _)| credential)
+    }
+
+    /// A cached credential together with its own expiry, read in one go so a
+    /// tunnel opened with it always gets the deadline of the credential it
+    /// was actually opened with.
+    fn lookup(&self, key: &str, device_id: &str) -> Option<(String, Deadline)> {
         let entries = self
             .entries
             .lock()
@@ -95,7 +127,15 @@ impl CredentialCache {
                     && std::time::Instant::now() < entry.valid_until
                     && now_unix() < entry.valid_until_unix
             })
-            .map(|entry| entry.credential.clone())
+            .map(|entry| {
+                (
+                    entry.credential.clone(),
+                    Deadline {
+                        monotonic: entry.expires,
+                        unix: entry.expires_unix,
+                    },
+                )
+            })
     }
 
     /// Remember a freshly fetched credential until the earlier of its expiry
@@ -123,6 +163,8 @@ impl CredentialCache {
                     device_id: device_id.to_owned(),
                     valid_until: std::time::Instant::now() + lifetime,
                     valid_until_unix: now + lifetime.as_secs(),
+                    expires: std::time::Instant::now() + remaining,
+                    expires_unix: fetched.expires_at_unix_seconds,
                 },
             );
         } else {
@@ -185,7 +227,22 @@ pub(crate) struct ProxyRoute {
     pub client_id: &'static str,
     pub credential: RouteCredential,
     pub upstream: Upstream,
+    /// The pairing is the first path segment after the prefix (the header is
+    /// ignored): for a client that cannot add a header to its requests.
+    pub pairing_in_path: bool,
+    /// WebSocket upgrades are tunnelled instead of refused.
+    pub tunnels_upgrades: bool,
+    /// A credential-less `GET /_ping` is forwarded without `x-llm-token`.
+    pub credential_less_ping: bool,
 }
+
+/// VS Code Copilot Chat's CAPI pass-through route (the target of
+/// `github.copilot.advanced.debug.overrideCapiUrl`): the pairing travels as
+/// the first path segment after the prefix instead of in `PAIRING_HEADER`,
+/// because VS Code sends these requests itself and has no setting that adds a
+/// header to them. Also the only route a WebSocket upgrade is tunnelled on
+/// (the `GET /responses` Auto/agent conversation).
+pub(crate) const CAPI_ROUTE: &str = "/vscode-copilot-capi";
 
 /// Routes for the Copilot programs. A prefix matches only at a `/` boundary, so
 /// `/vscode-copilot-passthrough/...` never matches `/vscode-copilot`.
@@ -195,20 +252,122 @@ pub(crate) const ROUTES: &[ProxyRoute] = &[
         client_id: "vscode-copilot",
         credential: RouteCredential::Passthrough,
         upstream: Upstream::ProxyUrl,
+        pairing_in_path: false,
+        tunnels_upgrades: false,
+        credential_less_ping: false,
+    },
+    ProxyRoute {
+        prefix: CAPI_ROUTE,
+        client_id: "vscode-copilot",
+        credential: RouteCredential::Passthrough,
+        upstream: Upstream::ProxyUrl,
+        pairing_in_path: true,
+        tunnels_upgrades: true,
+        credential_less_ping: true,
     },
     ProxyRoute {
         prefix: "/vscode-copilot",
         client_id: "vscode-copilot",
         credential: RouteCredential::Gateway,
         upstream: Upstream::Url,
+        pairing_in_path: false,
+        tunnels_upgrades: false,
+        credential_less_ping: false,
     },
     ProxyRoute {
         prefix: "/copilot-cli",
         client_id: "copilot-cli",
         credential: RouteCredential::Gateway,
         upstream: Upstream::Url,
+        pairing_in_path: false,
+        tunnels_upgrades: false,
+        credential_less_ping: false,
     },
 ];
+
+/// Splits `rest` (the path remainder after `CAPI_ROUTE`'s prefix, always
+/// starting with `/`) into the first non-empty path segment (the pairing
+/// value, still percent-encoded as sent) and the remainder starting with `/`
+/// (or `/` itself when nothing follows), so the pairing segment never reaches
+/// `match_route`'s caller, the forwarded upstream path, logs, or plan
+/// reports. `None` when the first segment is missing or empty (bare prefix,
+/// `/`, or `//...`).
+///
+/// Called from `forward` for `CAPI_ROUTE` only, in place of the `PAIRING_HEADER`
+/// check; the segment is compared in constant time and stripped before the
+/// request is forwarded.
+pub(crate) fn split_path_pairing(rest: &str) -> Option<(&str, &str)> {
+    let without_slash = rest.strip_prefix('/')?;
+    let (segment, remainder) = match without_slash.find('/') {
+        Some(index) => (&without_slash[..index], &without_slash[index..]),
+        None => (without_slash, "/"),
+    };
+    (!segment.is_empty()).then_some((segment, remainder))
+}
+
+/// Whether the request asks for a WebSocket upgrade: `Connection` lists the
+/// `upgrade` token and `Upgrade` lists `websocket`, both case-insensitive.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let lists = |name: &str, token: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|item| item.trim().eq_ignore_ascii_case(token))
+    };
+    lists(CONNECTION.as_str(), "upgrade") && lists("upgrade", "websocket")
+}
+
+/// The tunnel an upgraded request leaves behind. The connection task awaits it
+/// after hyper hands the connection over, so every tunnel runs under the
+/// server's JoinSet and dropping the server closes it.
+type PendingTunnel =
+    Arc<std::sync::Mutex<Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>>>;
+
+/// Relay bytes between the two upgraded connections until one side closes or
+/// the gateway credential the tunnel was opened with reaches its deadline.
+async fn run_tunnel(
+    inbound: hyper::upgrade::OnUpgrade,
+    outbound: hyper::upgrade::OnUpgrade,
+    deadline: Option<Deadline>,
+) {
+    let (inbound, outbound) = match tokio::try_join!(inbound, outbound) {
+        Ok(streams) => streams,
+        Err(error) => {
+            tracing::debug!(%error, "LLM proxy upgrade did not complete");
+            return;
+        }
+    };
+    let mut inbound = TokioIo::new(inbound);
+    let mut outbound = TokioIo::new(outbound);
+    let relay = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+    let expiry = async move {
+        let Some(deadline) = deadline else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        // The monotonic clock does not advance across a suspend, so the wall
+        // clock is checked as well, at most every 10 s.
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline.monotonic || now_unix() >= deadline.unix {
+                return;
+            }
+            tokio::time::sleep((deadline.monotonic - now).min(Duration::from_secs(10))).await;
+        }
+    };
+    tokio::select! {
+        result = relay => {
+            if let Err(error) = result {
+                tracing::debug!(%error, "LLM proxy tunnel closed with an error");
+            }
+        }
+        () = expiry => {
+            tracing::info!("LLM proxy tunnel closed: the gateway credential it was opened with expired");
+        }
+    }
+}
 
 /// Runtime settings of the proxy listener.
 #[derive(Clone)]
@@ -345,13 +504,16 @@ pub(crate) async fn serve_with_cache(
                 let config = config.clone();
                 let cache = cache.clone();
                 connections.spawn(async move {
+                    let pending: PendingTunnel = Arc::default();
+                    let slot = pending.clone();
                     let service = service_fn(move |request| {
                         let client = client.clone();
                         let state = state.clone();
                         let config = config.clone();
                         let cache = cache.clone();
+                        let slot = slot.clone();
                         async move {
-                            let response = match forward(request, &client, &state, &config, &cache).await {
+                            let response = match forward(request, &client, &state, &config, &cache, &slot).await {
                                 Ok(response) => response,
                                 Err(error) => {
                                     tracing::warn!(status = %error.status, code = error.code, message = %error.message, "LLM proxy request failed");
@@ -362,9 +524,20 @@ pub(crate) async fn serve_with_cache(
                         }
                     });
                     if let Err(error) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service).await
+                        .serve_connection(TokioIo::new(stream), service)
+                        .with_upgrades()
+                        .await
                     {
                         tracing::debug!(%error, "LLM proxy connection closed");
+                    }
+                    // An upgraded connection leaves its tunnel here; awaiting it
+                    // in this task keeps it under the server's JoinSet.
+                    let tunnel = pending
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(tunnel) = tunnel {
+                        tunnel.await;
                     }
                 });
             }
@@ -387,6 +560,14 @@ pub(crate) struct ProxyError {
 }
 
 impl ProxyError {
+    fn pairing_invalid() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "pairing_invalid",
+            "agentdesktop proxy: pairing value missing or wrong; re-apply the managed configuration",
+        )
+    }
+
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -553,11 +734,12 @@ fn upstream_base(gateway: &LlmGatewayConfig, upstream: Upstream) -> &url::Url {
 }
 
 async fn forward(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     client: &ProxyClient,
     state: &AppState,
     config: &ProxyConfig,
     cache: &CredentialCache,
+    tunnel_slot: &PendingTunnel,
 ) -> Result<Response<ProxyBody>, ProxyError> {
     if !host_is_loopback(request.headers()) {
         return Err(ProxyError::new(
@@ -581,33 +763,58 @@ async fn forward(
             "agentdesktop proxy: OPTIONS is not supported",
         ));
     }
-    // The pairing value is required on every route and travels only in its own
-    // header: Authorization keeps one meaning (the client's own token, used by the
-    // pass-through shapes) and the pairing is never mistaken for a credential.
-    // Checked before anything that reads configuration, so an unpaired caller
-    // learns nothing about this device and costs it no work.
-    let offered = request
-        .headers()
-        .get(PAIRING_HEADER)
-        .and_then(|value| value.to_str().ok());
-    if !offered
-        .is_some_and(|offered| constant_time_eq(offered.as_bytes(), config.pairing.as_bytes()))
-    {
-        return Err(ProxyError::new(
-            StatusCode::FORBIDDEN,
-            "pairing_invalid",
-            "agentdesktop proxy: pairing value missing or wrong; re-apply the managed configuration",
-        ));
-    }
-    // Pure string checks on the path run before any configuration is read.
+    // Pure string work on the path first; no configuration is read yet.
     let path_and_query = request
         .uri()
         .path_and_query()
-        .map_or("/", |path| path.as_str());
+        .map_or("/", |path| path.as_str())
+        .to_owned();
     let (path, query) = match path_and_query.split_once('?') {
         Some((path, query)) => (path, Some(query)),
-        None => (path_and_query, None),
+        None => (path_and_query.as_str(), None),
     };
+    // The pairing value is required on every route. It travels in its own
+    // header, so Authorization keeps one meaning (the client's own token on the
+    // pass-through shapes) and the pairing is never mistaken for a credential.
+    // The CAPI route's client (VS Code) cannot add a header, so there the
+    // pairing is the first path segment and the header is ignored. Checked
+    // before anything that reads configuration, so an unpaired caller learns
+    // nothing about this device and costs it no work.
+    let pairing_ok =
+        |offered: &str| constant_time_eq(offered.as_bytes(), config.pairing.as_bytes());
+    // Matched once; the route decides pairing placement, upgrade handling,
+    // the ping exemption, client id, credential mode and upstream.
+    let matched = match_route(path);
+    let matched_route = matched.map(|(route, _)| route);
+    let capi_rest = match matched {
+        Some((route, rest)) if route.pairing_in_path => {
+            let Some((segment, remainder)) = split_path_pairing(rest) else {
+                return Err(ProxyError::pairing_invalid());
+            };
+            if !pairing_ok(segment) {
+                return Err(ProxyError::pairing_invalid());
+            }
+            Some(remainder.to_owned())
+        }
+        _ => {
+            let offered = request
+                .headers()
+                .get(PAIRING_HEADER)
+                .and_then(|value| value.to_str().ok());
+            if !offered.is_some_and(pairing_ok) {
+                return Err(ProxyError::pairing_invalid());
+            }
+            None
+        }
+    };
+    let websocket = is_websocket_upgrade(request.headers());
+    if websocket && !matched_route.is_some_and(|route| route.tunnels_upgrades) {
+        return Err(ProxyError::new(
+            StatusCode::BAD_REQUEST,
+            "upgrade_not_supported",
+            "agentdesktop proxy: WebSocket upgrades are supported on the /vscode-copilot-capi route only",
+        ));
+    }
     if path_escapes_base(path) {
         return Err(ProxyError::new(
             StatusCode::BAD_REQUEST,
@@ -615,14 +822,14 @@ async fn forward(
             "agentdesktop proxy: path must not contain '..' segments",
         ));
     }
-    if match_route(path).is_none() && resembles_route(path) {
+    if matched.is_none() && resembles_route(path) {
         // A first segment that looks like a route name but is not one (case,
         // suffix, doubled slash) is a mistyped client file, not a request for
         // the hand-configured route with its different identity and credential mode.
         return Err(ProxyError::new(
             StatusCode::NOT_FOUND,
             "route_unknown",
-            "agentdesktop proxy: unknown route; the managed prefixes are /copilot-cli, /vscode-copilot and /vscode-copilot-passthrough",
+            "agentdesktop proxy: unknown route; the managed prefixes are /copilot-cli, /vscode-copilot, /vscode-copilot-passthrough and /vscode-copilot-capi",
         ));
     }
     let effective =
@@ -646,7 +853,7 @@ async fn forward(
     })?;
 
     // Which route, which client id, which credential mode, which upstream.
-    let (client_id, credential_mode, base, rest) = match match_route(path) {
+    let (client_id, credential_mode, base, rest) = match matched {
         Some((route, rest)) => {
             if route.upstream == Upstream::ProxyUrl && gateway.proxy_url.is_none() {
                 // The pass-through shape needs the gateway route that restores the
@@ -662,7 +869,7 @@ async fn forward(
                 route.client_id.to_owned(),
                 Some(route.credential),
                 upstream_base(gateway, route.upstream),
-                rest,
+                capi_rest.as_deref().unwrap_or(rest),
             )
         }
         // No prefix: the original hand-configured shape. Credential mode comes
@@ -699,6 +906,14 @@ async fn forward(
     // both places.
     let client_credential = bearer_or_header(request.headers(), "x-llm-token")
         .filter(|value| !constant_time_eq(value.as_bytes(), config.pairing.as_bytes()));
+    // GitHub's health ping carries no credential and needs none: on the CAPI
+    // route a GET without one is forwarded as is instead of being refused.
+    let credential_less_ping = matched_route.is_some_and(|route| route.credential_less_ping)
+        && capi_rest.as_deref() == Some("/_ping")
+        && request.method() == Method::GET
+        && client_credential.is_none();
+    // The inbound upgrade handle is taken before the body is consumed.
+    let inbound_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
 
     // Buffer the body (capped) so the request can be retried once with a fresh
     // credential; the response is streamed as it arrives.
@@ -731,6 +946,16 @@ async fn forward(
     let mut request = Request::from_parts(parts, ());
 
     strip_hop_headers(request.headers_mut());
+    if websocket {
+        // The upgrade is the point of the request: put back the two hop headers
+        // that carry it (the Sec-WebSocket-* headers are end-to-end and stay).
+        request
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        request
+            .headers_mut()
+            .insert("upgrade", HeaderValue::from_static("websocket"));
+    }
     for header in [
         AUTHORIZATION.as_str(),
         "x-api-key",
@@ -745,6 +970,7 @@ async fn forward(
     // so the prefix is added in exactly one place.
     let upstream_token = match credential_mode {
         Some(RouteCredential::Gateway) => None,
+        Some(RouteCredential::Passthrough) if credential_less_ping => None,
         Some(RouteCredential::Passthrough) => Some(client_credential.ok_or_else(|| {
             ProxyError::new(
                 StatusCode::UNAUTHORIZED,
@@ -847,13 +1073,17 @@ async fn forward(
         // has not rejected it, so a bad token is never handed to later requests.
         let mut fetched_now: Option<agentdesktop_core::model::LlmGatewayCredential> = None;
         let mut attempt_credential: Option<String> = None;
+        // The expiry of a cached credential, read together with it: a later
+        // lookup could miss an entry that expired or was invalidated meanwhile.
+        let mut cached_deadline: Option<Deadline> = None;
         if authenticated {
             let cached = cache_key
                 .as_ref()
-                .and_then(|(key, device_id)| cache.get(key, device_id));
+                .and_then(|(key, device_id)| cache.lookup(key, device_id));
             let credential = match cached {
-                Some(credential) => {
+                Some((credential, deadline)) => {
                     from_cache = true;
+                    cached_deadline = Some(deadline);
                     credential
                 }
                 None => {
@@ -952,6 +1182,49 @@ async fn forward(
             cache.insert(key, device_id, fetched);
         }
         let mut response = response;
+        if websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            // The upstream accepted the upgrade. The 101 goes back with the
+            // hop headers stripped except the two that carry the upgrade
+            // (the Sec-WebSocket-* headers are end-to-end and stay), and the
+            // tunnel between the two upgraded connections is handed to the
+            // connection task. It closes when either side closes or when the
+            // gateway credential it was opened with expires (its own expiry,
+            // not the cache's reuse window). Without a gateway credential
+            // (no authentication configured) there is no deadline.
+            let deadline = cached_deadline.or_else(|| {
+                fetched_now
+                    .as_ref()
+                    .map(|fetched| Deadline::from_unix(fetched.expires_at_unix_seconds))
+            });
+            let upgrade_value = response.headers().get("upgrade").cloned();
+            strip_hop_headers(response.headers_mut());
+            response
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+            if let Some(value) = upgrade_value {
+                response.headers_mut().insert("upgrade", value);
+            }
+            let outbound_upgrade = hyper::upgrade::on(&mut response);
+            let inbound_upgrade = inbound_upgrade.ok_or_else(|| {
+                ProxyError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "agentdesktop_unavailable",
+                    "agentdesktop proxy: upgrade handle missing",
+                )
+            })?;
+            *tunnel_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::pin(run_tunnel(
+                inbound_upgrade,
+                outbound_upgrade,
+                deadline,
+            )));
+            return Ok(response.map(|_| {
+                Empty::<Bytes>::new()
+                    .map_err(|never| match never {})
+                    .boxed()
+            }));
+        }
         strip_hop_headers(response.headers_mut());
         return Ok(response.map(BodyExt::boxed));
     }
@@ -1603,6 +1876,12 @@ mod tests {
                 RouteCredential::Passthrough,
                 Upstream::ProxyUrl,
             ),
+            (
+                "/vscode-copilot-capi/PAIRING/responses",
+                "vscode-copilot",
+                RouteCredential::Passthrough,
+                Upstream::ProxyUrl,
+            ),
         ];
         for (path, client_id, credential, upstream) in expected {
             let (route, _) = match_route(path).unwrap_or_else(|| panic!("{path}"));
@@ -1610,7 +1889,8 @@ mod tests {
             assert_eq!(route.credential, credential, "{path}");
             assert_eq!(route.upstream, upstream, "{path}");
         }
-        assert_eq!(ROUTES.len(), 3);
+        assert_eq!(ROUTES.len(), 4);
+        assert_eq!(CAPI_ROUTE, "/vscode-copilot-capi");
     }
 
     #[test]
@@ -2106,6 +2386,32 @@ mod tests {
         .unwrap();
     }
 
+    // Added with the implementation (not part of the spec-derived baseline).
+    #[test]
+    fn credential_cache_deadline_is_the_credential_expiry_not_the_reuse_window() {
+        let cache = CredentialCache::default();
+        let expires = now_unix() + 3600;
+        cache.insert(
+            "k",
+            "device-1",
+            &agentdesktop_core::model::LlmGatewayCredential {
+                credential: "jwt".to_owned(),
+                expires_at_unix_seconds: expires,
+            },
+        );
+        let (credential, deadline) = cache.lookup("k", "device-1").expect("cached");
+        assert_eq!(credential, "jwt");
+        assert_eq!(deadline.unix, expires);
+        let remaining = deadline.monotonic - std::time::Instant::now();
+        assert!(
+            remaining > CREDENTIAL_CACHE_TTL && remaining <= Duration::from_secs(3600),
+            "tunnel deadline must follow the credential's expiry, got {remaining:?}"
+        );
+        // The reuse window is still the short one.
+        let entry = cache.entries.lock().unwrap();
+        assert!(entry["k"].valid_until <= std::time::Instant::now() + CREDENTIAL_CACHE_TTL);
+    }
+
     #[test]
     fn credential_cache_honours_device_ttl_and_invalidation() {
         let cache = CredentialCache::default();
@@ -2182,5 +2488,854 @@ mod tests {
             logout: None,
         };
         (dir, state)
+    }
+
+    // --- vscode-copilot-capi: path pairing, /_ping and the WebSocket tunnel.
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    /// `request_source_state` (OIDC identity "identity", `githubOAuth: source:
+    /// request`) with `llmGateway.proxyUrl` pointed at `upstream`, matching
+    /// the CAPI route's Passthrough/ProxyUrl shape used by most tests below.
+    async fn capi_state(upstream: std::net::SocketAddr) -> (tempfile::TempDir, AppState) {
+        let (dir, mut state) = request_source_state(upstream).await;
+        state.config.llm_gateway.as_mut().unwrap().proxy_url =
+            Some(format!("http://{upstream}").parse().unwrap());
+        (dir, state)
+    }
+
+    /// Controller-JWT state (cacheable credential, unlike OIDC) with
+    /// `llmGateway.proxyUrl` pointed at `upstream`, for the credential-expiry
+    /// tunnel test, which needs a credential it can seed into the cache with a
+    /// controlled deadline.
+    async fn capi_controller_jwt_state(
+        upstream: std::net::SocketAddr,
+    ) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("identity.json"),
+            serde_json::json!({
+                "deviceId": "device-test",
+                "clientCertificatePem": "",
+                "clientCertificateExpiresAtUnixSeconds": 4_000_000_000u64,
+                "oauthTokenEndpoint": "https://controller.example/token",
+                "oauthClientId": "device",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config = parse_daemon(&format!(
+            "llmGateway:\n  url: http://{upstream}\n  proxyUrl: http://{upstream}\n  authentication:\n    type: controllerJwt\n    audience: agentgateway\n    allowedClientIds: [vscode-copilot]\n"
+        ))
+        .unwrap();
+        let (_, discovery) = watch::channel(Arc::new(Discovery {
+            agents: vec![],
+            model_runtimes: vec![],
+        }));
+        let state = AppState {
+            config,
+            daemon_info: DaemonInfo {
+                version: "test".into(),
+                scope: DaemonScope::User,
+                config_path: String::new(),
+                state_directory: String::new(),
+                inventory_interval: Duration::from_secs(60),
+                controller: None,
+                llm_proxy: None,
+            },
+            discovery,
+            enrollment: EnrollmentState::new(false),
+            state_dir: dir.path().to_owned(),
+            oidc_callback_listen: None,
+            telemetry: None,
+            logout: None,
+        };
+        (dir, state)
+    }
+
+    /// Whether no connection reached `listener` within a short window: proof
+    /// that a refused request was never forwarded upstream.
+    async fn no_connection_arrives(listener: &TcpListener) -> bool {
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err()
+    }
+
+    /// Reads a raw HTTP/1.1 request head (request line + headers, byte at a
+    /// time up to the blank line) from a hand-rolled test upstream: good
+    /// enough for a WebSocket upgrade request, which has no body. Header
+    /// names are folded to lowercase for case-insensitive lookup.
+    async fn read_http_head(
+        stream: &mut TcpStream,
+    ) -> (String, String, std::collections::HashMap<String, String>) {
+        let mut buffer = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buffer.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            buffer.push(byte[0]);
+        }
+        let text = String::from_utf8(buffer).unwrap();
+        let mut lines = text.split("\r\n");
+        let mut parts = lines.next().unwrap().split_whitespace();
+        let method = parts.next().unwrap().to_owned();
+        let path = parts.next().unwrap().to_owned();
+        let mut headers = std::collections::HashMap::new();
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+            }
+        }
+        (method, path, headers)
+    }
+
+    /// RFC 6455's fixed GUID: concatenated with the client's
+    /// `Sec-WebSocket-Key` and SHA-1'd (then base64'd) to produce
+    /// `Sec-WebSocket-Accept`.
+    const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+    fn ws_accept(key: &str) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use sha1::{Digest, Sha1};
+        STANDARD.encode(Sha1::digest(format!("{key}{WS_GUID}").as_bytes()))
+    }
+
+    /// Encodes a single, unfragmented text frame (opcode `0x1`). Client
+    /// frames must be masked (`mask: true`, a fixed key: the test payloads
+    /// are not attacker-controlled), server frames must not be.
+    fn ws_frame(payload: &[u8], mask: bool) -> Vec<u8> {
+        let mut frame = vec![0x81u8];
+        let mask_bit = if mask { 0x80 } else { 0x00 };
+        let len = payload.len();
+        if len < 126 {
+            frame.push(mask_bit | len as u8);
+        } else {
+            frame.push(mask_bit | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        if mask {
+            let key = [0x11u8, 0x22, 0x33, 0x44];
+            frame.extend_from_slice(&key);
+            frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+        } else {
+            frame.extend_from_slice(payload);
+        }
+        frame
+    }
+
+    /// Reads exactly one, unfragmented, non-huge frame and returns its opcode
+    /// and unmasked payload.
+    async fn ws_read_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await.unwrap();
+        let opcode = header[0] & 0x0f;
+        let masked = header[1] & 0x80 != 0;
+        let mut len = (header[1] & 0x7f) as usize;
+        if len == 126 {
+            let mut extended = [0u8; 2];
+            stream.read_exact(&mut extended).await.unwrap();
+            len = u16::from_be_bytes(extended) as usize;
+        }
+        let mask_key = if masked {
+            let mut key = [0u8; 4];
+            stream.read_exact(&mut key).await.unwrap();
+            Some(key)
+        } else {
+            None
+        };
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        if let Some(key) = mask_key {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= key[index % 4];
+            }
+        }
+        (opcode, payload)
+    }
+
+    /// A fixed, valid `Sec-WebSocket-Key` (the RFC 6455 example key): its
+    /// `Sec-WebSocket-Accept` is computed by `ws_accept`, never hand-checked
+    /// against a literal.
+    const SEC_WEBSOCKET_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    fn upgrade_request(uri: String) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header(CONNECTION, "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", SEC_WEBSOCKET_KEY)
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capi_route_accepts_and_strips_path_pairing_never_forwarding_it() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            // The pairing segment must never reach the upstream path.
+                            assert_eq!(request.uri(), "/chat/completions");
+                            assert!(!request.headers().contains_key(PAIRING_HEADER));
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/chat/completions"
+                ))
+                .header(AUTHORIZATION, "Bearer tid=from-client")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "path pairing must be accepted on {CAPI_ROUTE}"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_rejects_missing_empty_or_wrong_pairing_segment_even_with_a_valid_header() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            // Dropped rather than accepted from: today none of these four
+            // paths are rejected before forwarding (path-pairing extraction
+            // does not exist yet), so leaving the listener up would have
+            // every case hang until the gateway timeout instead of failing
+            // fast with a clean (if wrong) status.
+            drop(upstream);
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            for path in [
+                CAPI_ROUTE.to_owned(),                                  // no segment at all
+                format!("{CAPI_ROUTE}/"),                               // no segment at all
+                format!("{CAPI_ROUTE}//chat/completions"),              // empty segment
+                format!("{CAPI_ROUTE}/wrong-pairing/chat/completions"), // wrong segment
+            ] {
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{proxy_address}{path}"))
+                    // A valid header must not substitute for the path segment
+                    // on this route: the header is ignored here.
+                    .header(PAIRING_HEADER, PAIRING)
+                    .header(AUTHORIZATION, "Bearer tid=from-client")
+                    .body(Full::new(Bytes::from_static(b"{}")))
+                    .unwrap();
+                assert_eq!(
+                    error_code(client.request(request).await.unwrap()).await,
+                    (StatusCode::FORBIDDEN, "pairing_invalid".to_owned()),
+                    "{path}"
+                );
+            }
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_rejects_a_double_dot_segment_after_the_pairing() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/../admin"
+                ))
+                .header(AUTHORIZATION, "Bearer tid=from-client")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            assert_eq!(
+                error_code(client.request(request).await.unwrap()).await,
+                (StatusCode::BAD_REQUEST, "path_invalid".to_owned())
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_moves_the_client_token_to_x_llm_token() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            assert_eq!(request.uri(), "/chat/completions");
+                            assert_eq!(request.headers()["x-llm-token"], "tid=from-client");
+                            assert_eq!(request.headers()[AUTHORIZATION], "Bearer identity");
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/chat/completions"
+                ))
+                .header(AUTHORIZATION, "Bearer tid=from-client")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_ping_without_credential_is_forwarded_without_x_llm_token() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            assert_eq!(request.uri(), "/_ping");
+                            assert!(!request.headers().contains_key("x-llm-token"));
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/_ping"
+                ))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_ping_post_without_credential_is_401() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/_ping"
+                ))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            assert_eq!(
+                error_code(client.request(request).await.unwrap()).await,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "client_credential_missing".to_owned()
+                )
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_ping_without_pairing_is_403() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{proxy_address}{CAPI_ROUTE}/wrong/_ping"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            assert_eq!(
+                error_code(client.request(request).await.unwrap()).await,
+                (StatusCode::FORBIDDEN, "pairing_invalid".to_owned())
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_upgrade_without_pairing_is_403_and_not_forwarded() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let request = upgrade_request(format!(
+                "http://{proxy_address}{CAPI_ROUTE}/wrong/responses"
+            ));
+            assert_eq!(
+                error_code(client.request(request).await.unwrap()).await,
+                (StatusCode::FORBIDDEN, "pairing_invalid".to_owned())
+            );
+            assert!(
+                no_connection_arrives(&upstream).await,
+                "an upgrade refused for its pairing must not be forwarded upstream"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upgrade_on_another_route_is_400_but_other_upgrade_tokens_still_forward() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = match upstream.accept().await {
+                        Ok(accepted) => accepted,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(socket),
+                                service_fn(|_request: Request<Incoming>| async move {
+                                    Ok::<_, Infallible>(Response::new(Full::new(
+                                        Bytes::from_static(b"ok"),
+                                    )))
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+            let (dir, state) = request_source_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            // Only /vscode-copilot-capi tunnels an upgrade; on any other
+            // route Upgrade: websocket is refused outright.
+            let websocket_upgrade = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{proxy_address}/copilot-cli/v1/models"))
+                .header(PAIRING_HEADER, PAIRING)
+                .header(AUTHORIZATION, "Bearer tid=from-client")
+                .header(CONNECTION, "upgrade")
+                .header("upgrade", "websocket")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            // Checked as a plain status first (not via the shared
+            // `error_code` helper, which assumes a JSON error body): today
+            // this request is not refused at all and is forwarded as an
+            // ordinary request, so the response has no content-type header
+            // for `error_code` to read.
+            let response = client.request(websocket_upgrade).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "an Upgrade: websocket request on a non-CAPI route must be refused, not forwarded"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["code"], "upgrade_not_supported");
+            // Only the websocket token is refused; another Upgrade token on
+            // the same route is stripped (as a hop-by-hop header) and
+            // forwarded as an ordinary request, as before this feature.
+            let other_upgrade = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{proxy_address}/copilot-cli/v1/models"))
+                .header(PAIRING_HEADER, PAIRING)
+                .header(AUTHORIZATION, "Bearer tid=from-client")
+                .header(CONNECTION, "upgrade")
+                .header("upgrade", "h2c")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response = client.request(other_upgrade).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a non-websocket Upgrade token must still be forwarded"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_non_101_upstream_response_passes_through() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(|_request: Request<Incoming>| async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::BAD_GATEWAY)
+                                    .body(Full::new(Bytes::from_static(b"nope")))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let mut request = upgrade_request(format!(
+                "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/responses"
+            ));
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, "Bearer tid=from-client".parse().unwrap());
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body, Bytes::from_static(b"nope"));
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_route_websocket_tunnel_relays_the_101_and_one_frame_each_way_with_gateway_credentials()
+     {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                let (method, path, headers) = read_http_head(&mut socket).await;
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/responses");
+                assert_eq!(
+                    headers.get("authorization").map(String::as_str),
+                    Some("Bearer identity"),
+                    "the gateway identity must reach the upstream on the handshake"
+                );
+                assert_eq!(
+                    headers.get("x-llm-token").map(String::as_str),
+                    Some("tid=from-client"),
+                    "the client's own token must reach the upstream on the handshake"
+                );
+                let accept =
+                    ws_accept(headers.get("sec-websocket-key").map(String::as_str).unwrap_or(""));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let (opcode, payload) = ws_read_frame(&mut socket).await;
+                assert_eq!(opcode, 0x1);
+                assert_eq!(payload, b"hello from vs code");
+                socket
+                    .write_all(&ws_frame(b"hello from github", false))
+                    .await
+                    .unwrap();
+            });
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let mut request = upgrade_request(format!(
+                "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/responses"
+            ));
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, "Bearer tid=from-client".parse().unwrap());
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            assert_eq!(response.headers()["upgrade"], "websocket");
+            assert!(
+                response.headers()["connection"]
+                    .to_str()
+                    .unwrap()
+                    .eq_ignore_ascii_case("upgrade")
+            );
+            assert_eq!(
+                response.headers()["sec-websocket-accept"],
+                ws_accept(SEC_WEBSOCKET_KEY)
+            );
+            let upgraded = hyper::upgrade::on(response).await.unwrap();
+            let mut io = TokioIo::new(upgraded);
+            io.write_all(&ws_frame(b"hello from vs code", true))
+                .await
+                .unwrap();
+            let mut header = [0u8; 2];
+            io.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0] & 0x0f, 0x1, "expected a text frame back");
+            let len = (header[1] & 0x7f) as usize;
+            assert!(header[1] & 0x80 == 0, "a server frame must not be masked");
+            let mut payload = vec![0u8; len];
+            io.read_exact(&mut payload).await.unwrap();
+            assert_eq!(payload, b"hello from github");
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_the_proxy_closes_an_open_capi_tunnel() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                let (_, _, headers) = read_http_head(&mut socket).await;
+                let accept =
+                    ws_accept(headers.get("sec-websocket-key").map(String::as_str).unwrap_or(""));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                // Held open until the client side sees it close.
+                let mut buffer = [0u8; 1];
+                let _ = socket.read(&mut buffer).await;
+            });
+            let (dir, state) = capi_state(address).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, default_config()));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let mut request = upgrade_request(format!(
+                "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/responses"
+            ));
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, "Bearer tid=from-client".parse().unwrap());
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            let upgraded = hyper::upgrade::on(response).await.unwrap();
+            let mut io = TokioIo::new(upgraded);
+            proxy.abort();
+            let _ = proxy.await;
+            // The tunnel task is owned by the connection's JoinSet: dropping
+            // the server must close it, and the client sees EOF.
+            let mut buffer = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(5), io.read(&mut buffer))
+                .await
+                .expect("dropping the proxy must close the open tunnel promptly")
+                .unwrap();
+            assert_eq!(read, 0, "expected EOF once the tunnel closes");
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capi_tunnel_closes_when_the_cached_credential_expires() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream.accept().await.unwrap();
+                let (_, _, headers) = read_http_head(&mut socket).await;
+                let accept =
+                    ws_accept(headers.get("sec-websocket-key").map(String::as_str).unwrap_or(""));
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let mut buffer = [0u8; 1];
+                let _ = socket.read(&mut buffer).await;
+            });
+            let (dir, state) = capi_controller_jwt_state(address).await;
+            let cache = Arc::new(CredentialCache::default());
+            let key = format!("vscode-copilot\u{0}http://{address}/\u{0}agentgateway");
+            // Inserted directly (bypassing `insert`'s expiry-margin floor,
+            // which would otherwise refuse to cache anything this close to
+            // expiry) so the tunnel has time to open before the deadline.
+            cache.entries.lock().unwrap().insert(
+                key,
+                CachedCredential {
+                    credential: "short-lived".to_owned(),
+                    device_id: "device-test".to_owned(),
+                    valid_until: std::time::Instant::now() + Duration::from_millis(300),
+                    valid_until_unix: now_unix() + 60,
+                    expires: std::time::Instant::now() + Duration::from_millis(300),
+                    expires_unix: now_unix() + 60,
+                },
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve_with_cache(
+                listener,
+                state,
+                default_config(),
+                cache,
+            ));
+            let client: Client<HttpConnector, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let mut request = upgrade_request(format!(
+                "http://{proxy_address}{CAPI_ROUTE}/{PAIRING}/responses"
+            ));
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, "Bearer tid=from-client".parse().unwrap());
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            let upgraded = hyper::upgrade::on(response).await.unwrap();
+            let mut io = TokioIo::new(upgraded);
+            // Once the cached credential's deadline passes, the tunnel closes
+            // on its own, with the proxy still running.
+            let mut buffer = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(5), io.read(&mut buffer))
+                .await
+                .expect("the tunnel must close once its credential expires")
+                .unwrap();
+            assert_eq!(read, 0, "expected EOF once the tunnel closes");
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
     }
 }

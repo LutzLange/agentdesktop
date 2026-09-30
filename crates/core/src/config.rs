@@ -81,11 +81,13 @@ pub struct DaemonStartupConfig {
     /// then `~/.copilot/providers.json`).
     #[serde(default)]
     pub copilot: ToolConfigPath,
-    /// VS Code paths (`config` = the `chatLanguageModels.json` to manage;
-    /// defaults to `chatLanguageModels.json` inside the per-OS VS Code user
-    /// profile directory).
+    /// VS Code paths (`config` = the `chatLanguageModels.json` to manage under
+    /// the `ownModels` variant of `copilotChat`, `settings` = the user
+    /// `settings.json` to manage under the `githubModels` variant; each
+    /// defaults to its file inside the per-OS VS Code user profile
+    /// directory).
     #[serde(default)]
-    pub vscode: ToolConfigPath,
+    pub vscode: VsCodeStartupConfig,
     /// Local loopback LLM proxy.
     #[serde(default)]
     pub llm_proxy: LlmProxyStartupConfig,
@@ -126,6 +128,25 @@ pub struct ToolConfigPath {
     /// Configuration file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<PathBuf>,
+}
+
+/// VS Code paths: own type (not the shared `ToolConfigPath`) because the
+/// `githubModels` variant of `copilotChat` manages a second
+/// file, the user's `settings.json`, alongside `chatLanguageModels.json`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VsCodeStartupConfig {
+    /// `chatLanguageModels.json` to manage (the `ownModels` variant of
+    /// `copilotChat`). Defaults to that file inside the per-OS VS Code user
+    /// profile directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<PathBuf>,
+    /// The user `settings.json` to manage (the `githubModels` variant of
+    /// `copilotChat`). Defaults to that file inside the per-OS VS Code user
+    /// profile directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<PathBuf>,
 }
 
 /// Local OpenCode paths.
@@ -556,7 +577,8 @@ pub struct ProgramsConfig {
     /// GitHub Copilot CLI managed configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copilot: Option<CopilotConfig>,
-    /// VS Code (Copilot Chat, own models) managed configuration.
+    /// VS Code Copilot Chat managed configuration (own models through the
+    /// loopback proxy, or GitHub's models through the gateway).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vscode: Option<VsCodeConfig>,
 }
@@ -834,14 +856,17 @@ impl CopilotConfig {
     }
 }
 
-/// Settings reconciled into VS Code's `chatLanguageModels.json`: points
+/// Settings reconciled into VS Code's Copilot Chat configuration. Under
+/// `copilotChat: ownModels` this is `chatLanguageModels.json`, pointing
 /// Copilot Chat's built-in "Custom Endpoint" model provider at the local LLM
-/// proxy's `/vscode-copilot` route (the `githubModels` variant of
-/// `copilotChat`, using GitHub's own models through the gateway, arrives in a
-/// later PR). See `provider::vscode::reconcile` in the agent crate for how
-/// this is turned into the merged document. User mode only: the file lives in
-/// the user's VS Code profile directory, so a system daemon rejects the
-/// program.
+/// proxy's `/vscode-copilot` route; under `copilotChat: githubModels`
+/// it is the user `settings.json`, pointing Copilot Chat's
+/// CAPI endpoint at the loopback proxy's `/vscode-copilot-capi/<pairing>`
+/// route so VS Code keeps GitHub's own models and its own Copilot token while
+/// the daemon adds the gateway identity. See `provider::vscode::reconcile`
+/// and `provider::vscode::settings` in the agent crate for how each is turned
+/// into its merged document. User mode only: both files live in the user's
+/// VS Code profile directory, so a system daemon rejects the program.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -849,14 +874,17 @@ pub struct VsCodeConfig {
     /// Whether this program uses the top-level LLM gateway.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub use_llm_gateway: bool,
-    /// Which Copilot Chat model source VS Code is pointed at. Only
-    /// `ownModels` is available for now.
+    /// Which Copilot Chat model source VS Code is pointed at: agentdesktop's
+    /// own custom models (`ownModels`), or GitHub's own models reached
+    /// through the gateway (`githubModels`).
     #[serde(default)]
     pub copilot_chat: VsCodeCopilotChat,
     /// Custom model entries exposed to VS Code's Copilot Chat model picker,
-    /// keyed by the model ID VS Code sends as `model`.
+    /// keyed by the model ID VS Code sends as `model`. Only meaningful under
+    /// `copilotChat: ownModels`; `githubModels` rejects a non-empty map.
     ///
-    /// At least one is required when a top-level `llmGateway` is configured.
+    /// At least one is required when a top-level `llmGateway` is configured
+    /// and `copilotChat` is `ownModels`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, VsCodeModel>,
 }
@@ -870,6 +898,12 @@ pub enum VsCodeCopilotChat {
     /// route (VS Code's "Custom Endpoint" provider).
     #[default]
     OwnModels,
+    /// GitHub's own models, reached through the gateway's pass-through route
+    /// (`llmGateway.proxyUrl`) with the user's GitHub Copilot token forwarded:
+    /// the daemon points `github.copilot.advanced.debug.overrideCapiUrl` in
+    /// the user `settings.json` at the loopback proxy's
+    /// `/vscode-copilot-capi/<pairing>` route. `models` must be empty.
+    GithubModels,
 }
 
 /// One VS Code custom model entry. The entry's `id` is the map key; other
@@ -961,10 +995,17 @@ impl VsCodeConfig {
     }
 
     /// Rejects an empty model ID, a pass-through `id`, `url` or
-    /// `requestHeaders`, and a pass-through `apiKey`. Called from daemon
-    /// config validation, so the controller refuses the config before any
-    /// device sees it.
+    /// `requestHeaders`, a pass-through `apiKey`, and a non-empty `models`
+    /// under `copilotChat: githubModels` (that variant has no custom models
+    /// of its own; GitHub's own model picker is used instead). Called from
+    /// daemon config validation, so the controller refuses the config before
+    /// any device sees it.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.copilot_chat == VsCodeCopilotChat::GithubModels && !self.models.is_empty() {
+            anyhow::bail!(
+                "programs.vscode.models is not allowed when copilotChat is githubModels: GitHub's own models are used instead"
+            );
+        }
         for (id, model) in &self.models {
             if id.trim().is_empty() {
                 anyhow::bail!("programs.vscode.models has an entry with an empty ID");
@@ -1322,6 +1363,15 @@ fn validate_daemon(
                 if llm_gateway.is_some() && vscode.use_llm_gateway && vscode.models.is_empty() {
                     anyhow::bail!(
                         "VS Code requires at least one entry in models when llmGateway is configured"
+                    );
+                }
+            }
+            VsCodeCopilotChat::GithubModels => {
+                if vscode.use_llm_gateway
+                    && llm_gateway.is_some_and(|gateway| gateway.proxy_url.is_none())
+                {
+                    anyhow::bail!(
+                        "VS Code copilotChat githubModels requires llmGateway.proxyUrl when the gateway is used"
                     );
                 }
             }
