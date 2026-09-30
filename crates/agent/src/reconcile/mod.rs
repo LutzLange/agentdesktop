@@ -239,6 +239,26 @@ impl Reconciler {
 /// LLM proxy is absent.
 pub(crate) const PROXY_ABSENT_REASON: &str = "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen";
 
+/// The `inactive` detail under `llmGateway.whenProxyUnavailable: failClosed`,
+/// when a program behind the local LLM proxy keeps its managed entries.
+pub(crate) const FAIL_CLOSED_REASON: &str = concat!(
+    "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen",
+    "; the managed entries stay and the tool fails until the proxy is back (whenProxyUnavailable: failClosed)"
+);
+
+/// Under `failClosed`, marks the program `inactive` and returns `true`: the
+/// caller leaves its managed files as they are.
+pub(crate) fn fail_closed_without_proxy(
+    gateway: &agentdesktop_core::config::LlmGatewayConfig,
+    plan: &ReconcilePlan,
+) -> bool {
+    if gateway.when_proxy_unavailable != agentdesktop_core::config::ProxyUnavailable::FailClosed {
+        return false;
+    }
+    plan.inactive(FAIL_CLOSED_REASON);
+    true
+}
+
 /// A program's outcome, by precedence (highest first): Failed > Conflict >
 /// Blocked > Inactive > Applied/Removed > Unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

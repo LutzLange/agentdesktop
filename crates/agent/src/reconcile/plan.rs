@@ -82,6 +82,12 @@ impl ReconcilePlan {
         *self.inactive.borrow_mut() = Some(reason.to_owned());
     }
 
+    /// The reason recorded by [`ReconcilePlan::inactive`], for tests.
+    #[cfg(test)]
+    pub(crate) fn inactive_reason(&self) -> Option<String> {
+        self.inactive.borrow().clone()
+    }
+
     pub(super) fn operation_count(&self) -> usize {
         self.operations.borrow().len()
     }
