@@ -439,7 +439,10 @@ that the proxy tunnels: the gateway identity is checked once, at the upgrade,
 and the tunnel stays open until either side closes it or the gateway
 credential it was opened with expires (its own expiry, typically the
 controller JWT's; a re-enrollment or logout does not cut an open
-conversation). Quota headers from GitHub pass through, so VS Code's usage
+conversation). Everything else VS Code sends goes to the gateway and on to
+GitHub unchanged, including its `Copilot-Session-Token` (the Auto session
+token) and its machine and device ids; gateway access logs that record request
+headers see them. Quota headers from GitHub pass through, so VS Code's usage
 display keeps working.
 
 The file lives in the VS Code user profile directory next to

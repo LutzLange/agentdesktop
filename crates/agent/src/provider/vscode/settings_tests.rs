@@ -594,3 +594,37 @@ fn hand_edited_override_is_replaced_on_reapply_and_not_restored_on_removal() {
     );
     assert_eq!(remaining["editor.fontSize"], 14);
 }
+
+// Added with the implementation (not part of the spec-derived baseline):
+// the user's own override from before the first apply survives a hand edit of
+// the managed URL and comes back on removal.
+#[test]
+fn user_override_from_before_the_first_apply_survives_a_hand_edit_and_returns_on_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+    let users_own = "https://capi.example.invalid";
+    write_user_settings(&path, &serde_json::json!({ OVERRIDE_KEY: users_own }));
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    let managed_url = override_url(listen_addr(), PAIRING);
+    assert_eq!(read(&path)[OVERRIDE_KEY], managed_url);
+
+    let mut edited = read(&path);
+    edited[OVERRIDE_KEY] = Value::String(format!("{managed_url}x"));
+    write_user_settings(&path, &edited);
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    assert_eq!(read(&path)[OVERRIDE_KEY], managed_url, "hand edit replaced");
+
+    let removal = apply_removal(
+        &path,
+        Some((listen_addr(), PAIRING)),
+        Some((&own_models_config(), Some(&gateway))),
+    );
+    removal.apply().unwrap();
+    assert_eq!(
+        read(&path)[OVERRIDE_KEY],
+        users_own,
+        "the user's own value comes back"
+    );
+}
