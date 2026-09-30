@@ -314,3 +314,120 @@ fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
         Err(error) => Err(error),
     }
 }
+
+// --- No-op writes skipped (PR 5, AC5) --------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::ReconcilePlan;
+    use std::fs;
+
+    #[test]
+    fn identical_write_is_skipped_same_inode_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+
+        let plan = ReconcilePlan::default();
+        plan.write_file(&path, b"hello\n", 0o644).unwrap();
+        plan.apply().unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let before_mtime = before.modified().unwrap();
+        #[cfg(unix)]
+        let before_ino = {
+            use std::os::unix::fs::MetadataExt;
+            before.ino()
+        };
+
+        // A second, identical plan must not touch the file at all.
+        let plan = ReconcilePlan::default();
+        plan.write_file(&path, b"hello\n", 0o644).unwrap();
+        plan.apply().unwrap();
+
+        let after = fs::metadata(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                after.ino(),
+                before_ino,
+                "an identical write must not replace the file"
+            );
+        }
+        assert_eq!(
+            after.modified().unwrap(),
+            before_mtime,
+            "an identical write must not touch the file's mtime"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn same_bytes_at_a_looser_mode_are_rewritten_at_the_planned_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, b"hello\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+
+        let plan = ReconcilePlan::default();
+        plan.write_file(&path, b"hello\n", 0o600).unwrap();
+        plan.apply().unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file looser than planned must be tightened even with identical bytes"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn same_bytes_at_a_stricter_mode_are_left() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, b"hello\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let before_ino = fs::metadata(&path).unwrap().ino();
+
+        let plan = ReconcilePlan::default();
+        plan.write_file(&path, b"hello\n", 0o644).unwrap();
+        plan.apply().unwrap();
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(
+            after.ino(),
+            before_ino,
+            "a file stricter than planned must not be rewritten"
+        );
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o600,
+            "a stricter mode must not be loosened to match the plan"
+        );
+    }
+
+    #[test]
+    fn removal_whose_file_vanished_before_apply_fails_the_observed_check_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, b"hello\n").unwrap();
+
+        let plan = ReconcilePlan::default();
+        plan.remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let error = plan.apply().unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&path.display().to_string()),
+            "error must name the path: {message}"
+        );
+        assert!(
+            message.contains("changed since reconciliation was planned"),
+            "unexpected error: {message}"
+        );
+    }
+}

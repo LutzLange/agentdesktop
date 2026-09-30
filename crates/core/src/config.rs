@@ -91,6 +91,14 @@ pub struct DaemonStartupConfig {
     /// Local loopback LLM proxy.
     #[serde(default)]
     pub llm_proxy: LlmProxyStartupConfig,
+    /// Interval between periodic re-applies of the current configuration,
+    /// which repair drift (a managed file deleted or edited by hand, a fixed
+    /// conflict, a loosened mode) without rewriting anything unchanged.
+    /// Defaults to `5m`, must be greater than zero, read at startup only
+    /// (restart the daemon after changing it).
+    #[serde(default, with = "humantime_serde::option")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub reconcile_interval: Option<Duration>,
 }
 
 /// Local loopback LLM proxy settings. User mode only: the proxy hands out the
@@ -1469,6 +1477,40 @@ programs: { claudeCode: { useLlmGateway: false } }
             .expect_err("a zero inventory interval is not schedulable");
         assert!(
             error.to_string().contains("inventoryInterval"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn daemon_reconcile_interval_is_unset_by_default_and_parses_humantime() {
+        let default =
+            super::parse_local_daemon("programs: {}").expect("valid daemon configuration");
+        assert!(default.daemon.is_none());
+
+        let configured = super::parse_local_daemon("daemon:\n  reconcileInterval: 90s\n")
+            .expect("valid daemon configuration");
+        assert_eq!(
+            configured.daemon.unwrap().reconcile_interval,
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn daemon_reconcile_interval_rejects_zero() {
+        let error = super::parse_local_daemon("daemon:\n  reconcileInterval: 0s\n")
+            .expect_err("a zero reconcile interval is not schedulable");
+        assert!(
+            error.to_string().contains("daemon.reconcileInterval"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn daemon_reconcile_interval_is_rejected_in_pushed_configuration() {
+        let error = parse_daemon("daemon:\n  reconcileInterval: 5m\nprograms: {}")
+            .expect_err("daemon.* is local-only, like every other startup setting");
+        assert!(
+            error.to_string().contains("only allowed in the local"),
             "unexpected error: {error}"
         );
     }

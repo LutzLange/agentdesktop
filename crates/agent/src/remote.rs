@@ -39,6 +39,7 @@ use crate::{
     oidc,
     reconcile::Reconciler,
     secure_fs,
+    tick::TickStatus,
 };
 
 static OAUTH_REFRESH_MUTEX: Mutex<()> = Mutex::const_new(());
@@ -516,6 +517,24 @@ fn program_state_proto(state: crate::reconcile::ProgramState) -> ProtoProgramSta
     }
 }
 
+/// The `ConfigStatus` a tick's outcome should send on this stream, if any
+/// (PR 5, AC6). A status is sent only when the tick's revision is `Some` and
+/// equals the revision of the last `DaemonConfig` received on this stream,
+/// and the device state, the error, or any program's `(program, state,
+/// detail)` differs from `last_sent` (the last `ConfigStatus` sent on this
+/// stream, whether by a push or an earlier tick), where a program going from
+/// `applied` or `removed` to `unchanged` is not a difference. A failed tick
+/// is always reported (when its revision matches) as `FAILED` with the
+/// error and `programs_reported: true`.
+pub(crate) fn tick_config_status(
+    last_sent: Option<&ConfigStatus>,
+    stream_revision: Option<u64>,
+    tick: &TickStatus,
+) -> Option<ConfigStatus> {
+    let _ = (last_sent, stream_revision, tick);
+    todo!("PR 5 AC6: dedup a tick's outcome against the last ConfigStatus sent on this stream")
+}
+
 /// Sends the current inventory snapshot to the controller.
 ///
 /// The controller replaces a device's stored inventory on each message, so
@@ -937,5 +956,161 @@ mod tests {
         for (state, expected) in cases {
             assert_eq!(super::program_state_proto(state), expected, "{state:?}");
         }
+    }
+
+    // --- Tick reporting dedup (PR 5, AC6) ------------------------------------
+
+    fn program_report(
+        state: crate::reconcile::ProgramState,
+        detail: &str,
+    ) -> crate::reconcile::ApplyReport {
+        crate::reconcile::ApplyReport {
+            programs: vec![crate::reconcile::ProgramOutcome {
+                program: "claude-code",
+                state,
+                detail: detail.to_owned(),
+            }],
+        }
+    }
+
+    fn sent_status(report: &crate::reconcile::ApplyReport, revision: u64) -> super::ConfigStatus {
+        use super::{ConfigState, ConfigStatus, ProgramStatus};
+        ConfigStatus {
+            revision,
+            state: ConfigState::Applied.into(),
+            error: String::new(),
+            programs: report
+                .programs
+                .iter()
+                .map(|outcome| ProgramStatus {
+                    program: outcome.program.to_owned(),
+                    state: super::program_state_proto(outcome.state).into(),
+                    detail: outcome.detail.clone(),
+                })
+                .collect(),
+            programs_reported: true,
+        }
+    }
+
+    fn tick_status(
+        revision: Option<u64>,
+        report: crate::reconcile::ApplyReport,
+        error: Option<&str>,
+    ) -> crate::tick::TickStatus {
+        use crate::tick::TickStatus;
+        TickStatus {
+            revision,
+            report,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn tick_config_status_is_none_when_the_revision_is_none_or_mismatched() {
+        use crate::reconcile::ProgramState;
+        let previous = program_report(ProgramState::Unchanged, "");
+        let last_sent = sent_status(&previous, 3);
+        let current = program_report(ProgramState::Failed, "boom");
+
+        assert!(
+            super::tick_config_status(
+                Some(&last_sent),
+                Some(3),
+                &tick_status(None, current.clone(), None)
+            )
+            .is_none(),
+            "a tick with no revision is never reported"
+        );
+        assert!(
+            super::tick_config_status(
+                Some(&last_sent),
+                Some(3),
+                &tick_status(Some(2), current, None)
+            )
+            .is_none(),
+            "a tick whose revision does not match the stream's last push is never reported"
+        );
+    }
+
+    #[test]
+    fn tick_config_status_is_none_when_nothing_differs() {
+        use crate::reconcile::ProgramState;
+        let report = program_report(ProgramState::Unchanged, "");
+        let last_sent = sent_status(&report, 4);
+        assert!(
+            super::tick_config_status(
+                Some(&last_sent),
+                Some(4),
+                &tick_status(Some(4), report, None)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn tick_config_status_is_none_when_applied_or_removed_settles_to_unchanged() {
+        use crate::reconcile::ProgramState;
+        for state in [ProgramState::Applied, ProgramState::Removed] {
+            let previous = program_report(state, "");
+            let last_sent = sent_status(&previous, 5);
+            let current = program_report(ProgramState::Unchanged, "");
+            assert!(
+                super::tick_config_status(
+                    Some(&last_sent),
+                    Some(5),
+                    &tick_status(Some(5), current, None)
+                )
+                .is_none(),
+                "{state:?} -> Unchanged must not be reported"
+            );
+        }
+    }
+
+    #[test]
+    fn tick_config_status_is_some_when_a_programs_detail_changes() {
+        use crate::reconcile::ProgramState;
+        let previous = program_report(ProgramState::Conflict, "conflict at a");
+        let last_sent = sent_status(&previous, 6);
+        let current = program_report(ProgramState::Conflict, "conflict at b");
+
+        let status = super::tick_config_status(
+            Some(&last_sent),
+            Some(6),
+            &tick_status(Some(6), current, None),
+        )
+        .expect("a changed detail must be reported");
+        assert_eq!(status.revision, 6);
+        assert_eq!(status.state, super::ConfigState::Applied as i32);
+        assert!(status.programs_reported);
+    }
+
+    #[test]
+    fn tick_config_status_is_some_with_no_baseline_on_this_stream() {
+        use crate::reconcile::ProgramState;
+        let current = program_report(ProgramState::Applied, "");
+        let status = super::tick_config_status(None, Some(1), &tick_status(Some(1), current, None))
+            .expect(
+                "nothing sent yet on this stream must still be reported once the revision matches",
+            );
+        assert_eq!(status.revision, 1);
+    }
+
+    #[test]
+    fn tick_config_status_reports_a_failed_tick_as_failed_with_programs_reported() {
+        use crate::reconcile::ProgramState;
+        let previous = program_report(ProgramState::Unchanged, "");
+        let last_sent = sent_status(&previous, 7);
+        let current = program_report(ProgramState::Unchanged, "");
+
+        let status = super::tick_config_status(
+            Some(&last_sent),
+            Some(7),
+            &tick_status(Some(7), current, Some("disk full")),
+        )
+        .expect("a failed tick must be reported when its revision matches");
+        assert_eq!(status.revision, 7);
+        assert_eq!(status.state, super::ConfigState::Failed as i32);
+        assert_eq!(status.error, "disk full");
+        assert!(status.programs_reported);
     }
 }
