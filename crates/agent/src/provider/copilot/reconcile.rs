@@ -103,14 +103,21 @@ pub(super) fn plan(
 ) -> anyhow::Result<()> {
     let state_path = json_merge::state_path(path);
     let pairing = proxy.map(|(_, pairing)| pairing);
-    let Some((config, Some(_gateway))) = configured else {
+    let Some((config, Some(gateway))) = configured else {
         remove(path, &state_path, pairing, plan)?;
         return Ok(());
     };
     let Some((listen, pairing)) = proxy else {
+        if crate::reconcile::fail_closed_without_proxy(gateway, plan) {
+            tracing::debug!(
+                path = %path.display(),
+                "programs.copilot is configured but the local LLM proxy is not available; whenProxyUnavailable: failClosed, so the managed Copilot CLI providers are left as they are"
+            );
+            return Ok(());
+        }
         tracing::debug!(
             path = %path.display(),
-            "programs.copilot is configured but the local LLM proxy is not available, so the Copilot CLI is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed Copilot CLI providers"
+            "programs.copilot is configured but the local LLM proxy is not available, so the Copilot CLI is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); whenProxyUnavailable: failOpen, removing the managed Copilot CLI providers"
         );
         plan.inactive(crate::reconcile::PROXY_ABSENT_REASON);
         remove(path, &state_path, None, plan)?;

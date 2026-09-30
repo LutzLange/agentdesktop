@@ -126,9 +126,13 @@ occurrences in `agentgateway.yaml` (`urlRewrite.authority.full` and the backend
 `host`) and restart the gateway (`docker compose -f
 examples/copilot/compose.yaml restart agentgateway`).
 
-While the daemon is not running, VS Code keeps sending its requests, with its
-Copilot tokens, to the loopback port: use this on single-user machines, and
-switch back to own models (or stop VS Code) before removing the daemon.
+While the daemon is not running, or runs without the proxy under the default
+`llmGateway.whenProxyUnavailable: failClosed`, the override stays and Copilot
+Chat fails instead of reaching GitHub past the gateway; with `failOpen` a
+daemon without the proxy removes it and VS Code uses GitHub directly. The
+failing requests still carry VS Code's Copilot tokens to the loopback port:
+use this on single-user machines, and switch back to own models (or stop VS
+Code) before removing the daemon.
 
 ## 6. Drift, conflicts and removal
 
@@ -148,8 +152,12 @@ change before the next.
   is gone (VS Code's `settings.json` is the exception that accepts comments and
   trailing commas). Remove the comment: within one interval everything applies
   again (without the tick: at the next restart).
-- **Proxy gone.** Remove `daemon.llmProxy` and restart: the Copilot and VS Code
-  entries are removed and the log says `state="inactive"` with the reason.
+- **Proxy gone.** Remove `daemon.llmProxy` and restart: the log says
+  `state="inactive"` with the reason, and the Copilot and VS Code entries stay
+  (`llmGateway.whenProxyUnavailable: failClosed`, the default), so the CLI's
+  `agentdesktop/gpt-4.1` fails instead of answering. Add
+  `whenProxyUnavailable: failOpen` under `llmGateway` in `config.yaml` and
+  restart: the entries are removed.
 - **Removal.** Remove a program from `programs` and restart: its entries are
   taken out, your own entries stay, and a file the daemon created is deleted
   when nothing else is left.

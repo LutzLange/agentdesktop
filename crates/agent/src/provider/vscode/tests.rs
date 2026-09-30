@@ -5,7 +5,7 @@
 
 use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
 
-use agentdesktop_core::config::{LlmGatewayConfig, VsCodeConfig, VsCodeModel};
+use agentdesktop_core::config::{LlmGatewayConfig, ProxyUnavailable, VsCodeConfig, VsCodeModel};
 use serde_json::{Value, json};
 
 use super::reconcile::{chat_models_path, managed_document, plan};
@@ -42,6 +42,7 @@ fn sample_gateway() -> LlmGatewayConfig {
         authentication: None,
         proxy_url: None,
         github_oauth: None,
+        when_proxy_unavailable: Default::default(),
     }
 }
 
@@ -506,11 +507,12 @@ fn removal_when_use_llm_gateway_is_effectively_false() {
 }
 
 #[test]
-fn removal_when_the_loopback_proxy_is_unavailable() {
+fn fail_open_removes_the_entry_when_the_loopback_proxy_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("chatLanguageModels.json");
     let config = sample_config();
-    let gateway = sample_gateway();
+    let mut gateway = sample_gateway();
+    gateway.when_proxy_unavailable = ProxyUnavailable::FailOpen;
     apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
 
     // `ctx.llm_proxy` is `None` (bind failed, proxy off, no pairing) even
@@ -523,6 +525,27 @@ fn removal_when_the_loopback_proxy_is_unavailable() {
         !path.exists(),
         "our vendor entry must be removed when the proxy is unavailable, even if programs.vscode is still configured"
     );
+}
+
+#[test]
+fn fail_closed_keeps_the_entry_when_the_loopback_proxy_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chatLanguageModels.json");
+    let config = sample_config();
+    let gateway = sample_gateway();
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    let state = super::super::json_merge::state_path(&path);
+    let (before, state_before) = (fs::read(&path).unwrap(), fs::read(&state).unwrap());
+
+    let changes = ReconcilePlan::default();
+    plan(&path, None, Some((&config, Some(&gateway))), &changes).unwrap();
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_REASON)
+    );
+    changes.apply().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(fs::read(&state).unwrap(), state_before);
 }
 
 #[test]

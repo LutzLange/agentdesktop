@@ -9,7 +9,9 @@ use std::{
     net::SocketAddr,
 };
 
-use agentdesktop_core::config::{CopilotConfig, CopilotModel, CopilotProvider, LlmGatewayConfig};
+use agentdesktop_core::config::{
+    CopilotConfig, CopilotModel, CopilotProvider, LlmGatewayConfig, ProxyUnavailable,
+};
 use serde_json::{Value, json};
 
 use super::discovery;
@@ -51,6 +53,7 @@ fn sample_gateway() -> LlmGatewayConfig {
         authentication: None,
         proxy_url: None,
         github_oauth: None,
+        when_proxy_unavailable: Default::default(),
     }
 }
 
@@ -578,11 +581,12 @@ fn removal_when_use_llm_gateway_is_effectively_false() {
 }
 
 #[test]
-fn removal_when_the_loopback_proxy_is_unavailable() {
+fn fail_open_removes_the_entries_when_the_loopback_proxy_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("providers.json");
     let config = sample_config();
-    let gateway = sample_gateway();
+    let mut gateway = sample_gateway();
+    gateway.when_proxy_unavailable = ProxyUnavailable::FailOpen;
 
     let changes = ReconcilePlan::default();
     plan(
@@ -604,6 +608,50 @@ fn removal_when_the_loopback_proxy_is_unavailable() {
         !path.exists(),
         "our entries must be removed when the proxy is unavailable, even if programs.copilot is still configured"
     );
+}
+
+#[test]
+fn fail_closed_keeps_the_entries_when_the_loopback_proxy_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    let config = sample_config();
+    let gateway = sample_gateway();
+    assert_eq!(
+        gateway.when_proxy_unavailable,
+        ProxyUnavailable::FailClosed,
+        "the default"
+    );
+    let changes = ReconcilePlan::default();
+    plan(
+        &path,
+        Some((listen_addr(), PAIRING)),
+        Some((&config, Some(&gateway))),
+        &changes,
+    )
+    .unwrap();
+    changes.apply().unwrap();
+    let state = super::super::json_merge::state_path(&path);
+    let (before, state_before) = (fs::read(&path).unwrap(), fs::read(&state).unwrap());
+
+    let changes = ReconcilePlan::default();
+    plan(&path, None, Some((&config, Some(&gateway))), &changes).unwrap();
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_REASON)
+    );
+    changes.apply().unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "the providers stay, pointed at the loopback port"
+    );
+    assert_eq!(fs::read(&state).unwrap(), state_before);
+
+    // Removing the program still removes, whatever the policy.
+    let changes = ReconcilePlan::default();
+    plan(&path, None, None, &changes).unwrap();
+    changes.apply().unwrap();
+    assert!(!path.exists());
 }
 
 // --- plan(): conflicts (criterion 4, 8) -------------------------------------
