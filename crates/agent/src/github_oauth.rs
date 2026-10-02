@@ -86,6 +86,37 @@ async fn acquire(
     store: &SecretStore,
     continuation: Option<(url::Url, Option<std::net::SocketAddr>)>,
 ) -> anyhow::Result<LlmGatewayCredential> {
+    let mut page_started = false;
+    let result = acquire_inner(
+        client,
+        base,
+        client_id,
+        store,
+        &continuation,
+        &mut page_started,
+    )
+    .await;
+    // In a continued flow the browser is already waiting for this page; an
+    // error before it was served would otherwise leave that tab polling.
+    if result.is_err() && !page_started && continuation.is_some() {
+        match device_page("", continuation.as_ref()).await {
+            Ok((_, status, server)) => finish_page(status, server, false),
+            Err(error) => {
+                tracing::warn!(%error, "could not show the GitHub authorization failure page")
+            }
+        }
+    }
+    result
+}
+
+async fn acquire_inner(
+    client: &reqwest::Client,
+    base: &str,
+    client_id: &str,
+    store: &SecretStore,
+    continuation: &Option<(url::Url, Option<std::net::SocketAddr>)>,
+    page_started: &mut bool,
+) -> anyhow::Result<LlmGatewayCredential> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let stored = store
         .get_optional(SECRET_SERVICE, client_id)?
@@ -96,6 +127,7 @@ async fn acquire(
         if stored.expires_at > now.saturating_add(EXPIRY_SKEW_SECONDS) {
             if continuation.is_some() {
                 let (_, status, server) = device_page("", continuation.as_ref()).await?;
+                *page_started = true;
                 finish_page(status, server, true);
             }
             return Ok(LlmGatewayCredential {
@@ -121,6 +153,7 @@ async fn acquire(
                     let credential = save(store, client_id, response)?;
                     if continuation.is_some() {
                         let (_, status, server) = device_page("", continuation.as_ref()).await?;
+                        *page_started = true;
                         finish_page(status, server, true);
                     }
                     return Ok(credential);
@@ -157,6 +190,7 @@ async fn acquire(
         bail!("GitHub returned an unexpected verification URL");
     }
     let (page_url, status, server) = device_page(&code.user_code, continuation.as_ref()).await?;
+    *page_started = true;
     println!("Open this URL to connect GitHub:\n{page_url}");
     if continuation.is_none()
         && let Err(error) = open::that_detached(&page_url)
@@ -544,5 +578,50 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn continued_flow_shows_failure_when_github_setup_fails() {
+        let app = Router::new().route(
+            "/login/device/code",
+            post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let github = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // The port the OIDC callback page used; the browser tab polls it.
+        let callback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", callback.local_addr().unwrap());
+        drop(callback);
+        let redirect = url::Url::parse(&format!("{origin}/callback")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path()).unwrap();
+        let client = reqwest::Client::new();
+        assert!(
+            acquire(&client, &base, "test-app", &store, Some((redirect, None)))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .get(format!("{origin}/flow-ready"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            client
+                .get(format!("{origin}/status"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "failed"
+        );
+        github.abort();
     }
 }

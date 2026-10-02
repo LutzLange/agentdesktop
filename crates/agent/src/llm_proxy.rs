@@ -44,21 +44,23 @@ const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(600);
 const CREDENTIAL_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// A cached controller credential is not used within this margin of its expiry.
 const CREDENTIAL_EXPIRY_MARGIN: Duration = Duration::from_secs(30);
-/// Longest a controller credential is served from the cache, counted from the
-/// gateway's first answer with it. Together with the wait for that answer this
-/// bounds how long a revoked device keeps using the proxy: revocation is
-/// enforced at issuance, the gateway validates tokens statelessly.
+/// Longest a controller credential is served from the cache, counted from its
+/// fetch. This bounds how long a revoked device keeps using the proxy:
+/// revocation is enforced at issuance, the gateway validates tokens statelessly.
 const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Listener-local cache of controller-issued gateway credentials, one per client
 /// id. A controller fetch is a fresh mTLS connection and round trip; agent-mode
 /// sessions issue bursts of requests, so a short cache keeps them off the
-/// controller. The lock is never held across a fetch: a slow controller delays
-/// only the requests that need a credential, not cache hits on other routes.
+/// controller. Fetches are single-flight per key: concurrent misses wait for
+/// the one fetch in progress and then read its result from the cache. The
+/// entries lock is never held across a fetch, so a slow controller delays only
+/// the requests waiting for that key, not cache hits on other routes.
 /// OIDC credentials never go through here; the secret store is their cache.
 #[derive(Default)]
 pub(crate) struct CredentialCache {
     entries: std::sync::Mutex<std::collections::HashMap<String, CachedCredential>>,
+    flights: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 struct CachedCredential {
@@ -82,6 +84,42 @@ fn now_unix() -> u64 {
 }
 
 impl CredentialCache {
+    /// The lock a fetch for the key holds; one per key, kept for the
+    /// listener's lifetime (keys are client id, gateway and audience).
+    fn flight(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// The cached credential for the key, or one from `fetch`, which is cached
+    /// at once. Single-flight: a caller that finds a fetch in progress waits
+    /// for it and reads its result. Returns the credential and whether it came
+    /// from the cache.
+    async fn get_or_fetch<F, Fut, E>(
+        &self,
+        key: &str,
+        device_id: &str,
+        fetch: F,
+    ) -> Result<(String, bool), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut:
+            std::future::Future<Output = Result<agentdesktop_core::model::LlmGatewayCredential, E>>,
+    {
+        let flight = self.flight(key);
+        let _flight = flight.lock().await;
+        if let Some(credential) = self.get(key, device_id) {
+            return Ok((credential, true));
+        }
+        let fetched = fetch().await?;
+        self.insert(key, device_id, &fetched);
+        Ok((fetched.credential, false))
+    }
+
     /// A cached credential for the key and device, if one is still valid.
     fn get(&self, key: &str, device_id: &str) -> Option<String> {
         let entries = self
@@ -535,14 +573,17 @@ fn bearer_or_header(headers: &HeaderMap, header: &str) -> Option<String> {
         .get(header)
         .or_else(|| headers.get(AUTHORIZATION))
         .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .strip_prefix("Bearer ")
-                .unwrap_or(value)
-                .trim()
-                .to_owned()
-        })
+        .map(|value| strip_bearer(value).trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// The token of a `Bearer` credential; authentication schemes are
+/// case-insensitive (RFC 9110, section 11.1).
+fn strip_bearer(value: &str) -> &str {
+    match value.split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token,
+        _ => value,
+    }
 }
 
 fn upstream_base(gateway: &LlmGatewayConfig, upstream: Upstream) -> &url::Url {
@@ -557,7 +598,7 @@ async fn forward(
     client: &ProxyClient,
     state: &AppState,
     config: &ProxyConfig,
-    cache: &CredentialCache,
+    cache: &Arc<CredentialCache>,
 ) -> Result<Response<ProxyBody>, ProxyError> {
     if !host_is_loopback(request.headers()) {
         return Err(ProxyError::new(
@@ -843,9 +884,10 @@ async fn forward(
         let mut attempt =
             Request::from_parts(request.clone().into_parts().0, Full::new(body.clone()));
         let mut from_cache = false;
-        // A credential fetched for this attempt; cached only once the gateway
-        // has not rejected it, so a bad token is never handed to later requests.
-        let mut fetched_now: Option<agentdesktop_core::model::LlmGatewayCredential> = None;
+        // A credential fetched for this attempt. It is cached right away, so
+        // requests that arrive while this one waits for the model use it too,
+        // and dropped again if the gateway rejects it.
+        let mut fetched_now = false;
         let mut attempt_credential: Option<String> = None;
         if authenticated {
             let cached = cache_key
@@ -861,13 +903,24 @@ async fn forward(
                     // wait below does not cancel it half-way (an OAuth refresh must
                     // finish and be stored). The fetch bounds its own controller
                     // call, so a detached fetch ends by itself; an OIDC acquisition
-                    // may wait for a browser login and is not bounded.
+                    // may wait for a browser login and is not bounded. The task
+                    // holds the key's flight lock, so of concurrent misses one
+                    // fetches and the others find its credential in the cache.
                     let fetch = {
                         let state = state.clone();
                         let effective = effective.clone();
                         let client_id = client_id.clone();
+                        let cache = cache.clone();
+                        let cache_key = cache_key.clone();
                         tokio::spawn(async move {
-                            api::gateway_credential(&state, &effective, &client_id, false).await
+                            let fetch =
+                                || api::gateway_credential(&state, &effective, &client_id, false);
+                            match &cache_key {
+                                Some((key, device_id)) => {
+                                    cache.get_or_fetch(key, device_id, fetch).await
+                                }
+                                None => fetch().await.map(|fetched| (fetched.credential, false)),
+                            }
                         })
                     };
                     let outcome = if controller_issued {
@@ -890,8 +943,9 @@ async fn forward(
                             ))
                         })?
                         .map_err(ProxyError::credential)?;
-                    let credential = fetched.credential.clone();
-                    fetched_now = Some(fetched);
+                    let (credential, cached) = fetched;
+                    from_cache = cached;
+                    fetched_now = !cached;
                     credential
                 }
             };
@@ -946,10 +1000,11 @@ async fn forward(
             retried = true;
             continue;
         }
-        if response.status() != StatusCode::UNAUTHORIZED
-            && let (Some(fetched), Some((key, device_id))) = (&fetched_now, &cache_key)
+        if response.status() == StatusCode::UNAUTHORIZED
+            && fetched_now
+            && let (Some((key, _)), Some(rejected)) = (&cache_key, &attempt_credential)
         {
-            cache.insert(key, device_id, fetched);
+            cache.invalidate_if(key, rejected);
         }
         let mut response = response;
         strip_hop_headers(response.headers_mut());
@@ -1000,6 +1055,25 @@ mod tests {
 
     // Covers the real socket path, credential replacement/rotation, opaque bytes,
     // header forwarding, and delivery before the upstream response is complete.
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        for value in ["Bearer tok", "bearer tok", "BEARER tok", "tok"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+            assert_eq!(
+                bearer_or_header(&headers, "x-llm-token").as_deref(),
+                Some("tok"),
+                "{value}"
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-llm-token", HeaderValue::from_static("bearer gho_x"));
+        assert_eq!(
+            bearer_or_header(&headers, "x-llm-token").as_deref(),
+            Some("gho_x")
+        );
+    }
+
     #[tokio::test]
     async fn streams_opaque_requests_with_current_credentials() {
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -2107,6 +2181,48 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_share_one_fetch_per_key() {
+        let far = now_unix() + 3600;
+        let cache = Arc::new(CredentialCache::default());
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for key in ["a", "a", "a", "a", "a", "b", "b"] {
+            let cache = cache.clone();
+            let fetches = fetches.clone();
+            tasks.spawn(async move {
+                cache
+                    .get_or_fetch(key, "device-1", || async move {
+                        let n = fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok::<_, ()>(agentdesktop_core::model::LlmGatewayCredential {
+                            credential: format!("{key}{n}"),
+                            expires_at_unix_seconds: far,
+                        })
+                    })
+                    .await
+                    .map(|(credential, _)| (key, credential))
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            results.push(result.unwrap().unwrap());
+        }
+        // One fetch per key; every caller of a key got that fetch's credential.
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for key in ["a", "b"] {
+            let mut credentials: Vec<_> = results
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, c)| c)
+                .collect();
+            credentials.dedup();
+            assert_eq!(credentials.len(), 1, "{key}: {results:?}");
+        }
+        // Cached at fetch time, before any gateway answer.
+        assert!(cache.get("a", "device-1").is_some());
     }
 
     #[test]

@@ -28,20 +28,19 @@ llm:
       issuer: http://127.0.0.1:5557/dex
       audiences: [agentdesktop-local]
       jwks:
-        url: http://localhost:5557/dex/keys
-    transformations:
-      request:
-        set:
-          authorization: |
-            "Bearer " + request.headers['x-llm-token']
+        url: http://dex:5557/dex/keys
   models:
   # Claude desktop requires an explicit model
-  - name: "gpt-6-luna"
-    provider: copilot
+  - name: "claude-haiku-4-5"
+    provider: anthropic
     params:
-      model: gpt-5.6-luna
-    requestHeaders:
-      set:
-        copilot-integration-id: copilot-developer-cli
-    auth:
-      credentials: []
+      apiKey: $ANTHROPIC_API_KEY
+  - name: "claude-sonnet-4-5"
+    provider: anthropic
+    params:
+      apiKey: $ANTHROPIC_API_KEY
+  # Claude code will not query our models and is fine with passthrough
+  - name: "*"
+    provider: anthropic
+    params:
+      apiKey: $ANTHROPIC_API_KEY

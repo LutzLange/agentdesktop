@@ -404,7 +404,7 @@
           ]
         },
         "proxyUrl": {
-          "description": "Base URL the local LLM proxy forwards to, when it differs from `url`.\n\n`url` is shared by every program that sets `useLlmGateway`, so it can\nonly carry one path prefix. A gateway that puts each provider behind its\nown prefix therefore cannot serve both a program and the proxy from one\nvalue. Setting this leaves `url` to the programs and gives the proxy its\nown target.",
+          "description": "Base URL the local LLM proxy forwards to, when it differs from `url`.\n\n`url` is shared by every program that sets `useLlmGateway`, so it can\nonly carry one path prefix. A gateway that puts each provider behind its\nown prefix therefore cannot serve both a program and the proxy from one\nvalue. Setting this leaves `url` to the programs and gives the proxy its\nown target. The same rules as for `url` apply.",
           "type": [
             "string",
             "null"

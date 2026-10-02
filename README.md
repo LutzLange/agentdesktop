@@ -116,7 +116,7 @@ daemon:
 Then start the daemon as usual:
 
 ```sh
-agentdesktop daemon --user --config examples/standalone/config.yaml
+agentdesktop daemon --user --config <your-config>.yaml
 ```
 
 Point the client's model endpoint at `http://127.0.0.1:4000/v1/chat/completions`,
@@ -210,7 +210,9 @@ the response headers and no total limit on the body; a non-streaming completion
 sends nothing until it is done, so the header limit bounds it too.
 Controller-issued credentials are cached in the daemon for at most 60 s per
 client ID, and are not used within 30 s of their own expiry, nor after a logout
-or re-enrollment. The cache adds no exposure beyond the credential's own
+or re-enrollment. Concurrent requests that find no cached credential share one
+controller fetch; its credential is cached as soon as it arrives and dropped
+again if the gateway rejects it. The cache adds no exposure beyond the credential's own
 lifetime: a token the controller has issued stays valid at the gateway until it
 expires whether or not the daemon caches it, and a logout does not revoke it.
 OIDC credentials are not cached. A controller that does not answer within 15 s

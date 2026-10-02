@@ -200,7 +200,7 @@ pub struct LlmGatewayConfig {
     /// only carry one path prefix. A gateway that puts each provider behind its
     /// own prefix therefore cannot serve both a program and the proxy from one
     /// value. Setting this leaves `url` to the programs and gives the proxy its
-    /// own target.
+    /// own target. The same rules as for `url` apply.
     #[serde(rename = "proxyUrl", default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub proxy_url: Option<Url>,
@@ -837,10 +837,22 @@ fn validate_daemon(
         if gateway.url.query().is_some() || gateway.url.fragment().is_some() {
             anyhow::bail!("LLM gateway URL cannot include a query or fragment");
         }
-        if let Some(proxy_url) = &gateway.proxy_url
-            && (proxy_url.query().is_some() || proxy_url.fragment().is_some())
-        {
-            anyhow::bail!("LLM gateway proxyUrl cannot include a query or fragment");
+        if let Some(proxy_url) = &gateway.proxy_url {
+            if !matches!(proxy_url.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "LLM gateway proxyUrl must use HTTP or HTTPS, got {}",
+                    proxy_url.scheme()
+                );
+            }
+            if proxy_url.host().is_none() {
+                anyhow::bail!("LLM gateway proxyUrl must include a host");
+            }
+            if !proxy_url.username().is_empty() || proxy_url.password().is_some() {
+                anyhow::bail!("LLM gateway proxyUrl cannot include credentials");
+            }
+            if proxy_url.query().is_some() || proxy_url.fragment().is_some() {
+                anyhow::bail!("LLM gateway proxyUrl cannot include a query or fragment");
+            }
         }
         if let Some(github) = &gateway.github_oauth {
             match github.source {
@@ -1322,6 +1334,31 @@ llmGateway:
         .expect_err("invalid gateway should fail");
 
         assert!(error.to_string().contains("must use HTTP or HTTPS"));
+    }
+
+    #[test]
+    fn rejects_an_invalid_llm_gateway_proxy_url() {
+        for (proxy_url, message) in [
+            (
+                "ftp://gateway.example.com",
+                "proxyUrl must use HTTP or HTTPS",
+            ),
+            ("file:///etc/passwd", "proxyUrl must use HTTP or HTTPS"),
+            (
+                "https://user:secret@gateway.example.com",
+                "proxyUrl cannot include credentials",
+            ),
+            (
+                "https://gateway.example.com/?a=b",
+                "proxyUrl cannot include a query",
+            ),
+        ] {
+            let error = parse_daemon(&format!(
+                "llmGateway:\n  url: https://gateway.example.com\n  proxyUrl: {proxy_url}\n"
+            ))
+            .expect_err(proxy_url);
+            assert!(error.to_string().contains(message), "{proxy_url}: {error}");
+        }
     }
 
     #[test]
