@@ -313,7 +313,10 @@ startup stops the daemon from starting, as for the other programs). If the
 daemon's sidecar next to the file is gone, entries under the managed names
 that carry a pairing header are replaced on the next apply, and those that
 carry this daemon's own pairing value are removed when the program goes
-away; entries with another pairing value are left alone. The file is written owner-only. Removing
+away; entries with another pairing value are left alone. The file is written owner-only. The
+daemon's sidecar next to it (`.providers.json.agentdesktop`, owner-only) keeps
+a copy of the file as last written, including the user's own providers and
+their `apiKey` values, until the next apply. Removing
 `programs.copilot`, setting `useLlmGateway: false`, or running without the
 proxy takes the managed entries out again and restores the user's file with
 its previous mode (deleted only if the daemon created it and nothing else is
@@ -441,7 +444,11 @@ that the proxy tunnels: the gateway identity is checked once, at the upgrade,
 and the tunnel stays open until either side closes it or the gateway
 credential it was opened with expires (its own expiry, typically the
 controller JWT's; a re-enrollment or logout does not cut an open
-conversation). Everything else VS Code sends goes to the gateway and on to
+conversation). With the controller's default `gatewayJwt.lifetime` of 5
+minutes, and a credential that may have been cached for up to 60 s, a tunnel
+is closed after 4 to 5 minutes, also in the middle of a turn; whether VS Code
+then reconnects without the user noticing has not been verified. A longer
+lifetime lengthens the tunnel and the revocation window together. Everything else VS Code sends goes to the gateway and on to
 GitHub unchanged, including its `Copilot-Session-Token` (the Auto session
 token) and its machine and device ids; gateway access logs that record request
 headers see them. Quota headers from GitHub pass through, so VS Code's usage
@@ -471,10 +478,12 @@ The daemon edits the file in place: the override and the two ignore entries
 are the only text it changes (new properties go at the top of the object),
 and comments, trailing commas, key order, indentation, line endings and a
 leading byte-order mark stay as they are; removal takes out exactly what the apply added, so a file the
-daemon only added keys to returns to its earlier content. One exception: a
+daemon only added keys to returns to its earlier content. Exceptions: a
 file written on a single line (`{ "a": 1 }`) is expanded to one property per
-line when keys are added and stays expanded after removal; VS Code itself
-always writes one property per line. The sidecar holds no
+line when keys are added and stays expanded after removal, an empty object
+written over several lines comes back as `{}`, and a file that holds only
+comments keeps them and gains `{}`. VS Code itself always writes one property
+per line. The sidecar holds no
 copy of the file, only the override's earlier value and which ignore entries
 the daemon added. A conflict (the file is not valid VS Code JSONC, meaning
 anything beyond comments and trailing commas such as a missing comma or a
