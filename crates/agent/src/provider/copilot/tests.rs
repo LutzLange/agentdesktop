@@ -890,6 +890,26 @@ fn an_orphaned_managed_provider_with_a_pairing_header_is_replaced_not_a_conflict
 }
 
 #[test]
+fn orphan_removal_does_not_add_a_missing_models_key() {
+    // No sidecar and no `models` key: removing our providers by their pairing
+    // header must not invent `"models": null` in the user's file.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    let document = json!({
+        "providers": [
+            {"name": super::PROVIDER_OPENAI, "headers": {"x-agentdesktop-pairing": PAIRING}},
+            {"name": "mine", "baseUrl": "https://example.com"}
+        ]
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    apply_removal(&path).apply().unwrap();
+    assert_eq!(
+        read(&path),
+        json!({"providers": [{"name": "mine", "baseUrl": "https://example.com"}]})
+    );
+}
+
+#[test]
 fn a_file_recreated_by_the_daemon_after_the_user_deleted_theirs_is_removed_whole() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("providers.json");

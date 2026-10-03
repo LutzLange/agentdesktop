@@ -243,14 +243,15 @@ fn plan_remove_orphaned(path: &Path, pairing: &str, plan: &ReconcilePlan) -> any
         return Ok(());
     }
     let mut remaining = Value::Object(current);
-    if let Some(entries) = remaining["providers"].as_array_mut() {
+    // get_mut: indexing a mutable Value inserts a missing key as null.
+    if let Some(entries) = remaining.get_mut("providers").and_then(Value::as_array_mut) {
         entries.retain(|provider| {
             !provider["name"]
                 .as_str()
                 .is_some_and(|name| orphaned.iter().any(|own| own == name))
         });
     }
-    if let Some(entries) = remaining["models"].as_array_mut() {
+    if let Some(entries) = remaining.get_mut("models").and_then(Value::as_array_mut) {
         entries.retain(|model| {
             !model["provider"]
                 .as_str()
