@@ -32,7 +32,7 @@ use crate::{
 
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// RFC 8628 section 3.2: clients poll every 5 seconds unless told otherwise.
-const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// RFC 8628 section 3.5: `slow_down` increases the interval by 5 seconds.
 const DEVICE_POLL_SLOW_DOWN: Duration = Duration::from_secs(5);
 const DEVICE_CODE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -497,8 +497,8 @@ fn classify_device_token_error(body: &[u8]) -> DevicePoll {
     match error.error.as_str() {
         "authorization_pending" => DevicePoll::Pending,
         "slow_down" => DevicePoll::SlowDown,
-        "access_denied" => DevicePoll::Failed("device enrollment was denied".to_owned()),
-        "expired_token" => DevicePoll::Failed("device enrollment code expired".to_owned()),
+        "access_denied" => DevicePoll::Failed("device authorization was denied".to_owned()),
+        "expired_token" => DevicePoll::Failed("device authorization code expired".to_owned()),
         other => DevicePoll::Failed(match error.error_description {
             Some(description) => format!("OIDC token endpoint returned {other}: {description}"),
             None => format!("OIDC token endpoint returned {other}"),
@@ -506,7 +506,7 @@ fn classify_device_token_error(body: &[u8]) -> DevicePoll {
     }
 }
 
-async fn poll_device_token(
+pub(crate) async fn poll_device_token(
     token_endpoint: &str,
     client_id: &str,
     device_code: &str,
@@ -516,10 +516,14 @@ async fn poll_device_token(
     let deadline = tokio::time::Instant::now() + expires_in;
     let client = reqwest::Client::new();
     loop {
-        tokio::time::sleep(interval).await;
+        // Never sleep past the deadline. The interval is IdP-controlled and grows by
+        // DEVICE_POLL_SLOW_DOWN on every slow_down, so it can exceed what's left of
+        // expires_in; sleeping the full interval would then keep the task (and any
+        // pending login it represents) alive long after the code expired.
+        tokio::time::sleep_until((tokio::time::Instant::now() + interval).min(deadline)).await;
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            bail!("device enrollment code expired before it was approved");
+            bail!("device authorization code expired before it was approved");
         }
         // Bound the request (connect through response body) by whatever's left of
         // expires_in, not just the pre-request deadline check above. Without this, a
@@ -876,6 +880,28 @@ mod tests {
     };
     use crate::identity::{Identity, OAuthCredentials};
 
+    // The poll interval is provider-controlled and grows on every slow_down, so it can
+    // exceed what is left of expires_in. Sleeping the whole interval kept the task, and
+    // the pending login it stands for, alive long after the code had expired.
+    #[tokio::test(start_paused = true)]
+    async fn poll_device_token_does_not_sleep_past_the_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = poll_device_token(
+            "http://127.0.0.1:1/token",
+            "client",
+            "device-code",
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() <= Duration::from_secs(6),
+            "slept {:?} against a 5s expires_in",
+            started.elapsed()
+        );
+    }
+
     // Regression test for the actual bug this fix targets. The pre-request deadline
     // check only runs again once a request RETURNS, so a peer that accepts the
     // connection and then never answers at all previously left polling stuck past
@@ -945,11 +971,11 @@ mod tests {
         );
         assert_eq!(
             classify_device_token_error(br#"{"error":"expired_token"}"#),
-            DevicePoll::Failed("device enrollment code expired".to_owned())
+            DevicePoll::Failed("device authorization code expired".to_owned())
         );
         assert_eq!(
             classify_device_token_error(br#"{"error":"access_denied"}"#),
-            DevicePoll::Failed("device enrollment was denied".to_owned())
+            DevicePoll::Failed("device authorization was denied".to_owned())
         );
         assert_eq!(
             classify_device_token_error(

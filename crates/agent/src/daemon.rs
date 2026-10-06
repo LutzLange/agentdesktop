@@ -436,6 +436,12 @@ where
         reconciler
             .apply(&initial_config)
             .context("apply initial daemon configuration")?;
+        // With a controller, the cached controller configuration is what is in effect
+        // from here, and start_gateway_authentication above only saw the local file.
+        // Without one the two are the same configuration and it already ran.
+        if config.controller.is_some() {
+            gateway_oidc::start_device_login_if_configured(&initial_config, &args.state_dir);
+        }
     } else {
         tracing::info!(
             "preserving managed files until the controller provides daemon configuration"
@@ -755,8 +761,23 @@ fn start_gateway_authentication(
                 redirect_uri,
                 scopes,
                 allow_insecure,
+                device_authorization,
             }) = authentication
             {
+                if device_authorization {
+                    // Logs the verification URL and code, then signs in in the
+                    // background once the user approves from any device.
+                    tracing::info!(%issuer, "starting LLM gateway OIDC device authorization");
+                    gateway_oidc::device_login(
+                        &issuer,
+                        &client_id,
+                        &scopes,
+                        allow_insecure,
+                        &state_dir,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 tracing::info!(%issuer, "starting LLM gateway OIDC authentication");
                 let acquired = gateway_oidc::credential(
                     &issuer,
@@ -777,6 +798,7 @@ fn start_gateway_authentication(
                                 .then(|| github.client_id.clone())
                                 .flatten()
                         }),
+                        device_authorization: false,
                     },
                 )
                 .await?;
