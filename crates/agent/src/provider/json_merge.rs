@@ -173,7 +173,7 @@ pub(super) fn plan_merge_with(
     // An unchanged file that grants more than `options.mode` is rewritten
     // with the same bytes at that mode (the plan skips identical writes
     // otherwise).
-    let looser = current_mode(path).is_some_and(|mode| mode & !options.mode & 0o777 != 0);
+    let looser = crate::reconcile::grants_beyond(path, options.mode);
     let action = match existing.as_deref() {
         Some(existing) if existing == contents && !looser => "unchanged",
         Some(_) => "update",

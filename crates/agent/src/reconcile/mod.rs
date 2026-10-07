@@ -1,6 +1,7 @@
 //! Shared reconciliation orchestration, plan application, and dry-run reporting.
-mod plan;
+pub(crate) mod plan;
 pub use plan::ReconcilePlan;
+pub(crate) use plan::grants_beyond;
 
 use crate::provider::{
     Provider, ReconcileContext, claude_code::ClaudeCode, claude_desktop::ClaudeDesktop,
@@ -207,29 +208,30 @@ impl Reconciler {
         &self,
         config: &DaemonConfig,
     ) -> (Option<ApplyReport>, ApplyReport, anyhow::Result<()>) {
-        let (previous, report, result) = self
-            .apply_read_under_lock(|| Some(Arc::new(config.clone())))
+        let ((), previous, report, result) = self
+            .apply_read_under_lock(|| Some(((), Arc::new(config.clone()))))
             .expect("a configuration was given");
         (previous, report, result)
     }
 
-    /// Takes the apply lock, then reads the configuration to apply, so a
+    /// Takes the apply lock, then reads the configuration to apply (with
+    /// whatever `read` returns alongside it, such as its revision), so a
     /// configuration pushed while this call waited for the lock is the one
     /// applied (a tick never re-applies an older revision after a push).
     /// `None` from `read` applies nothing.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn apply_read_under_lock(
+    pub(crate) fn apply_read_under_lock<T>(
         &self,
-        read: impl FnOnce() -> Option<Arc<DaemonConfig>>,
-    ) -> Option<(Option<ApplyReport>, ApplyReport, anyhow::Result<()>)> {
+        read: impl FnOnce() -> Option<(T, Arc<DaemonConfig>)>,
+    ) -> Option<(T, Option<ApplyReport>, ApplyReport, anyhow::Result<()>)> {
         let mut last = self
             .last_apply
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = read()?;
+        let (value, config) = read()?;
         let (report, result) = self.plan_with_report(&config).apply();
         let previous = last.replace(report.clone());
-        Some((previous, report, result))
+        Some((value, previous, report, result))
     }
 }
 

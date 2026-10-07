@@ -537,7 +537,7 @@ pub(super) fn plan(
 
     // An unchanged file is not rewritten, unless its mode lets others read
     // it (VS Code saves it 664): then the same bytes are written 0600.
-    let looser = json_merge::current_mode(path).is_some_and(|mode| mode & !FILE_MODE & 0o777 != 0);
+    let looser = crate::reconcile::grants_beyond(path, FILE_MODE);
     let action = match text {
         None => "create",
         Some(text) if text == edited && !looser => "unchanged",
@@ -549,8 +549,7 @@ pub(super) fn plan(
         .with_context(|| format!("serialize {} {DESCRIPTION} state", VsCode::DISPLAY_NAME))?;
     state_bytes.push(b'\n');
     // An identical sidecar is rewritten only when its mode lets others read it.
-    let looser_sidecar =
-        json_merge::current_mode(&state_path).is_some_and(|mode| mode & !FILE_MODE & 0o777 != 0);
+    let looser_sidecar = crate::reconcile::grants_beyond(&state_path, FILE_MODE);
     if sidecar.as_deref() != Some(state_bytes.as_slice()) || looser_sidecar {
         plan.write_file(&state_path, &state_bytes, FILE_MODE)?;
     }

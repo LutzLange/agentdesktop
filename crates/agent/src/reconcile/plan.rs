@@ -333,28 +333,174 @@ fn already_in_place(
     permissions: u32,
     observed: &BTreeMap<PathBuf, Option<Vec<u8>>>,
 ) -> bool {
-    if observed.get(path).and_then(Option::as_deref) != Some(contents) {
-        return false;
-    }
+    // A file gone since it was observed is written again.
+    observed.get(path).and_then(Option::as_deref) == Some(contents)
+        && fs::metadata(path).is_ok()
+        && !grants_beyond(path, permissions)
+}
+
+/// Whether the file at `path` grants a permission bit outside `mode`.
+/// Unix: the current mode has a bit outside `mode`. A missing file, and any
+/// file on non-Unix, is false.
+pub(crate) fn grants_beyond(path: &Path, mode: u32) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        match fs::metadata(path) {
-            Ok(metadata) => metadata.permissions().mode() & !permissions & 0o777 == 0,
-            Err(_) => false,
-        }
+        fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & !mode & 0o777 != 0)
     }
     #[cfg(not(unix))]
     {
-        let _ = permissions;
-        true
+        let _ = (path, mode);
+        false
+    }
+}
+
+/// Shared checks for the planners that write a managed file (C5.1).
+#[cfg(all(test, unix))]
+pub(crate) mod mode_repair {
+    use super::ReconcilePlan;
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::Path,
+    };
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn applied(plan_fn: &dyn Fn(&ReconcilePlan) -> anyhow::Result<()>) {
+        let plan = ReconcilePlan::default();
+        plan_fn(&plan).unwrap();
+        plan.apply().unwrap();
+    }
+
+    /// `plan_fn` plans the program's managed `files`, each planned at
+    /// `planned_mode`. After a first apply every file is loosened to 0666 with
+    /// its bytes untouched; the next plan must record an `update` and the
+    /// apply must restore `planned_mode` on every file.
+    pub(crate) fn assert_identical_bytes_with_looser_mode_is_an_update(
+        files: &[&Path],
+        planned_mode: u32,
+        plan_fn: &dyn Fn(&ReconcilePlan) -> anyhow::Result<()>,
+    ) {
+        applied(plan_fn);
+        let bytes: Vec<_> = files.iter().map(|file| fs::read(file).unwrap()).collect();
+        for file in files {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        let plan = ReconcilePlan::default();
+        plan_fn(&plan).unwrap();
+        let rendered = plan.render();
+        assert!(
+            rendered.contains("UPDATE"),
+            "a loosened mode with identical bytes must be an update: {rendered}"
+        );
+        plan.apply().unwrap();
+
+        for (file, bytes) in files.iter().zip(bytes) {
+            assert_eq!(
+                mode(file),
+                planned_mode,
+                "{} must be rewritten at the planned mode",
+                file.display()
+            );
+            assert_eq!(fs::read(file).unwrap(), bytes);
+        }
+    }
+
+    /// After a first apply every file is tightened to 0600 (within any planned
+    /// mode); the next plan must record no change and must not write.
+    pub(crate) fn assert_identical_bytes_within_mode_is_unchanged(
+        files: &[&Path],
+        plan_fn: &dyn Fn(&ReconcilePlan) -> anyhow::Result<()>,
+    ) {
+        applied(plan_fn);
+        for file in files {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let before: Vec<_> = files
+            .iter()
+            .map(|file| {
+                let metadata = fs::metadata(file).unwrap();
+                (metadata.ino(), metadata.modified().unwrap())
+            })
+            .collect();
+
+        let plan = ReconcilePlan::default();
+        plan_fn(&plan).unwrap();
+        let rendered = plan.render();
+        assert!(
+            !rendered.contains("UPDATE") && !rendered.contains("CREATE"),
+            "an identical file within the planned mode must stay unchanged: {rendered}"
+        );
+        plan.apply().unwrap();
+
+        for (file, (ino, modified)) in files.iter().zip(before) {
+            let metadata = fs::metadata(file).unwrap();
+            assert_eq!(
+                metadata.ino(),
+                ino,
+                "{} must not be replaced",
+                file.display()
+            );
+            assert_eq!(metadata.modified().unwrap(), modified);
+            assert_eq!(mode(file), 0o600, "a stricter mode must be left");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ReconcilePlan;
-    use std::fs;
+    use super::{ReconcilePlan, already_in_place, grants_beyond};
+    use std::{collections::BTreeMap, fs};
+
+    #[test]
+    fn grants_beyond_is_false_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!grants_beyond(&dir.path().join("absent"), 0o600));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grants_beyond_is_false_within_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        fs::write(&path, b"x").unwrap();
+        for current in [0o600, 0o640, 0o644] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(current)).unwrap();
+            assert!(!grants_beyond(&path, 0o644), "{current:o} within 644");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grants_beyond_is_true_with_a_bit_outside_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        fs::write(&path, b"x").unwrap();
+        for (current, planned) in [(0o664, 0o644), (0o644, 0o600), (0o755, 0o644)] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(current)).unwrap();
+            assert!(
+                grants_beyond(&path, planned),
+                "{current:o} beyond {planned:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn already_in_place_still_writes_a_file_removed_after_the_observed_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gone");
+        let observed = BTreeMap::from([(path.clone(), Some(b"hello\n".to_vec()))]);
+        assert!(
+            !already_in_place(&path, b"hello\n", 0o644, &observed),
+            "a file that no longer exists must be written"
+        );
+    }
 
     #[test]
     fn identical_write_is_skipped_same_inode_and_mtime() {
