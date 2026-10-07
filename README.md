@@ -140,7 +140,11 @@ Avoid repeating `/v1` in both URLs.
 programs that use the proxy (`programs.copilot`, `programs.vscode`). With
 `failClosed`, the default, the daemon leaves their managed entries as they
 are: the Copilot CLI and VS Code stay pointed at the loopback port, and those
-requests fail instead of reaching GitHub past the gateway. If the address could
+requests fail instead of reaching GitHub past the gateway. This needs entries
+to be in place: on a first apply without the proxy, or after the entries were
+removed by hand, nothing points at the loopback port, so VS Code on GitHub's
+models talks to GitHub directly and the Copilot CLI and VS Code on own models
+have no gateway models; the status says so. If the address could
 not be bound because another process holds it, that process receives those
 requests, with VS Code's Copilot tokens and the pairing value: use the default
 on devices with a single user, as for the proxy in general. With
@@ -348,7 +352,10 @@ startup stops the daemon from starting, as for the other programs). If the
 daemon's sidecar next to the file is gone, entries under the managed names
 that carry a pairing header are replaced on the next apply, and those that
 carry this daemon's own pairing value are removed when the program goes
-away; entries with another pairing value are left alone. The file is written owner-only. The
+away; entries with another pairing value are left alone. While the daemon runs
+without the proxy it has no pairing of its own, so any pairing value counts
+(only an agentdesktop daemon writes that header). The file is written
+owner-only. The
 daemon's sidecar next to it (`.providers.json.agentdesktop`, owner-only) keeps
 a copy of the file as last written, including the user's own providers and
 their `apiKey` values, until the next apply. Removing
@@ -432,7 +439,8 @@ resolved (and stops the daemon at startup, as for the other programs); an
 empty file is filled. If the daemon's sidecar next to the file is gone, an
 `agentdesktop` entry carrying a pairing header is replaced on the next apply,
 and one carrying this daemon's own pairing value is removed when the program
-goes away. Pass-through
+goes away (while the daemon runs without the proxy, one carrying any pairing
+value). Pass-through
 model keys are written as given, so a misspelt key reaches VS Code unchanged.
 The daemon's sidecar next to the file (`.chatLanguageModels.json.agentdesktop`,
 owner-only) keeps a copy of the file as last written, including the user's
@@ -672,7 +680,7 @@ device-wide state. The device page in the controller lists them under
 | `unchanged` | The program is configured and nothing needed to change. |
 | `removed` | The program is no longer configured and its managed content was removed. |
 | `conflict` | A managed file holds configuration the daemon will not overwrite; the detail names the file. |
-| `inactive` | The program uses the LLM gateway but the local LLM proxy is not running (see `llmProxy.error` in daemon-info): its entries were left pointing at the loopback port (`whenProxyUnavailable: failClosed`, the default) or removed (`failOpen`). |
+| `inactive` | The program uses the LLM gateway but the local LLM proxy is not running (see `llmProxy.error` in daemon-info): its entries were left pointing at the loopback port (`whenProxyUnavailable: failClosed`, the default; the detail says when no entries were in place, so the tool keeps its own settings) or removed (`failOpen`). |
 | `blocked` | The program had changes, but none were written because another program conflicted or failed; the detail names that program. |
 | `failed` | Planning or writing this program failed; the detail carries the error. |
 

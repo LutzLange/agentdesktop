@@ -235,10 +235,6 @@ impl Reconciler {
     }
 }
 
-/// The reason recorded for a program that uses the gateway while the local
-/// LLM proxy is absent.
-pub(crate) const PROXY_ABSENT_REASON: &str = "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen";
-
 /// The `inactive` detail under `llmGateway.whenProxyUnavailable: failClosed`,
 /// when a program behind the local LLM proxy keeps its managed entries.
 pub(crate) const FAIL_CLOSED_REASON: &str = concat!(
@@ -246,16 +242,36 @@ pub(crate) const FAIL_CLOSED_REASON: &str = concat!(
     "; the managed entries stay and the tool fails until the proxy is back (whenProxyUnavailable: failClosed)"
 );
 
-/// Under `failClosed`, marks the program `inactive` and returns `true`: the
-/// caller leaves its managed files as they are.
+/// The `inactive` detail under `failClosed` when nothing of the daemon's is
+/// in the file, so the tool keeps its own settings.
+pub(crate) const FAIL_CLOSED_NOT_IN_PLACE_REASON: &str = concat!(
+    "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen",
+    "; no managed entries are in place, so the tool keeps its own settings until the proxy is back (whenProxyUnavailable: failClosed)"
+);
+
+/// The `inactive` detail under `failOpen`: the managed entries are removed.
+pub(crate) const FAIL_OPEN_REASON: &str = concat!(
+    "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen",
+    "; the managed entries are removed until the proxy is back (whenProxyUnavailable: failOpen)"
+);
+
+/// Under `failClosed`, marks the program `inactive` (with the reason that
+/// matches `in_place`, which reads the file and is called only under
+/// `failClosed`) and returns `true`: the caller leaves its managed files as
+/// they are.
 pub(crate) fn fail_closed_without_proxy(
     gateway: &agentdesktop_core::config::LlmGatewayConfig,
     plan: &ReconcilePlan,
+    in_place: impl FnOnce() -> bool,
 ) -> bool {
     if gateway.when_proxy_unavailable != agentdesktop_core::config::ProxyUnavailable::FailClosed {
         return false;
     }
-    plan.inactive(FAIL_CLOSED_REASON);
+    plan.inactive(if in_place() {
+        FAIL_CLOSED_REASON
+    } else {
+        FAIL_CLOSED_NOT_IN_PLACE_REASON
+    });
     true
 }
 

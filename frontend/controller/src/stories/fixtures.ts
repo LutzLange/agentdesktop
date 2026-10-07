@@ -290,7 +290,7 @@ export const failedDeviceDetail: DeviceDetail = {
       program: "copilot",
       state: "inactive",
       detail:
-        "local LLM proxy not available; see llmProxy.error in daemon-info",
+        "local LLM proxy not available; see llmProxy.error in daemon-info, or set daemon.llmProxy.listen; the managed entries stay and the tool fails until the proxy is back (whenProxyUnavailable: failClosed)",
       revision: 12,
       updated_at: now - 60,
     },

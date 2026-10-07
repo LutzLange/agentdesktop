@@ -1712,3 +1712,65 @@ fn a_sidecar_with_a_byte_order_mark_is_read() {
 
     assert_eq!(read(&path)[OVERRIDE_KEY], SECRET);
 }
+
+// --- failClosed in place, failOpen reason -----------------------------------
+
+#[test]
+fn fail_closed_first_apply_reports_not_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+
+    let changes = apply_removal(&path, None, Some((&config, Some(&gateway))));
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_NOT_IN_PLACE_REASON)
+    );
+    changes.apply().unwrap();
+    assert!(
+        !path.exists(),
+        "nothing is written when nothing is in place"
+    );
+    assert!(!json_merge::state_path(&path).exists());
+}
+
+#[test]
+fn fail_open_reports_the_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_user_settings(&path, &json!({"editor.fontSize": 14}));
+    let config = github_models_config();
+    let mut gateway = gateway_with_proxy();
+    gateway.when_proxy_unavailable = ProxyUnavailable::FailOpen;
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+
+    let changes = apply_removal(&path, None, Some((&config, Some(&gateway))));
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_OPEN_REASON)
+    );
+}
+
+#[test]
+fn fail_closed_after_the_user_removed_the_override_reports_not_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_user_settings(&path, &json!({"editor.fontSize": 14}));
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    assert!(read(&path).get(OVERRIDE_KEY).is_some());
+
+    // The user deletes the override, keeping their own keys.
+    write_user_settings(&path, &json!({"editor.fontSize": 14}));
+    let before = fs::read(&path).unwrap();
+
+    let changes = apply_removal(&path, None, Some((&config, Some(&gateway))));
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_NOT_IN_PLACE_REASON)
+    );
+    changes.apply().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before, "nothing is written");
+}

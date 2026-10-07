@@ -205,8 +205,9 @@ export function ConfigurationView({
                         <strong>Fail open without the local proxy</strong>
                         <small>
                           Off (default): while the local proxy is down, Copilot
-                          fails instead of reaching GitHub past the gateway. On:
-                          the Copilot entries are removed until it is back.
+                          fails instead of reaching GitHub past the gateway,
+                          once the daemon has pointed it at the proxy. On: the
+                          Copilot entries are removed until it is back.
                         </small>
                       </span>
                       <input
