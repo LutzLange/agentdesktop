@@ -170,8 +170,12 @@ pub(super) fn plan_merge_with(
     let mut contents = serde_json::to_vec_pretty(&combined)
         .with_context(|| format!("serialize merged {display_name}"))?;
     contents.push(b'\n');
+    // An unchanged file that grants more than `options.mode` is rewritten
+    // with the same bytes at that mode (the plan skips identical writes
+    // otherwise).
+    let looser = crate::reconcile::grants_beyond(path, options.mode);
     let action = match existing.as_deref() {
-        Some(existing) if existing == contents => "unchanged",
+        Some(existing) if existing == contents && !looser => "unchanged",
         Some(_) => "update",
         None => "create",
     };
@@ -336,8 +340,18 @@ fn read_state(
     plan: &ReconcilePlan,
 ) -> anyhow::Result<Option<MergeState>> {
     match plan.read(path) {
+        // The parse error names the position only: serde's message can quote
+        // a value from the file, and the sidecar holds managed content (a
+        // pairing value, a credential helper command).
         Ok(contents) => serde_json::from_slice(&contents)
-            .with_context(|| format!("parse {display_name} merge state from {}", path.display()))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "parse {display_name} merge state from {}: not a valid merge state (line {}, column {})",
+                    path.display(),
+                    error.line(),
+                    error.column()
+                )
+            })
             .map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error)
@@ -873,5 +887,58 @@ mod tests {
         assert!(plan.has_conflicts(), "{}", plan.render());
         assert!(plan.apply().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"42\n");
+    }
+
+    // --- No-op writes skipped --------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn a_looser_mode_with_identical_bytes_is_recorded_as_update_and_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chatLanguageModels.json");
+        let state = state_path(&path);
+        let options = root_array_options(); // mode 0600
+
+        let managed = json!([{"name": "agentdesktop"}]);
+        let plan = ReconcilePlan::default();
+        plan_merge_with(
+            &path,
+            &state,
+            managed.clone(),
+            false,
+            "chat models",
+            "Test",
+            options,
+            &plan,
+        )
+        .unwrap();
+        plan.apply().unwrap();
+
+        // VS Code (or another program) saves the file at a looser mode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+        let plan = ReconcilePlan::default();
+        plan_merge_with(
+            &path,
+            &state,
+            managed,
+            false,
+            "chat models",
+            "Test",
+            options,
+            &plan,
+        )
+        .unwrap();
+        assert!(
+            plan.render().contains("UPDATE"),
+            "a file looser than the planned mode must be treated as an update, \
+             not unchanged: {}",
+            plan.render()
+        );
+        plan.apply().unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the loosened file must be tightened");
     }
 }

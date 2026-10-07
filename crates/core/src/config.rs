@@ -91,6 +91,16 @@ pub struct DaemonStartupConfig {
     /// Local loopback LLM proxy.
     #[serde(default)]
     pub llm_proxy: LlmProxyStartupConfig,
+    /// Opt-in interval between periodic re-applies of the current
+    /// configuration, which repair drift (a managed file deleted or edited by
+    /// hand, a fixed conflict, a loosened mode) without rewriting anything
+    /// unchanged. Unset means no periodic re-apply; a controller-managed
+    /// device still re-applies the controller's configuration on every
+    /// reconnect. Must be greater than zero and at most 30 days; read at
+    /// startup only (restart the daemon after changing it).
+    #[serde(default, with = "humantime_serde::option")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub reconcile_interval: Option<Duration>,
 }
 
 /// Local loopback LLM proxy settings. User mode only: the proxy hands out the
@@ -242,6 +252,36 @@ pub struct LlmGatewayConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub github_oauth: Option<GitHubOAuthConfig>,
+    /// What the programs behind the local LLM proxy (`programs.copilot`,
+    /// `programs.vscode`) do while the daemon runs without that proxy:
+    /// `failClosed` (the default) leaves their managed entries in place, so
+    /// the tools stay pointed at the loopback port and fail instead
+    /// of falling back to GitHub past the gateway (with no entries in place
+    /// yet, the tools keep their own settings); `failOpen` removes them
+    /// until the proxy is back (VS Code on `githubModels` then talks to GitHub
+    /// directly, the Copilot CLI and VS Code on `ownModels` lose the gateway's
+    /// models).
+    #[serde(default, skip_serializing_if = "ProxyUnavailable::is_default")]
+    pub when_proxy_unavailable: ProxyUnavailable,
+}
+
+/// The `llmGateway.whenProxyUnavailable` policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyUnavailable {
+    /// Keep the managed entries: the tools fail instead of bypassing the
+    /// gateway.
+    #[default]
+    FailClosed,
+    /// Remove the managed entries until the proxy is back.
+    FailOpen,
+}
+
+impl ProxyUnavailable {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// GitHub App user authorization for Copilot requests through the local proxy.
@@ -1153,6 +1193,9 @@ pub fn parse_daemon(contents: &str) -> anyhow::Result<DaemonConfig> {
     Ok(config)
 }
 
+/// The longest accepted `daemon.reconcileInterval`.
+const MAX_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 fn parse_local_daemon(contents: &str) -> anyhow::Result<DaemonConfig> {
     let config: DaemonConfig =
         crate::serdes::yamlviajson::from_str(contents).context("parse daemon configuration")?;
@@ -1163,6 +1206,16 @@ fn parse_local_daemon(contents: &str) -> anyhow::Result<DaemonConfig> {
     }
     if config.inventory_interval.is_zero() {
         anyhow::bail!("inventoryInterval must be greater than zero");
+    }
+    if config
+        .daemon
+        .as_ref()
+        .and_then(|daemon| daemon.reconcile_interval)
+        .is_some_and(|interval| interval.is_zero() || interval > MAX_RECONCILE_INTERVAL)
+    {
+        anyhow::bail!(
+            "daemon.reconcileInterval must be greater than zero and at most 30 days (leave it unset for no periodic re-apply)"
+        );
     }
     validate_daemon(
         config.llm_gateway.as_ref(),
@@ -1519,6 +1572,51 @@ programs: { claudeCode: { useLlmGateway: false } }
             .expect_err("a zero inventory interval is not schedulable");
         assert!(
             error.to_string().contains("inventoryInterval"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn daemon_reconcile_interval_is_unset_by_default_and_parses_humantime() {
+        let default =
+            super::parse_local_daemon("programs: {}").expect("valid daemon configuration");
+        assert!(default.daemon.is_none());
+
+        let configured = super::parse_local_daemon("daemon:\n  reconcileInterval: 90s\n")
+            .expect("valid daemon configuration");
+        assert_eq!(
+            configured.daemon.unwrap().reconcile_interval,
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn daemon_reconcile_interval_rejects_zero() {
+        let error = super::parse_local_daemon("daemon:\n  reconcileInterval: 0s\n")
+            .expect_err("a zero reconcile interval is not schedulable");
+        assert!(
+            error.to_string().contains("daemon.reconcileInterval"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn daemon_reconcile_interval_rejects_more_than_thirty_days() {
+        assert!(super::parse_local_daemon("daemon:\n  reconcileInterval: 30days\n").is_ok());
+        let error = super::parse_local_daemon("daemon:\n  reconcileInterval: 31days\n")
+            .expect_err("an interval beyond 30 days is refused");
+        assert!(
+            error.to_string().contains("daemon.reconcileInterval"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn daemon_reconcile_interval_is_rejected_in_pushed_configuration() {
+        let error = parse_daemon("daemon:\n  reconcileInterval: 5m\nprograms: {}")
+            .expect_err("daemon.* is local-only, like every other startup setting");
+        assert!(
+            error.to_string().contains("only allowed in the local"),
             "unexpected error: {error}"
         );
     }

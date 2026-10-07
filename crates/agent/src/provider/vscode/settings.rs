@@ -489,8 +489,11 @@ pub(super) fn read_state(bytes: &[u8]) -> Option<SettingsState> {
 ///
 /// Edits only when the program is set with `copilotChat: githubModels`,
 /// uses the gateway, the gateway has `proxyUrl` and the loopback proxy is
-/// available; removes the managed keys otherwise (with a warning when the
-/// proxy is the missing part), the same decision shape as `reconcile::plan`.
+/// available; removes the managed keys otherwise, the same decision shape as
+/// `reconcile::plan`. The one exception is the proxy being the missing part:
+/// then `llmGateway.whenProxyUnavailable` decides, and `failClosed` (the default) leaves
+/// the file as it is, so VS Code stays pointed at the loopback port
+/// instead of reaching GitHub past the gateway.
 pub(super) fn plan(
     path: &Path,
     proxy: Option<(SocketAddr, &str)>,
@@ -507,10 +510,22 @@ pub(super) fn plan(
         return remove(path, &state_path, proxy, plan);
     }
     let Some((listen, pairing)) = proxy else {
-        warn!(
+        if let Some((_, Some(gateway))) = configured
+            && crate::reconcile::fail_closed_without_proxy(gateway, plan, || {
+                override_in_place(path, plan)
+            })
+        {
+            debug!(
+                path = %path.display(),
+                "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available; whenProxyUnavailable: failClosed, so settings.json is left as it is"
+            );
+            return Ok(());
+        }
+        tracing::debug!(
             path = %path.display(),
-            "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed settings"
+            "programs.vscode uses copilotChat: githubModels but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); whenProxyUnavailable: failOpen, removing the managed settings"
         );
+        plan.inactive(crate::reconcile::FAIL_OPEN_REASON);
         return remove(path, &state_path, None, plan);
     };
     if let Some(parent) = path
@@ -536,7 +551,7 @@ pub(super) fn plan(
 
     // An unchanged file is not rewritten, unless its mode lets others read
     // it (VS Code saves it 664): then the same bytes are written 0600.
-    let looser = json_merge::current_mode(path).is_some_and(|mode| mode & !FILE_MODE & 0o777 != 0);
+    let looser = crate::reconcile::grants_beyond(path, FILE_MODE);
     let action = match text {
         None => "create",
         Some(text) if text == edited && !looser => "unchanged",
@@ -548,8 +563,7 @@ pub(super) fn plan(
         .with_context(|| format!("serialize {} {DESCRIPTION} state", VsCode::DISPLAY_NAME))?;
     state_bytes.push(b'\n');
     // An identical sidecar is rewritten only when its mode lets others read it.
-    let looser_sidecar =
-        json_merge::current_mode(&state_path).is_some_and(|mode| mode & !FILE_MODE & 0o777 != 0);
+    let looser_sidecar = crate::reconcile::grants_beyond(&state_path, FILE_MODE);
     if sidecar.as_deref() != Some(state_bytes.as_slice()) || looser_sidecar {
         plan.write_file(&state_path, &state_bytes, FILE_MODE)?;
     }
@@ -631,6 +645,34 @@ fn remove(
             .with_context(|| format!("remove {}", state_path.display()))?;
     }
     Ok(())
+}
+
+/// Whether the override points at an agentdesktop loopback CAPI route, so
+/// VS Code goes through the daemon (and fails while the proxy is down). A
+/// missing file is not in place; one that cannot be read or parsed is logged
+/// and counts as not in place.
+fn override_in_place(path: &Path, plan: &ReconcilePlan) -> bool {
+    let bytes = match read_optional(path, plan) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return false,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "reading the VS Code settings file");
+            return false;
+        }
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Ok((_root, object)) = parse_object(split_bom(text).1) else {
+        return false;
+    };
+    object
+        .get(OVERRIDE_KEY)
+        .and_then(|property| property.value())
+        .and_then(|value| value.to_serde_value())
+        .as_ref()
+        .and_then(Value::as_str)
+        .is_some_and(is_daemon_capi_url)
 }
 
 fn conflict(path: &Path, kind: SettingsConflict, plan: &ReconcilePlan) -> anyhow::Result<()> {

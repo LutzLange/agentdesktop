@@ -7,7 +7,9 @@ use std::{
     net::SocketAddr,
 };
 
-use agentdesktop_core::config::{CopilotConfig, CopilotModel, CopilotProvider, LlmGatewayConfig};
+use agentdesktop_core::config::{
+    CopilotConfig, CopilotModel, CopilotProvider, LlmGatewayConfig, ProxyUnavailable,
+};
 use serde_json::{Value, json};
 
 use super::discovery;
@@ -49,6 +51,7 @@ fn sample_gateway() -> LlmGatewayConfig {
         authentication: None,
         proxy_url: None,
         github_oauth: None,
+        when_proxy_unavailable: Default::default(),
     }
 }
 
@@ -575,11 +578,12 @@ fn removal_when_use_llm_gateway_is_effectively_false() {
 }
 
 #[test]
-fn removal_when_the_loopback_proxy_is_unavailable() {
+fn fail_open_removes_the_entries_when_the_loopback_proxy_is_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("providers.json");
     let config = sample_config();
-    let gateway = sample_gateway();
+    let mut gateway = sample_gateway();
+    gateway.when_proxy_unavailable = ProxyUnavailable::FailOpen;
 
     let changes = ReconcilePlan::default();
     plan(
@@ -601,6 +605,50 @@ fn removal_when_the_loopback_proxy_is_unavailable() {
         !path.exists(),
         "our entries must be removed when the proxy is unavailable, even if programs.copilot is still configured"
     );
+}
+
+#[test]
+fn fail_closed_keeps_the_entries_when_the_loopback_proxy_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    let config = sample_config();
+    let gateway = sample_gateway();
+    assert_eq!(
+        gateway.when_proxy_unavailable,
+        ProxyUnavailable::FailClosed,
+        "the default"
+    );
+    let changes = ReconcilePlan::default();
+    plan(
+        &path,
+        Some((listen_addr(), PAIRING)),
+        Some((&config, Some(&gateway))),
+        &changes,
+    )
+    .unwrap();
+    changes.apply().unwrap();
+    let state = super::super::json_merge::state_path(&path);
+    let (before, state_before) = (fs::read(&path).unwrap(), fs::read(&state).unwrap());
+
+    let changes = ReconcilePlan::default();
+    plan(&path, None, Some((&config, Some(&gateway))), &changes).unwrap();
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_REASON)
+    );
+    changes.apply().unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "the providers stay, pointed at the loopback port"
+    );
+    assert_eq!(fs::read(&state).unwrap(), state_before);
+
+    // Removing the program still removes, whatever the policy.
+    let changes = ReconcilePlan::default();
+    plan(&path, None, None, &changes).unwrap();
+    changes.apply().unwrap();
+    assert!(!path.exists());
 }
 
 // --- plan(): conflicts ------------------------------------------------------
@@ -1080,4 +1128,144 @@ fn config_rejects_a_non_object_entry_and_names_the_entry() {
         format!("{error:#}").contains("models.gpt-4.1.apiKey"),
         "{error:#}"
     );
+}
+
+// --- failClosed in place, failOpen reason, cleanup without a sidecar --------
+
+fn fail_open_gateway() -> LlmGatewayConfig {
+    let mut gateway = sample_gateway();
+    gateway.when_proxy_unavailable = ProxyUnavailable::FailOpen;
+    gateway
+}
+
+#[test]
+fn fail_closed_first_apply_reports_not_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    let config = sample_config();
+    let gateway = sample_gateway();
+
+    let changes = ReconcilePlan::default();
+    plan(&path, None, Some((&config, Some(&gateway))), &changes).unwrap();
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_NOT_IN_PLACE_REASON)
+    );
+    changes.apply().unwrap();
+    assert!(
+        !path.exists(),
+        "nothing is written when nothing is in place"
+    );
+    assert!(!super::super::json_merge::state_path(&path).exists());
+}
+
+#[test]
+fn fail_open_reports_the_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    let config = sample_config();
+    let gateway = fail_open_gateway();
+    apply_managed_with(&path, &config, &gateway);
+
+    let changes = ReconcilePlan::default();
+    plan(&path, None, Some((&config, Some(&gateway))), &changes).unwrap();
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_OPEN_REASON)
+    );
+}
+
+fn apply_managed_with(path: &std::path::Path, config: &CopilotConfig, gateway: &LlmGatewayConfig) {
+    let changes = ReconcilePlan::default();
+    plan(
+        path,
+        Some((listen_addr(), PAIRING)),
+        Some((config, Some(gateway))),
+        &changes,
+    )
+    .unwrap();
+    assert!(!changes.has_conflicts(), "{}", changes.render());
+    changes.apply().unwrap();
+}
+
+/// A user-owned file with our entries applied, the sidecar gone and the mode
+/// loosened to 0640.
+fn paired_entries_without_a_sidecar(path: &std::path::Path, gateway: &LlmGatewayConfig) {
+    write_user_owned_document(path);
+    apply_managed_with(path, &sample_config(), gateway);
+    fs::remove_file(super::super::json_merge::state_path(path)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    assert_eq!(our_provider_count(&read(path)), 2);
+}
+
+fn assert_paired_entries_gone_user_entries_kept(path: &std::path::Path) {
+    let after = read(path);
+    assert_eq!(our_provider_count(&after), 0, "{after}");
+    assert!(
+        after["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["provider"] == "my-own-openai"),
+        "{after}"
+    );
+    assert_user_entries_present(&after);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "the file keeps its mode"
+        );
+    }
+}
+
+#[test]
+fn fail_open_without_sidecar_removes_paired_entries_and_keeps_user_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    let config = sample_config();
+    let gateway = fail_open_gateway();
+    paired_entries_without_a_sidecar(&path, &gateway);
+
+    // No proxy, so no pairing is known.
+    let changes = ReconcilePlan::default();
+    plan(&path, None, Some((&config, Some(&gateway))), &changes).unwrap();
+    changes.apply().unwrap();
+    assert_paired_entries_gone_user_entries_kept(&path);
+}
+
+#[test]
+fn removal_without_proxy_and_sidecar_removes_paired_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    paired_entries_without_a_sidecar(&path, &sample_gateway());
+
+    let changes = ReconcilePlan::default();
+    plan(&path, None, None, &changes).unwrap();
+    changes.apply().unwrap();
+    assert_paired_entries_gone_user_entries_kept(&path);
+}
+
+#[test]
+fn known_pairing_keeps_entries_with_another_pairing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("providers.json");
+    paired_entries_without_a_sidecar(&path, &sample_gateway());
+
+    let changes = ReconcilePlan::default();
+    plan(
+        &path,
+        Some((listen_addr(), "PAIRING-OTHER")),
+        None,
+        &changes,
+    )
+    .unwrap();
+    changes.apply().unwrap();
+    assert_eq!(our_provider_count(&read(&path)), 2);
 }

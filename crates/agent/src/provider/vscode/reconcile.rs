@@ -98,15 +98,23 @@ pub(super) fn plan(
 ) -> anyhow::Result<()> {
     let state_path = json_merge::state_path(path);
     let pairing = proxy.map(|(_, pairing)| pairing);
-    let Some((config, Some(_gateway))) = configured else {
+    let Some((config, Some(gateway))) = configured else {
         remove(path, &state_path, pairing, plan)?;
         return Ok(());
     };
     let Some((listen, pairing)) = proxy else {
-        warn!(
+        if crate::reconcile::fail_closed_without_proxy(gateway, plan, || in_place(path, plan)) {
+            tracing::debug!(
+                path = %path.display(),
+                "programs.vscode is configured but the local LLM proxy is not available; whenProxyUnavailable: failClosed, so the chat language models file is left as it is"
+            );
+            return Ok(());
+        }
+        tracing::debug!(
             path = %path.display(),
-            "programs.vscode is configured but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed chat language models"
+            "programs.vscode is configured but the local LLM proxy is not available, so VS Code is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); whenProxyUnavailable: failOpen, removing the managed chat language models"
         );
+        plan.inactive(crate::reconcile::FAIL_OPEN_REASON);
         remove(path, &state_path, None, plan)?;
         return Ok(());
     };
@@ -141,7 +149,7 @@ pub(super) fn plan(
 }
 
 /// Managed entries are removed through the sidecar when there is one, and by
-/// this daemon's pairing value when there is none.
+/// pairing value when there is none (any value when `pairing` is `None`).
 fn remove(
     path: &Path,
     state_path: &Path,
@@ -155,11 +163,27 @@ fn remove(
         VsCode::DISPLAY_NAME,
         options(),
         plan,
-    )? && let Some(pairing) = pairing
-    {
+    )? {
         plan_remove_orphaned(path, pairing, plan)?;
     }
     Ok(())
+}
+
+/// Whether the file holds the `agentdesktop` vendor entry an agentdesktop
+/// daemon wrote (a model with a pairing header). A missing file is not in
+/// place; a file that cannot be read or parsed is logged and counts as not
+/// in place.
+fn in_place(path: &Path, plan: &ReconcilePlan) -> bool {
+    match read_array(path, plan) {
+        Ok(Some(current)) => current.iter().any(|vendor| {
+            vendor["name"] == VsCodeConfig::VENDOR_NAME && carries_pairing(vendor, None)
+        }),
+        Ok(None) => false,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "reading the VS Code chat language models file");
+            false
+        }
+    }
 }
 
 /// Whether a vendor entry carries the pairing header on one of its models,
@@ -204,10 +228,15 @@ fn foreign_managed_entry(
 }
 
 /// Removal without a sidecar: the vendor entry named `agentdesktop` whose
-/// models carry this daemon's own pairing value was written for this daemon,
-/// so it is taken out; the file keeps its mode and is never deleted here. A
-/// file that cannot be read is skipped with a warning.
-fn plan_remove_orphaned(path: &Path, pairing: &str, plan: &ReconcilePlan) -> anyhow::Result<()> {
+/// models carry this daemon's pairing value (any pairing value while the
+/// daemon runs without the proxy and has none of its own) was written by an
+/// agentdesktop daemon, so it is taken out; the file keeps its mode and is
+/// never deleted here. A file that cannot be read is skipped with a warning.
+fn plan_remove_orphaned(
+    path: &Path,
+    pairing: Option<&str>,
+    plan: &ReconcilePlan,
+) -> anyhow::Result<()> {
     let current = match read_array(path, plan) {
         Ok(Some(current)) => current,
         Ok(None) => return Ok(()),
@@ -219,7 +248,7 @@ fn plan_remove_orphaned(path: &Path, pairing: &str, plan: &ReconcilePlan) -> any
     let remaining: Vec<Value> = current
         .iter()
         .filter(|vendor| {
-            !(vendor["name"] == VsCodeConfig::VENDOR_NAME && carries_pairing(vendor, Some(pairing)))
+            !(vendor["name"] == VsCodeConfig::VENDOR_NAME && carries_pairing(vendor, pairing))
         })
         .cloned()
         .collect();

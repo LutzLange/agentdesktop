@@ -133,6 +133,37 @@ The incoming path and query are appended to the gateway base URL: with
 `llmGateway.proxyUrl: https://gateway.example/prefix` (or `url`, when `proxyUrl`
 is unset), `/v1/messages` goes to `https://gateway.example/prefix/v1/messages`.
 Avoid repeating `/v1` in both URLs.
+
+**Without the proxy.** When the daemon runs without its loopback proxy
+(`daemon.llmProxy.listen` unset, or the address could not be bound),
+`llmGateway.whenProxyUnavailable` decides what happens to the files of the
+programs that use the proxy (`programs.copilot`, `programs.vscode`). With
+`failClosed`, the default, the daemon leaves their managed entries as they
+are: the Copilot CLI and VS Code stay pointed at the loopback port, and those
+requests fail instead of reaching GitHub past the gateway. This needs entries
+to be in place: on a first apply without the proxy, or after the entries were
+removed by hand, nothing points at the loopback port, so VS Code on GitHub's
+models talks to GitHub directly and the Copilot CLI and VS Code on own models
+have no gateway models; the status says so. If the address could
+not be bound because another process holds it, that process receives those
+requests, with VS Code's Copilot tokens and the pairing value: use the default
+on devices with a single user, as for the proxy in general. With
+`failOpen`, the daemon removes the entries until the proxy is back: VS Code on
+GitHub's models then talks to GitHub directly, and the Copilot CLI and VS Code
+on own models lose the gateway's models. Either way the programs report
+`inactive` with the reason, and the next apply with the proxy writes the
+current entries. A stopped daemon changes no file, so the tools fail until it
+runs again, whatever the policy. The policy covers only the files the daemon
+writes: whether developers can reach GitHub's models without the gateway is
+set by the organisation's Copilot policy and egress rules. Set the key only
+after the controller and the daemons run a version that knows it; older ones
+reject a configuration that carries it.
+
+```yaml
+llmGateway:
+  url: https://gateway.example.com
+  whenProxyUnavailable: failOpen   # default failClosed
+```
 The proxy does not discover models or rewrite model IDs; configure those in the
 client. VS Code's built-in **Custom Endpoint** provider can use this endpoint
 without the experimental extension in `vscode/`. The provider reads
@@ -271,6 +302,14 @@ device authorization again. Non-expiring App user tokens are also supported.
 Request bodies remain untouched. The existing Claude credential-helper flow is
 unchanged; the local proxy always uses the gateway identity in `Authorization`.
 
+### GitHub Copilot: a runnable example
+
+[`examples/copilot`](examples/copilot/README.md) runs Dex and Agentgateway
+locally and walks through the Copilot CLI, VS Code on the gateway's models and
+VS Code on GitHub's models, with what to check at each step (drift,
+conflicts, removal) and the settings the GitHub organisation owner controls
+([`examples/copilot/github-side.md`](examples/copilot/github-side.md)).
+
 ### Managed program: GitHub Copilot CLI
 
 `programs.copilot` makes the daemon write the Copilot CLI's BYOK provider
@@ -313,12 +352,16 @@ startup stops the daemon from starting, as for the other programs). If the
 daemon's sidecar next to the file is gone, entries under the managed names
 that carry a pairing header are replaced on the next apply, and those that
 carry this daemon's own pairing value are removed when the program goes
-away; entries with another pairing value are left alone. The file is written owner-only. The
+away; entries with another pairing value are left alone. While the daemon runs
+without the proxy it has no pairing of its own, so any pairing value counts
+(only an agentdesktop daemon writes that header). The file is written
+owner-only. The
 daemon's sidecar next to it (`.providers.json.agentdesktop`, owner-only) keeps
 a copy of the file as last written, including the user's own providers and
 their `apiKey` values, until the next apply. Removing
-`programs.copilot`, setting `useLlmGateway: false`, or running without the
-proxy takes the managed entries out again and restores the user's file with
+`programs.copilot` or setting `useLlmGateway: false` takes the managed
+entries out again (running without the proxy depends on
+`llmGateway.whenProxyUnavailable`, see **Without the proxy**) and restores the user's file with
 its previous mode (deleted only if the daemon created it and nothing else is
 left).
 
@@ -396,7 +439,8 @@ resolved (and stops the daemon at startup, as for the other programs); an
 empty file is filled. If the daemon's sidecar next to the file is gone, an
 `agentdesktop` entry carrying a pairing header is replaced on the next apply,
 and one carrying this daemon's own pairing value is removed when the program
-goes away. Pass-through
+goes away (while the daemon runs without the proxy, one carrying any pairing
+value). Pass-through
 model keys are written as given, so a misspelt key reaches VS Code unchanged.
 The daemon's sidecar next to the file (`.chatLanguageModels.json.agentdesktop`,
 owner-only) keeps a copy of the file as last written, including the user's
@@ -468,7 +512,8 @@ carries the pairing) and removal keeps the mode it finds; the sidecar is
 itself saves the file with its own
 default mode (664 with a new inode when a setting is changed in the UI), so the
 URL is readable to the group and others until the daemon's next apply
-tightens it again (a config push or a daemon restart); an unchanged file
+tightens it again (a config push, a daemon restart, a reconnect to the
+controller, or the reconcile tick when `daemon.reconcileInterval` is set); an unchanged file
 looser than 0600 is tightened on the next apply without being rewritten
 otherwise. The override key is the daemon's while the program is active: a
 hand edit of the URL is replaced on the next apply and is not kept as the
@@ -499,12 +544,15 @@ single-quoted string; the top level is not an object;
 `settingsSync.ignoredSettings` is not an array; or a managed key appears twice)
 leaves the file untouched and blocks every managed file on the device until it
 is resolved (and stops the daemon at startup); fix the file in VS Code and
-re-apply. Removal (program
-absent, `ownModels`, `useLlmGateway: false`, no gateway, no `proxyUrl`, or no
-proxy, with a warning) takes the key and the two entries out and deletes the
-file only if the daemon created it. Restart VS Code after an apply that changes
+re-apply (with `daemon.reconcileInterval` set, the next tick applies it). Removal (program
+absent, `ownModels`, `useLlmGateway: false`, no gateway, or no `proxyUrl`)
+takes the key and the two entries out and deletes the file only if the daemon
+created it. Without the proxy, `llmGateway.whenProxyUnavailable` decides (see
+**Without the proxy** above): the default keeps the override, so Copilot Chat
+fails instead of reaching GitHub directly. Restart VS Code after an apply that changes
 the file (first apply, re-pairing after a re-enrollment). There is no
-`--dry-run` preview: a dry run has no proxy and plans a removal; `--once`
+`--dry-run` preview: a dry run has no proxy, so it lists nothing for this file
+under `failClosed` and the removal under `failOpen`; `--once`
 refuses the program.
 
 Caveats. `github.copilot.advanced.debug.overrideCapiUrl` is an undocumented
@@ -575,6 +623,39 @@ routes:
           - x-llm-token
 ```
 
+## Periodic re-apply (opt-in)
+
+The daemon applies its configuration at startup and whenever the controller
+pushes one; a controller-managed device also re-applies the controller's
+configuration on every reconnect, which happens at least once per OIDC
+access-token lifetime. To repair drift between those points, set an interval
+in the local configuration:
+
+```yaml
+daemon:
+  reconcileInterval: 5m
+```
+
+Every interval the daemon re-applies the current configuration (the local
+file, or the last configuration the controller pushed). A managed file that
+was deleted or edited by hand comes back, a file whose mode was loosened is
+tightened, and a conflict that was fixed is applied. Nothing is written when
+nothing changed, and a tick reports to the controller and logs its outcome lines only when the outcome changed; a provider warning that explains a conflict (for example the file it refuses to change) repeats with every apply until the conflict is fixed. Deleting a managed file is then no longer a way to opt out:
+switch the program off in the configuration or stop the daemon instead. The
+tick cannot start a local LLM proxy that was not running when the daemon
+started (restart the daemon for that). Unset means no periodic re-apply; zero
+and more than 30 days are rejected. The interval is read at startup only. After a
+logout from the controller the tick stops re-applying (the managed files stay
+until the next configuration). A controller configuration whose apply failed
+is saved as the one to restore once a tick applies it; if the device loses the
+connection before that and restarts offline, it restores the previous saved
+configuration until the controller pushes again.
+
+Any apply (tick or not) leaves a managed file alone when it already holds the
+planned bytes, and rewrites it with the same bytes when its mode grants more
+than the daemon writes: for example a Claude Code user `settings.json` at
+0664 becomes 0644, a Copilot CLI `providers.json` at 0644 becomes 0600.
+
 ## Start locally, grow into a fleet
 
 Agentdesktop uses the same daemon and tool-native configuration model at every
@@ -586,6 +667,44 @@ stage.
 | [Run the standalone quickstart](https://agentdesktop.dev/docs/getting-started/standalone/) | [Run the managed quickstart](https://agentdesktop.dev/docs/getting-started/managed/) |
 
 ![Agentdesktop controller device inventory](images/controller-ui.png)
+
+### Configuration status
+
+Each apply reports the outcome for every managed program, next to the
+device-wide state. The device page in the controller lists them under
+"Managed programs" (`GET /api/v1/devices/{id}` returns them as `programs`):
+
+| State | Meaning |
+| --- | --- |
+| `applied` | The program is configured and its files were changed. |
+| `unchanged` | The program is configured and nothing needed to change. |
+| `removed` | The program is no longer configured and its managed content was removed. |
+| `conflict` | A managed file holds configuration the daemon will not overwrite; the detail names the file. |
+| `inactive` | The program uses the LLM gateway but the local LLM proxy is not running (see `llmProxy.error` in daemon-info): its entries were left pointing at the loopback port (`whenProxyUnavailable: failClosed`, the default; the detail says when no entries were in place, so the tool keeps its own settings) or removed (`failOpen`). |
+| `blocked` | The program had changes, but none were written because another program conflicted or failed; the detail names that program. |
+| `failed` | Planning or writing this program failed; the detail carries the error. |
+
+When several apply, the first in the list `failed`, `conflict`, `blocked`,
+`inactive`, `applied`/`removed`, `unchanged` is shown. An apply is all or
+nothing across programs: one conflict or failure means no file is written for
+any program, which is what `blocked` makes visible. Programs that are not
+configured and have nothing to clean up, and discovery-only tools, are not
+listed. After each push and startup apply the daemon logs one `program
+configuration outcome` line (`program`, `state`, `detail`) per program that is
+not `applied` or `unchanged`; a reconcile tick logs and reports only when the
+outcome changed. A daemon restart reports again, because the controller re-sends
+the configuration on every connection; the files are already written by the
+startup apply of the saved configuration at that point, so the report after a
+restart usually says `unchanged` (the startup apply's outcome lines for programs
+that are not `applied` or `unchanged` are in the daemon log). If the controller
+rejects a report (an agent outside the reporting limits), it keeps the device
+status and the last accepted program rows; rows from an earlier revision show
+that revision on the device page. Agents and controllers can be upgraded
+in either order: an older agent shows as "Per-program status is not reported
+by this agent version", and an older controller ignores the new fields. The
+controller's database migration is one-way: once this controller has run, an
+older controller refuses the same database, so roll back from a database
+backup taken before the upgrade.
 
 ## Core capabilities
 

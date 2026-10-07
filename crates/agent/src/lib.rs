@@ -14,6 +14,7 @@ pub mod remote;
 pub mod secret_store;
 pub mod secure_fs;
 pub mod subscription;
+mod tick;
 
 #[cfg(windows)]
 mod windows_security;

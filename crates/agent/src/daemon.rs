@@ -87,6 +87,8 @@ struct ResolvedDaemonArgs {
     vscode_chat_models: Option<PathBuf>,
     /// VS Code's user `settings.json`; `None` in system mode (user-only program).
     vscode_settings: Option<PathBuf>,
+    /// `daemon.reconcileInterval`; `None` means no periodic re-apply.
+    reconcile_interval: Option<Duration>,
     once: bool,
     dry_run: bool,
 }
@@ -208,6 +210,7 @@ impl DaemonArgs {
                 },
                 vscode_chat_models: None,
                 vscode_settings: None,
+                reconcile_interval: startup.reconcile_interval,
                 once: self.once || self.dry_run,
                 dry_run: self.dry_run,
             });
@@ -294,6 +297,7 @@ impl DaemonArgs {
                     .settings
                     .unwrap_or_else(|| reconcile::default_vscode_settings_path(&home)),
             ),
+            reconcile_interval: startup.reconcile_interval,
             once: self.once || self.dry_run,
             dry_run: self.dry_run,
         })
@@ -430,9 +434,9 @@ where
                 .context("preview daemon configuration")?;
         } else {
             validate_one_shot(&config)?;
-            reconciler
-                .apply(&config)
-                .context("apply daemon configuration")?;
+            let (report, applied) = reconciler.apply_with_report(&config);
+            report.log();
+            applied.context("apply daemon configuration")?;
             println!("Reconciliation complete.");
         }
         return Ok(());
@@ -479,20 +483,42 @@ where
     } else {
         Some(local_config)
     };
-    if let Some(initial_config) = initial_config {
-        reconciler
-            .apply(&initial_config)
-            .context("apply initial daemon configuration")?;
+    if let Some(initial_config) = &initial_config {
+        // The outcomes are logged before a failure stops the daemon.
+        let (report, applied) = reconciler.apply_with_report(initial_config);
+        report.log();
+        applied.context("apply initial daemon configuration")?;
         // With a controller, the cached controller configuration is what is in effect
         // from here, and start_gateway_authentication above only saw the local file.
         // Without one the two are the same configuration and it already ran.
         if config.controller.is_some() {
-            gateway_oidc::start_device_login_if_configured(&initial_config, &args.state_dir);
+            gateway_oidc::start_device_login_if_configured(initial_config, &args.state_dir);
         }
     } else {
         tracing::info!(
             "preserving managed files until the controller provides daemon configuration"
         );
+    }
+    // The current configuration, re-applied by the reconcile tick; held here
+    // for the daemon's lifetime and replaced by each pushed configuration.
+    let (current_config, current_config_receiver) =
+        watch::channel(initial_config.map(|config| crate::tick::CurrentConfig {
+            revision: None,
+            config: Arc::new(config),
+        }));
+    let (tick_status_sender, tick_status_receiver) = watch::channel(None);
+    let tick_enabled = args.reconcile_interval.is_some();
+    if let Some(interval) = args.reconcile_interval {
+        tracing::info!(
+            interval_seconds = interval.as_secs_f64(),
+            "reconcile tick enabled"
+        );
+        tokio::spawn(crate::tick::run_tick(
+            reconciler.clone(),
+            current_config_receiver,
+            interval,
+            config.controller.is_some().then_some(tick_status_sender),
+        ));
     }
     let discovery = reconciler.discover().await;
     log_discovery(&discovery);
@@ -507,6 +533,7 @@ where
     let (logout_sender, logout_receiver) = mpsc::channel(1);
     let logout = config.controller.as_ref().map(|_| logout_sender);
     if let Some(controller) = config.controller.clone() {
+        let remote_current_config = current_config.clone();
         let remote_discovery = inventory.clone();
         let state_dir = args.state_dir.clone();
         let oidc_callback_listen = args.oidc_callback_listen;
@@ -522,6 +549,8 @@ where
             remote::Requests {
                 telemetry: telemetry_receiver,
                 logout: logout_receiver,
+                current: remote_current_config,
+                tick_statuses: tick_enabled.then_some(tick_status_receiver),
             },
         ));
     }
@@ -607,7 +636,7 @@ fn attach_llm_proxy_pairing(
 /// failure is logged and reported as `bound: false` rather than propagated:
 /// the proxy is optional, the rest of the daemon is not.
 ///
-/// Invariant for callers: this runs before the initial `reconciler.apply`, so a
+/// Invariant for callers: this runs before the initial apply, so a
 /// reconciler that writes the proxy address into a client file must take the
 /// address from this result and must not write it when `bound` is false. The
 /// accept loop starts later, after discovery; connections in between queue in
@@ -1780,6 +1809,30 @@ programs:
                 .contains("daemon.copilot.config requires --user"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn the_reconcile_tick_is_off_unless_an_interval_is_set() {
+        let resolved = daemon_args(true)
+            .resolve(
+                config::DaemonStartupConfig::default(),
+                PathBuf::from("config.yaml"),
+                PathBuf::from("agentdesktop.sock"),
+            )
+            .unwrap();
+        assert_eq!(resolved.reconcile_interval, None);
+        let startup = config::DaemonStartupConfig {
+            reconcile_interval: Some(Duration::from_secs(120)),
+            ..Default::default()
+        };
+        let resolved = daemon_args(true)
+            .resolve(
+                startup,
+                PathBuf::from("config.yaml"),
+                PathBuf::from("agentdesktop.sock"),
+            )
+            .unwrap();
+        assert_eq!(resolved.reconcile_interval, Some(Duration::from_secs(120)));
     }
 
     #[test]

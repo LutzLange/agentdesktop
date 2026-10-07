@@ -26,6 +26,7 @@
 |`daemon.openCode`|object|OpenCode paths.|
 |`daemon.openCode.config`|string|Configuration file.|
 |`daemon.openCode.plugin`|string|Credential plugin path.|
+|`daemon.reconcileInterval`|string|Opt-in interval between periodic re-applies of the current<br>configuration, which repair drift (a managed file deleted or edited by<br>hand, a fixed conflict, a loosened mode) without rewriting anything<br>unchanged. Unset means no periodic re-apply; a controller-managed<br>device still re-applies the controller's configuration on every<br>reconnect. Must be greater than zero and at most 30 days; read at<br>startup only (restart the daemon after changing it).|
 |`daemon.socket`|string|Local API Unix socket or Windows named pipe.|
 |`daemon.stateDir`|string|Persistent daemon state directory.|
 |`daemon.user`|boolean|Manage the current user’s tool settings instead of system settings.|
@@ -50,6 +51,7 @@
 |`llmGateway.githubOAuth.source`|enum|Where the GitHub credential comes from.<br>Possible values: `deviceFlow`, `request`.|
 |`llmGateway.proxyUrl`|string|Base URL the local LLM proxy forwards to, when it differs from `url`.<br><br>`url` is shared by every program that sets `useLlmGateway`, so it can<br>only carry one path prefix. A gateway that puts each provider behind its<br>own prefix therefore cannot serve both a program and the proxy from one<br>value. Setting this leaves `url` to the programs and gives the proxy its<br>own target. The same rules as for `url` apply.|
 |`llmGateway.url`|string|Base HTTP or HTTPS URL of the LLM gateway.<br><br>The URL must include a host and cannot include credentials, a query, or a fragment.|
+|`llmGateway.whenProxyUnavailable`|enum|What the programs behind the local LLM proxy (`programs.copilot`,<br>`programs.vscode`) do while the daemon runs without that proxy:<br>`failClosed` (the default) leaves their managed entries in place, so<br>the tools stay pointed at the loopback port and fail instead<br>of falling back to GitHub past the gateway (with no entries in place<br>yet, the tools keep their own settings); `failOpen` removes them<br>until the proxy is back (VS Code on `githubModels` then talks to GitHub<br>directly, the Copilot CLI and VS Code on `ownModels` lose the gateway's<br>models).<br>Possible values: `failClosed`, `failOpen`.|
 |`programs`|object|Per-program settings reconciled on this device.|
 |`programs.claudeCode`|object|Claude Code managed-settings configuration. Arbitrary keys are passed through directly.|
 |`programs.claudeCode.auth`|enum|Upstream authentication used by this agent.<br>Possible values: `subscription`.|

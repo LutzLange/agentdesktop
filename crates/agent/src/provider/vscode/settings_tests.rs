@@ -7,7 +7,9 @@
 
 use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
 
-use agentdesktop_core::config::{LlmGatewayConfig, VsCodeConfig, VsCodeCopilotChat, VsCodeModel};
+use agentdesktop_core::config::{
+    LlmGatewayConfig, ProxyUnavailable, VsCodeConfig, VsCodeCopilotChat, VsCodeModel,
+};
 use jsonc_parser::{ParseOptions, cst::CstRootNode};
 use serde_json::{Value, json};
 
@@ -15,6 +17,7 @@ use super::settings::{
     Removal, SETTINGS_STATE_VERSION, SettingsConflict, SettingsState, edit_settings, plan,
     read_state, remove_settings, settings_path,
 };
+use crate::provider::json_merge;
 use crate::reconcile::ReconcilePlan;
 
 /// The two keys the daemon owns in `settings.json`.
@@ -57,6 +60,7 @@ fn gateway_with_proxy() -> LlmGatewayConfig {
         authentication: None,
         proxy_url: Some("https://gateway.example.com/copilot-proxy".parse().unwrap()),
         github_oauth: None,
+        when_proxy_unavailable: Default::default(),
     }
 }
 
@@ -365,12 +369,13 @@ fn removal_no_proxy_url_keeps_user_keys() {
 }
 
 #[test]
-fn removal_no_proxy_available_keeps_user_keys_with_a_warning() {
+fn fail_open_removal_no_proxy_available_keeps_user_keys() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.json");
     write_user_settings(&path, &json!({"editor.fontSize": 14}));
     let config = github_models_config();
-    let gateway = gateway_with_proxy();
+    let mut gateway = gateway_with_proxy();
+    gateway.when_proxy_unavailable = ProxyUnavailable::FailOpen;
     apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
 
     // `ctx.llm_proxy` is `None` (bind failed, proxy off) even though the
@@ -382,6 +387,82 @@ fn removal_no_proxy_available_keeps_user_keys_with_a_warning() {
     let after = read(&path);
     assert_eq!(after["editor.fontSize"], 14);
     assert!(after.get(OVERRIDE_KEY).is_none(), "{after}");
+}
+
+#[test]
+fn fail_closed_leaves_the_file_and_sidecar_until_the_proxy_is_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_user_settings(&path, &json!({"editor.fontSize": 14}));
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    let state = json_merge::state_path(&path);
+    let (before, state_before) = (fs::read(&path).unwrap(), fs::read(&state).unwrap());
+
+    let changes = apply_removal(&path, None, Some((&config, Some(&gateway))));
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_REASON)
+    );
+    changes.apply().unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "the override stays, pointed at the loopback port"
+    );
+    assert_eq!(fs::read(&state).unwrap(), state_before);
+
+    // The proxy back, on another port: the current URL is written.
+    let other: SocketAddr = "127.0.0.1:18199".parse().unwrap();
+    apply_managed(&path, other, PAIRING, &config, &gateway);
+    assert_eq!(read(&path)[OVERRIDE_KEY], override_url(other, PAIRING));
+
+    // Removing the program still removes, whatever the policy.
+    apply_removal(&path, None, None).apply().unwrap();
+    let after = read(&path);
+    assert!(after.get(OVERRIDE_KEY).is_none(), "{after}");
+    assert_eq!(after["editor.fontSize"], 14);
+}
+
+#[test]
+fn fail_closed_does_not_create_a_file_without_the_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let changes = apply_removal(
+        &path,
+        None,
+        Some((&github_models_config(), Some(&gateway_with_proxy()))),
+    );
+    changes.apply().unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn when_proxy_unavailable_defaults_to_fail_closed_and_parses_fail_open() {
+    let parse = |extra: Value| {
+        let mut document = json!({"url": "https://gateway.example.com"});
+        document
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value::<LlmGatewayConfig>(document)
+    };
+    let default = parse(json!({})).unwrap();
+    assert_eq!(default.when_proxy_unavailable, ProxyUnavailable::FailClosed);
+    assert!(
+        serde_json::to_value(&default)
+            .unwrap()
+            .get("whenProxyUnavailable")
+            .is_none()
+    );
+    assert_eq!(
+        parse(json!({"whenProxyUnavailable": "failOpen"}))
+            .unwrap()
+            .when_proxy_unavailable,
+        ProxyUnavailable::FailOpen
+    );
+    assert!(parse(json!({"whenProxyUnavailable": "failSoft"})).is_err());
 }
 
 #[test]
@@ -1630,4 +1711,66 @@ fn a_sidecar_with_a_byte_order_mark_is_read() {
     apply_removal(&path, None, None).apply().unwrap();
 
     assert_eq!(read(&path)[OVERRIDE_KEY], SECRET);
+}
+
+// --- failClosed in place, failOpen reason -----------------------------------
+
+#[test]
+fn fail_closed_first_apply_reports_not_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+
+    let changes = apply_removal(&path, None, Some((&config, Some(&gateway))));
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_NOT_IN_PLACE_REASON)
+    );
+    changes.apply().unwrap();
+    assert!(
+        !path.exists(),
+        "nothing is written when nothing is in place"
+    );
+    assert!(!json_merge::state_path(&path).exists());
+}
+
+#[test]
+fn fail_open_reports_the_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_user_settings(&path, &json!({"editor.fontSize": 14}));
+    let config = github_models_config();
+    let mut gateway = gateway_with_proxy();
+    gateway.when_proxy_unavailable = ProxyUnavailable::FailOpen;
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+
+    let changes = apply_removal(&path, None, Some((&config, Some(&gateway))));
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_OPEN_REASON)
+    );
+}
+
+#[test]
+fn fail_closed_after_the_user_removed_the_override_reports_not_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    write_user_settings(&path, &json!({"editor.fontSize": 14}));
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    assert!(read(&path).get(OVERRIDE_KEY).is_some());
+
+    // The user deletes the override, keeping their own keys.
+    write_user_settings(&path, &json!({"editor.fontSize": 14}));
+    let before = fs::read(&path).unwrap();
+
+    let changes = apply_removal(&path, None, Some((&config, Some(&gateway))));
+    assert_eq!(
+        changes.inactive_reason().as_deref(),
+        Some(crate::reconcile::FAIL_CLOSED_NOT_IN_PLACE_REASON)
+    );
+    changes.apply().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before, "nothing is written");
 }

@@ -274,6 +274,14 @@
           "$ref": "#/$defs/OpenCodeStartupConfig",
           "default": {}
         },
+        "reconcileInterval": {
+          "description": "Opt-in interval between periodic re-applies of the current\nconfiguration, which repair drift (a managed file deleted or edited by\nhand, a fixed conflict, a loosened mode) without rewriting anything\nunchanged. Unset means no periodic re-apply; a controller-managed\ndevice still re-applies the controller's configuration on every\nreconnect. Must be greater than zero and at most 30 days; read at\nstartup only (restart the daemon after changing it).",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "socket": {
           "description": "Local API Unix socket or Windows named pipe.",
           "type": [
@@ -483,6 +491,10 @@
         "url": {
           "description": "Base HTTP or HTTPS URL of the LLM gateway.\n\nThe URL must include a host and cannot include credentials, a query, or a fragment.",
           "type": "string"
+        },
+        "whenProxyUnavailable": {
+          "description": "What the programs behind the local LLM proxy (`programs.copilot`,\n`programs.vscode`) do while the daemon runs without that proxy:\n`failClosed` (the default) leaves their managed entries in place, so\nthe tools stay pointed at the loopback port and fail instead\nof falling back to GitHub past the gateway (with no entries in place\nyet, the tools keep their own settings); `failOpen` removes them\nuntil the proxy is back (VS Code on `githubModels` then talks to GitHub\ndirectly, the Copilot CLI and VS Code on `ownModels` lose the gateway's\nmodels).",
+          "$ref": "#/$defs/ProxyUnavailable"
         }
       },
       "additionalProperties": false,
@@ -653,6 +665,21 @@
         }
       },
       "additionalProperties": false
+    },
+    "ProxyUnavailable": {
+      "description": "The `llmGateway.whenProxyUnavailable` policy.",
+      "oneOf": [
+        {
+          "description": "Keep the managed entries: the tools fail instead of bypassing the\ngateway.",
+          "type": "string",
+          "const": "failClosed"
+        },
+        {
+          "description": "Remove the managed entries until the proxy is back.",
+          "type": "string",
+          "const": "failOpen"
+        }
+      ]
     },
     "SandboxConfig": {
       "description": "Local execution restrictions applied to managed developer tools.",

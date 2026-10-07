@@ -103,15 +103,23 @@ pub(super) fn plan(
 ) -> anyhow::Result<()> {
     let state_path = json_merge::state_path(path);
     let pairing = proxy.map(|(_, pairing)| pairing);
-    let Some((config, Some(_gateway))) = configured else {
+    let Some((config, Some(gateway))) = configured else {
         remove(path, &state_path, pairing, plan)?;
         return Ok(());
     };
     let Some((listen, pairing)) = proxy else {
-        warn!(
+        if crate::reconcile::fail_closed_without_proxy(gateway, plan, || in_place(path, plan)) {
+            tracing::debug!(
+                path = %path.display(),
+                "programs.copilot is configured but the local LLM proxy is not available; whenProxyUnavailable: failClosed, so the Copilot CLI providers file is left as it is"
+            );
+            return Ok(());
+        }
+        tracing::debug!(
             path = %path.display(),
-            "programs.copilot is configured but the local LLM proxy is not available, so the Copilot CLI is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); removing the managed Copilot CLI providers"
+            "programs.copilot is configured but the local LLM proxy is not available, so the Copilot CLI is not pointed at the gateway; the reason is llmProxy.error in daemon-info (or daemon.llmProxy.listen is unset); whenProxyUnavailable: failOpen, removing the managed Copilot CLI providers"
         );
+        plan.inactive(crate::reconcile::FAIL_OPEN_REASON);
         remove(path, &state_path, None, plan)?;
         return Ok(());
     };
@@ -156,11 +164,38 @@ fn remove(
     plan: &ReconcilePlan,
 ) -> anyhow::Result<()> {
     if !json_merge::plan_remove_with(path, state_path, DESCRIPTION, DISPLAY_NAME, options(), plan)?
-        && let Some(pairing) = pairing
     {
         plan_remove_orphaned(path, pairing, plan)?;
     }
     Ok(())
+}
+
+/// Whether a provider under a managed name carries a pairing header: with
+/// `Some(value)` that value only; with `None` (the daemon runs without the
+/// proxy and has no pairing of its own) any value, since only an
+/// agentdesktop daemon writes that header.
+fn paired(provider: &Value, pairing: Option<&str>) -> bool {
+    let header = &provider["headers"][crate::llm_proxy::PAIRING_HEADER];
+    let name = provider["name"].as_str();
+    name.is_some_and(|name| name == PROVIDER_OPENAI || name == PROVIDER_ANTHROPIC)
+        && match pairing {
+            Some(pairing) => header == pairing,
+            None => !header.is_null(),
+        }
+}
+
+/// Whether the file holds a provider entry an agentdesktop daemon wrote (a
+/// managed name with a pairing header). A missing file is not in place; a
+/// file that cannot be read or parsed is logged and counts as not in place.
+fn in_place(path: &Path, plan: &ReconcilePlan) -> bool {
+    match read_object(path, plan) {
+        Ok(Some(current)) => providers(&current).any(|provider| paired(provider, None)),
+        Ok(None) => false,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "reading the Copilot CLI providers file");
+            false
+        }
+    }
 }
 
 /// Before agentdesktop has written the file (no sidecar), an entry under a
@@ -220,12 +255,17 @@ fn foreign_managed_entry(
 }
 
 /// Removal without a sidecar: entries under the managed names that carry
-/// this daemon's own pairing value were written for this daemon (before its
-/// sidecar was deleted), so they and the models under them are taken out by
-/// key; the file keeps its mode and is never deleted here. Entries with
-/// another pairing value, or none, are left alone, and a file that cannot be
-/// read is skipped with a warning rather than failing the whole apply.
-fn plan_remove_orphaned(path: &Path, pairing: &str, plan: &ReconcilePlan) -> anyhow::Result<()> {
+/// this daemon's pairing value (any pairing value while the daemon runs
+/// without the proxy and has none of its own) were written by an agentdesktop
+/// daemon, so they and the models under them are taken out by key; the file
+/// keeps its mode and is never deleted here. Entries with another pairing
+/// value, or none, are left alone, and a file that cannot be read is skipped
+/// with a warning rather than failing the whole apply.
+fn plan_remove_orphaned(
+    path: &Path,
+    pairing: Option<&str>,
+    plan: &ReconcilePlan,
+) -> anyhow::Result<()> {
     let current = match read_object(path, plan) {
         Ok(Some(current)) => current,
         Ok(None) => return Ok(()),
@@ -235,9 +275,8 @@ fn plan_remove_orphaned(path: &Path, pairing: &str, plan: &ReconcilePlan) -> any
         }
     };
     let orphaned: Vec<String> = providers(&current)
-        .filter(|provider| provider["headers"][crate::llm_proxy::PAIRING_HEADER] == pairing)
+        .filter(|provider| paired(provider, pairing))
         .filter_map(|provider| provider["name"].as_str().map(str::to_owned))
-        .filter(|name| name == PROVIDER_OPENAI || name == PROVIDER_ANTHROPIC)
         .collect();
     if orphaned.is_empty() {
         return Ok(());
