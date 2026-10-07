@@ -256,7 +256,8 @@ pub struct LlmGatewayConfig {
     /// `programs.vscode`) do while the daemon runs without that proxy:
     /// `failClosed` (the default) leaves their managed entries in place, so
     /// the tools stay pointed at the loopback port and fail instead
-    /// of falling back to GitHub past the gateway; `failOpen` removes them
+    /// of falling back to GitHub past the gateway (with no entries in place
+    /// yet, the tools keep their own settings); `failOpen` removes them
     /// until the proxy is back (VS Code on `githubModels` then talks to GitHub
     /// directly, the Copilot CLI and VS Code on `ownModels` lose the gateway's
     /// models).
