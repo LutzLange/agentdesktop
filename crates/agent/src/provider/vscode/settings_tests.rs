@@ -1211,30 +1211,203 @@ fn v2_sidecar_has_the_exact_camelcase_fields_after_a_fresh_apply() {
     assert_eq!(typed.version, SETTINGS_STATE_VERSION);
 }
 
-#[test]
-fn an_unreadable_sidecar_warns_and_apply_proceeds() {
+/// An overridden URL the user owns; must never appear in an error message.
+const SECRET: &str = "https://secret-user-override.example.com/v1";
+
+/// `settings.json` holding the user's override, applied once so a valid
+/// sidecar exists. Returns the settings path and the sidecar path.
+fn applied_with_user_override() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.json");
-    write_user_settings(&path, &json!({ "editor.fontSize": 14 }));
+    write_user_settings(
+        &path,
+        &json!({ OVERRIDE_KEY: SECRET, "editor.fontSize": 14 }),
+    );
+    apply_managed(
+        &path,
+        listen_addr(),
+        PAIRING,
+        &github_models_config(),
+        &gateway_with_proxy(),
+    );
     let state_path = super::super::json_merge::state_path(&path);
-    fs::write(&state_path, b"not json at all").unwrap();
+    (dir, path, state_path)
+}
 
+/// Plans an apply and returns the plan error text, asserting nothing was
+/// written (the plan failed before `apply`).
+fn apply_plan_error(path: &std::path::Path) -> String {
     let config = github_models_config();
     let gateway = gateway_with_proxy();
     let changes = ReconcilePlan::default();
-    plan(
-        &path,
+    let error = plan(
+        path,
         Some((listen_addr(), PAIRING)),
         Some((&config, Some(&gateway))),
         &changes,
     )
-    .unwrap();
-    assert!(!changes.has_conflicts(), "{}", changes.render());
-    changes.apply().unwrap();
+    .expect_err("an unreadable sidecar must fail the plan");
+    format!("{error:#}")
+}
 
-    let written = read(&path);
-    assert_eq!(written["editor.fontSize"], 14);
-    assert_eq!(written[OVERRIDE_KEY], override_url(listen_addr(), PAIRING));
+fn removal_plan_error(path: &std::path::Path) -> String {
+    let changes = ReconcilePlan::default();
+    let error = plan(path, None, None, &changes)
+        .expect_err("an unreadable sidecar must fail the removal plan");
+    format!("{error:#}")
+}
+
+#[test]
+fn corrupt_sidecar_fails_the_plan_on_apply() {
+    let (_dir, path, state_path) = applied_with_user_override();
+    fs::write(&state_path, b"{ not json").unwrap();
+    let settings_before = fs::read(&path).unwrap();
+
+    let message = apply_plan_error(&path);
+
+    assert!(
+        message.contains(&state_path.display().to_string()),
+        "{message}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), settings_before);
+    assert_eq!(fs::read(&state_path).unwrap(), b"{ not json");
+}
+
+#[test]
+fn corrupt_sidecar_fails_the_plan_on_removal() {
+    let (_dir, path, state_path) = applied_with_user_override();
+    fs::write(&state_path, b"{ not json").unwrap();
+    let settings_before = fs::read(&path).unwrap();
+
+    let message = removal_plan_error(&path);
+
+    assert!(
+        message.contains(&state_path.display().to_string()),
+        "{message}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), settings_before);
+    assert_eq!(fs::read(&state_path).unwrap(), b"{ not json");
+}
+
+#[test]
+fn sidecar_with_unknown_version_fails_the_plan() {
+    let (_dir, path, state_path) = applied_with_user_override();
+    let bytes = serde_json::to_vec(&json!({
+        "version": 99,
+        "created": false,
+        "overrideBefore": SECRET,
+        "addedIgnored": [],
+        "ignoredCreated": false,
+    }))
+    .unwrap();
+    fs::write(&state_path, &bytes).unwrap();
+
+    let message = apply_plan_error(&path);
+    assert!(
+        message.contains(&state_path.display().to_string()),
+        "{message}"
+    );
+    let message = removal_plan_error(&path);
+    assert!(
+        message.contains(&state_path.display().to_string()),
+        "{message}"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), bytes);
+}
+
+#[test]
+fn sidecar_with_wrong_shape_fails_the_plan() {
+    for shape in [
+        // Current version, a field missing and an unknown one.
+        json!({ "version": SETTINGS_STATE_VERSION, "bogus": SECRET }),
+        // No version, not the whole-document legacy form either.
+        json!({ "unrelated": SECRET }),
+        // Valid JSON, not an object.
+        json!([SECRET]),
+    ] {
+        let (_dir, path, state_path) = applied_with_user_override();
+        let bytes = serde_json::to_vec(&shape).unwrap();
+        fs::write(&state_path, &bytes).unwrap();
+
+        let message = apply_plan_error(&path);
+        assert!(
+            message.contains(&state_path.display().to_string()),
+            "{shape}: {message}"
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), bytes, "{shape}");
+    }
+}
+
+#[test]
+fn the_unreadable_sidecar_error_quotes_nothing_from_the_file() {
+    let (_dir, path, state_path) = applied_with_user_override();
+    // Invalid JSON and valid-but-wrong-shape JSON, both carrying the secret.
+    for bytes in [
+        format!("{{\n  \"overrideBefore\": \"{SECRET}\" oops\n}}").into_bytes(),
+        format!("{{\"version\": 2, \"overrideBefore\": \"{SECRET}\"}}").into_bytes(),
+    ] {
+        fs::write(&state_path, &bytes).unwrap();
+        for message in [apply_plan_error(&path), removal_plan_error(&path)] {
+            assert!(
+                message.contains(&state_path.display().to_string()),
+                "{message}"
+            );
+            assert!(!message.contains("secret-user-override"), "{message}");
+            assert!(!message.contains("oops"), "{message}");
+        }
+    }
+    // A parse error names the position only: line and column.
+    fs::write(&state_path, b"{\n  \"version\": }\n").unwrap();
+    let message = apply_plan_error(&path);
+    assert!(
+        message.contains("line 2") && message.contains("column"),
+        "{message}"
+    );
+}
+
+#[test]
+fn corrupt_sidecar_does_not_lose_the_users_override() {
+    let (_dir, path, state_path) = applied_with_user_override();
+    let valid_sidecar = fs::read(&state_path).unwrap();
+    let settings_before = fs::read(&path).unwrap();
+
+    fs::write(&state_path, b"{ not json").unwrap();
+    apply_plan_error(&path);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        settings_before,
+        "settings.json unchanged"
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), b"{ not json");
+
+    // A valid sidecar restored, the removal brings the user's value back.
+    fs::write(&state_path, &valid_sidecar).unwrap();
+    let changes = apply_removal(&path, None, None);
+    changes.apply().unwrap();
+    assert_eq!(read(&path)[OVERRIDE_KEY], SECRET);
+}
+
+#[cfg(unix)]
+#[test]
+fn identical_sidecar_with_looser_mode_is_rewritten_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    let state_path = super::super::json_merge::state_path(&path);
+    let sidecar_before = fs::read(&state_path).unwrap();
+    fs::set_permissions(&state_path, fs::Permissions::from_mode(0o664)).unwrap();
+
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+
+    assert_eq!(fs::read(&state_path).unwrap(), sidecar_before);
+    assert_eq!(
+        fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "an identical sidecar looser than 0600 must be rewritten at 0600"
+    );
 }
 
 #[test]
@@ -1428,4 +1601,33 @@ fn removal_records_unchanged_only_when_something_of_ours_was_there() {
     );
     plan_absent.apply().unwrap();
     assert!(!super::super::json_merge::state_path(&path).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn identical_sidecar_within_0600_is_not_rewritten() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let config = github_models_config();
+    let gateway = gateway_with_proxy();
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+    let state_path = super::super::json_merge::state_path(&path);
+    let inode = fs::metadata(&state_path).unwrap().ino();
+
+    apply_managed(&path, listen_addr(), PAIRING, &config, &gateway);
+
+    assert_eq!(fs::metadata(&state_path).unwrap().ino(), inode);
+}
+
+#[test]
+fn a_sidecar_with_a_byte_order_mark_is_read() {
+    let (_dir, path, state_path) = applied_with_user_override();
+    let mut bytes = b"\xef\xbb\xbf".to_vec();
+    bytes.extend(fs::read(&state_path).unwrap());
+    fs::write(&state_path, &bytes).unwrap();
+
+    apply_removal(&path, None, None).apply().unwrap();
+
+    assert_eq!(read(&path)[OVERRIDE_KEY], SECRET);
 }

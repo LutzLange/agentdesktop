@@ -464,7 +464,8 @@ removal; `github.copilot.internal.capiUrl` is the newer alias of the same
 setting and is only added to the ignore list, not written. The file is written
 owner-only (an existing world-readable file is tightened, since the URL
 carries the pairing) and removal keeps the mode it finds; the sidecar is
-`.settings.json.agentdesktop`. VS Code itself saves the file with its own
+`.settings.json.agentdesktop` (owner-only, tightened the same way). VS Code
+itself saves the file with its own
 default mode (664 with a new inode when a setting is changed in the UI), so the
 URL is readable to the group and others until the daemon's next apply
 tightens it again (a config push or a daemon restart); an unchanged file
@@ -485,7 +486,14 @@ written over several lines comes back as `{}`, and a file that holds only
 comments keeps them and gains `{}`. VS Code itself always writes one property
 per line. The sidecar holds no
 copy of the file, only the override's earlier value and which ignore entries
-the daemon added. A conflict (the file is not valid VS Code JSONC, meaning
+the daemon added. A sidecar the daemon cannot read (not JSON, or not a state
+it knows) fails the apply like a conflict: every managed file on the device
+stays untouched, also while `programs.vscode` is not configured (removal reads
+the sidecar too), and the daemon does not start; without it the override's
+earlier value could not be restored. Fix the sidecar, or delete it to go on
+without it (the daemon then treats an override pointing at its own loopback
+route as its own, and a value it replaced earlier is not restored). A
+conflict (the file is not valid VS Code JSONC, meaning
 anything beyond comments and trailing commas such as a missing comma or a
 single-quoted string; the top level is not an object;
 `settingsSync.ignoredSettings` is not an array; or a managed key appears twice)

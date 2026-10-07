@@ -196,7 +196,7 @@ fn is_string(node: &jsonc_parser::cst::CstNode, text: &str) -> bool {
 /// otherwise) and makes `settingsSync.ignoredSettings` hold both
 /// `OVERRIDE_KEY` and `CAPI_ALIAS_KEY`, creating the array when absent and
 /// appending only the missing entries. `state` is the previous sidecar
-/// (`None` on a first apply or when it could not be read); the returned
+/// (`None` on a first apply or when there is none); the returned
 /// state is what removal needs afterwards.
 pub(super) fn edit_settings(
     text: Option<&str>,
@@ -457,7 +457,7 @@ struct LegacyMergeState {
 }
 
 /// Reads a sidecar: the current form, or the earlier whole-document form
-/// upgraded; `None` when the bytes are neither (the caller warns).
+/// upgraded; `None` when the bytes are neither (the caller fails the plan).
 pub(super) fn read_state(bytes: &[u8]) -> Option<SettingsState> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
     if value.get("version").is_some() {
@@ -536,7 +536,7 @@ pub(super) fn plan(
 
     // An unchanged file is not rewritten, unless its mode lets others read
     // it (VS Code saves it 664): then the same bytes are written 0600.
-    let looser = json_merge::current_mode(path).is_some_and(|mode| mode & 0o077 != 0);
+    let looser = json_merge::current_mode(path).is_some_and(|mode| mode & !FILE_MODE & 0o777 != 0);
     let action = match text {
         None => "create",
         Some(text) if text == edited && !looser => "unchanged",
@@ -547,7 +547,10 @@ pub(super) fn plan(
     let mut state_bytes = serde_json::to_vec_pretty(&new_state)
         .with_context(|| format!("serialize {} {DESCRIPTION} state", VsCode::DISPLAY_NAME))?;
     state_bytes.push(b'\n');
-    if sidecar.as_deref() != Some(state_bytes.as_slice()) {
+    // An identical sidecar is rewritten only when its mode lets others read it.
+    let looser_sidecar =
+        json_merge::current_mode(&state_path).is_some_and(|mode| mode & !FILE_MODE & 0o777 != 0);
+    if sidecar.as_deref() != Some(state_bytes.as_slice()) || looser_sidecar {
         plan.write_file(&state_path, &state_bytes, FILE_MODE)?;
     }
     if action == "unchanged" {
@@ -644,21 +647,37 @@ fn read_optional(path: &Path, plan: &ReconcilePlan) -> anyhow::Result<Option<Vec
     }
 }
 
-/// The sidecar's bytes and its parsed state. A sidecar that cannot be parsed
-/// is a warning (the sidecar-less rules apply and the next write replaces
-/// it); one that cannot be read at all (permissions) is an error, as for any
-/// managed file.
+/// The sidecar's bytes and its parsed state. A sidecar that is present but
+/// not a settings state (after a leading byte-order mark, which a hand edit
+/// on Windows can add) is an error, as is one that cannot be read at all
+/// (permissions), as for any managed file.
 fn read_sidecar(
     state_path: &Path,
     plan: &ReconcilePlan,
 ) -> anyhow::Result<(Option<Vec<u8>>, Option<SettingsState>)> {
     let bytes = read_optional(state_path, plan)?;
-    let state = bytes.as_deref().and_then(|bytes| {
-        let state = read_state(bytes);
-        if state.is_none() {
-            warn!(path = %state_path.display(), "ignoring a VS Code settings sidecar that cannot be parsed");
+    let state = match bytes.as_deref() {
+        Some(bytes) => {
+            let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+            Some(read_state(bytes).ok_or_else(|| unreadable_sidecar(state_path, bytes))?)
         }
-        state
-    });
+        None => None,
+    };
     Ok((bytes, state))
+}
+
+/// A sidecar that is present but not a settings state fails the plan, as the
+/// json_merge sidecars do: without it the user's own override cannot be
+/// restored. The message names the position of a syntax error only, never a
+/// value: the sidecar can hold the user's own override URL.
+fn unreadable_sidecar(state_path: &Path, bytes: &[u8]) -> anyhow::Error {
+    let position = match serde_json::from_slice::<Value>(bytes) {
+        Err(error) => format!(" (line {}, column {})", error.line(), error.column()),
+        Ok(_) => String::new(),
+    };
+    anyhow::anyhow!(
+        "parse {} {DESCRIPTION} state from {}: not a valid settings state{position}; fix it, or delete it (the override's earlier value is then not restored)",
+        VsCode::DISPLAY_NAME,
+        state_path.display()
+    )
 }
