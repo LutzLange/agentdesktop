@@ -96,8 +96,8 @@ pub struct DaemonStartupConfig {
     /// hand, a fixed conflict, a loosened mode) without rewriting anything
     /// unchanged. Unset means no periodic re-apply; a controller-managed
     /// device still re-applies the controller's configuration on every
-    /// reconnect. Must be greater than zero; read at startup only (restart the
-    /// daemon after changing it).
+    /// reconnect. Must be greater than zero and at most 30 days; read at
+    /// startup only (restart the daemon after changing it).
     #[serde(default, with = "humantime_serde::option")]
     #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub reconcile_interval: Option<Duration>,

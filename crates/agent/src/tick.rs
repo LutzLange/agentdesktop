@@ -28,6 +28,9 @@ pub(crate) struct CurrentConfig {
 /// tick never persists anything or changes the current configuration.
 #[derive(Clone)]
 pub(crate) struct TickStatus {
+    /// The revision of the configuration this tick applied, read with it
+    /// under the apply lock; the connection loop reports and saves the
+    /// outcome only when it matches the current stream revision.
     pub(crate) revision: Option<u64>,
     pub(crate) report: ApplyReport,
     pub(crate) error: Option<String>,
@@ -44,7 +47,7 @@ pub(crate) async fn run_tick_with<F>(
     statuses: Option<watch::Sender<Option<TickStatus>>>,
     apply: F,
 ) where
-    F: FnMut(&DaemonConfig) -> (ApplyReport, anyhow::Result<()>),
+    F: FnMut(&DaemonConfig) -> Option<(Option<u64>, ApplyReport, anyhow::Result<()>)>,
 {
     if interval.is_zero() {
         tracing::warn!("reconcile interval is zero; not scheduling periodic re-applies");
@@ -69,10 +72,13 @@ pub(crate) async fn run_tick_with<F>(
         let Some(snapshot) = current.borrow_and_update().clone() else {
             continue;
         };
-        let (report, result) = apply(&snapshot.config);
+        // `None`: the closure applied nothing, so nothing is published.
+        let Some((revision, report, result)) = apply(&snapshot.config) else {
+            continue;
+        };
         if let Some(statuses) = &statuses {
             statuses.send_replace(Some(TickStatus {
-                revision: snapshot.revision,
+                revision,
                 report,
                 error: result.err().map(|error| format!("{error:#}")),
             }));
@@ -91,14 +97,12 @@ pub(crate) async fn run_tick(
     run_tick_with(current, interval, statuses, move |_| {
         // Read again under the apply lock: a push that took the lock first
         // may have replaced the configuration this tick woke up with.
-        let Some((previous, report, result)) = reconciler.apply_read_under_lock(|| {
+        let (revision, previous, report, result) = reconciler.apply_read_under_lock(|| {
             latest
                 .borrow()
                 .as_ref()
-                .map(|current| Arc::clone(&current.config))
-        }) else {
-            return (ApplyReport::default(), Ok(()));
-        };
+                .map(|current| (current.revision, Arc::clone(&current.config)))
+        })?;
         // Outcome lines and the failure warning only when something changed,
         // so a conflict that persists does not repeat every interval.
         if crate::reconcile::should_log(previous.as_ref(), &report) {
@@ -107,7 +111,7 @@ pub(crate) async fn run_tick(
                 tracing::warn!(error = %format!("{error:#}"), "reconcile tick failed");
             }
         }
-        (report, result)
+        Some((revision, report, result))
     })
     .await
 }
@@ -134,10 +138,10 @@ mod tests {
 
     fn counting(
         count: Arc<AtomicUsize>,
-    ) -> impl FnMut(&DaemonConfig) -> (ApplyReport, anyhow::Result<()>) {
+    ) -> impl FnMut(&DaemonConfig) -> Option<(Option<u64>, ApplyReport, anyhow::Result<()>)> {
         move |_config| {
             count.fetch_add(1, Ordering::SeqCst);
-            (ApplyReport::default(), Ok(()))
+            Some((None, ApplyReport::default(), Ok(())))
         }
     }
 
@@ -236,7 +240,13 @@ mod tests {
             current_rx,
             Duration::from_secs(30),
             Some(status_tx),
-            |_: &DaemonConfig| (ApplyReport::default(), Err(anyhow::anyhow!("disk full"))),
+            |_: &DaemonConfig| {
+                Some((
+                    Some(9),
+                    ApplyReport::default(),
+                    Err(anyhow::anyhow!("disk full")),
+                ))
+            },
         ));
 
         status_rx.changed().await.unwrap();
@@ -254,5 +264,60 @@ mod tests {
             "{:?}",
             status.error
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_reports_the_revision_the_apply_returns() {
+        // The snapshot the tick woke up with is revision 3; the apply (which
+        // re-reads under the lock) applied revision 5.
+        let (_current_tx, current_rx) = watch::channel(Some(current_config(Some(3))));
+        let (status_tx, mut status_rx) = watch::channel(None);
+        let _ticker = tokio::spawn(run_tick_with(
+            current_rx,
+            Duration::from_secs(30),
+            Some(status_tx),
+            |_: &DaemonConfig| Some((Some(5), ApplyReport::default(), Ok(()))),
+        ));
+
+        status_rx.changed().await.unwrap();
+        let status = status_rx
+            .borrow_and_update()
+            .clone()
+            .expect("a tick status must be published");
+        assert_eq!(
+            status.revision,
+            Some(5),
+            "the published revision is the one the apply returned, not the snapshot's"
+        );
+        assert!(status.error.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_status_when_the_apply_returns_none() {
+        let (_current_tx, current_rx) = watch::channel(Some(current_config(Some(3))));
+        let (status_tx, mut status_rx) = watch::channel(None);
+        let count = Arc::new(AtomicUsize::new(0));
+        let applied = Arc::clone(&count);
+        let _ticker = tokio::spawn(run_tick_with(
+            current_rx,
+            Duration::from_secs(30),
+            Some(status_tx),
+            move |_: &DaemonConfig| {
+                applied.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(100), status_rx.changed())
+                .await
+                .is_err(),
+            "a closure returning None must publish nothing"
+        );
+        assert!(
+            count.load(Ordering::SeqCst) >= 3,
+            "the closure must have run on each tick"
+        );
+        assert!(status_rx.borrow().is_none());
     }
 }
