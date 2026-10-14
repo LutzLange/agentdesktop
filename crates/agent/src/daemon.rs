@@ -841,6 +841,14 @@ fn log_discovery(discovery: &agentdesktop_core::model::Discovery) {
             "discovered model runtime"
         );
     }
+    for browser in &discovery.browser_pacs {
+        tracing::info!(
+            browser = %browser.browser,
+            pac_url = browser.pac_url.as_deref().unwrap_or("none"),
+            recommended = browser.recommended,
+            "discovered browser PAC policy"
+        );
+    }
 }
 
 /// Re-runs discovery on an interval so the inventory reflects tools installed,
@@ -1358,6 +1366,8 @@ mod tests {
                 })
                 .collect(),
             model_runtimes: Vec::new(),
+            browser_pacs: Vec::new(),
+            pac_fetches: Vec::new(),
         }
     }
 
