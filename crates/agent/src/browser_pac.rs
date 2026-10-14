@@ -388,18 +388,26 @@ mod linux {
         (packaging.is_some() || found_policy).then_some(row)
     }
 
-    /// Reads every `*.json` in the directories of one level. Two files that
-    /// set different proxy values are reported as a conflict rather than
-    /// guessing Chrome's merge order; unreadable files are collected in
-    /// `unreadable` and skipped.
+    /// Reads every `*.json` in the directories of one level and merges the
+    /// proxy keys across files the way Chrome merges policies key by key
+    /// (`ProxyMode` in one file and `ProxyPacUrl` in another still give a
+    /// PAC). The same key with different values in two files is reported as
+    /// a conflict rather than guessing Chrome's merge order. Unreadable files
+    /// and directories are collected in `unreadable` and skipped.
     fn chromium_level(
         directories: &[PathBuf],
         unreadable: &mut Vec<String>,
     ) -> Result<Option<(ProxyPolicy, PathBuf)>, String> {
-        let mut found: Option<(ProxyPolicy, PathBuf)> = None;
+        const KEYS: [&str; 3] = ["ProxySettings", "ProxyMode", "ProxyPacUrl"];
+        let mut merged: Vec<(&str, Value, PathBuf)> = Vec::new();
         for directory in directories {
-            let Ok(entries) = std::fs::read_dir(directory) else {
-                continue;
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    unreadable.push(format!("read {}: {error}", directory.display()));
+                    continue;
+                }
             };
             let mut files: Vec<PathBuf> = entries
                 .filter_map(Result::ok)
@@ -418,23 +426,39 @@ mod linux {
                         continue;
                     }
                 };
-                let Some(policy) = chromium_proxy(&value) else {
-                    continue;
-                };
-                match &found {
-                    Some((existing, first)) if *existing != policy => {
-                        return Err(format!(
-                            "conflicting proxy policy in {} and {}",
-                            first.display(),
-                            file.display()
-                        ));
+                for key in KEYS {
+                    let Some(setting) = value.get(key) else {
+                        continue;
+                    };
+                    match merged.iter().find(|(existing, _, _)| *existing == key) {
+                        Some((_, existing, first)) if existing != setting => {
+                            return Err(format!(
+                                "conflicting proxy policy in {} and {}",
+                                first.display(),
+                                file.display()
+                            ));
+                        }
+                        Some(_) => {}
+                        None => merged.push((key, setting.clone(), file.clone())),
                     }
-                    Some(_) => {}
-                    None => found = Some((policy, file)),
                 }
             }
         }
-        Ok(found)
+        // The source shown is the file that set the PAC URL, if any.
+        let Some(source) = ["ProxySettings", "ProxyPacUrl", "ProxyMode"]
+            .iter()
+            .find_map(|key| merged.iter().find(|(existing, _, _)| existing == key))
+            .map(|(_, _, file)| file.clone())
+        else {
+            return Ok(None);
+        };
+        let policy = Value::Object(
+            merged
+                .into_iter()
+                .map(|(key, setting, _)| (key.to_owned(), setting))
+                .collect(),
+        );
+        Ok(chromium_proxy(&policy).map(|policy| (policy, source)))
     }
 
     fn firefox(root: &Path) -> Option<BrowserPac> {
@@ -626,6 +650,50 @@ mod linux {
                     .contains("conflicting proxy policy")
             );
             assert_eq!(by_name("firefox").pac_url, None);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn legacy_keys_split_across_files_are_merged() {
+            let root = temp_root("split");
+            write(
+                &root,
+                "etc/opt/chrome/policies/managed/a.json",
+                r#"{"ProxyMode":"pac_script"}"#,
+            );
+            write(
+                &root,
+                "etc/opt/chrome/policies/managed/b.json",
+                &format!(r#"{{"ProxyPacUrl":"{PAC}"}}"#),
+            );
+            let chrome = &discover(&root)[0];
+            assert_eq!(chrome.pac_url.as_deref(), Some(PAC));
+            assert_eq!(
+                chrome.source.as_deref(),
+                Some(
+                    root.join("etc/opt/chrome/policies/managed/b.json")
+                        .as_path()
+                )
+            );
+            assert_eq!(chrome.detail, None);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn an_unreadable_policy_directory_is_reported() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = temp_root("noaccess");
+            let managed = root.join("etc/opt/chrome/policies/managed");
+            write(&root, "etc/opt/chrome/policies/managed/p.json", "{}");
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o000)).unwrap();
+            let readable = fs::read_dir(&managed).is_ok(); // root ignores modes
+            let chrome = discover(&root).into_iter().next();
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
+            if !readable {
+                let chrome = chrome.expect("reported");
+                assert_eq!(chrome.pac_url, None);
+                assert!(chrome.detail.as_deref().unwrap().contains("read "));
+            }
             fs::remove_dir_all(root).unwrap();
         }
 

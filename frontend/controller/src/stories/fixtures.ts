@@ -768,3 +768,32 @@ export const sandboxDaemonConfig: DaemonConfigDocument = {
     codex: {},
   },
 };
+
+export const differsDeviceDetail: DeviceDetail = {
+  ...deviceDetail,
+  browser_pac: {
+    state: "differs",
+    url: null,
+    sha256: null,
+    size: null,
+    fetch_error: null,
+    compliance: {
+      state: "not_compliant",
+      reason: "browsers set different PACs",
+    },
+  },
+  browser_pacs: [
+    { ...deviceDetail.browser_pacs[0] },
+    {
+      ...deviceDetail.browser_pacs[1],
+      pac_url: "https://old-pac.corp.example/ai-egress.pac",
+    },
+  ],
+  pac_fetches: [
+    ...deviceDetail.pac_fetches,
+    {
+      url: "https://old-pac.corp.example/ai-egress.pac",
+      error: "error sending request",
+    },
+  ],
+};

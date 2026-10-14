@@ -66,6 +66,13 @@ impl InventoryWatch {
         ))
     }
 
+    /// Uses `directories` instead of the browser policy directories.
+    #[cfg(test)]
+    pub(crate) fn with_policy_directories(mut self, directories: fn() -> Vec<PathBuf>) -> Self {
+        self.policy_directories = directories;
+        self
+    }
+
     /// Points the watch at the directories behind `discovery`.
     ///
     /// Called again after every published snapshot, so a tool that gains or

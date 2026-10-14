@@ -487,6 +487,30 @@ function BrowserPacCard({ device }: { device: DeviceDetail }) {
               <time />
             </div>
           )}
+          {!pac.url &&
+            device.pac_fetches.map((fetch) => (
+              <div className="event-row" key={fetch.url}>
+                <span className="event-source">
+                  <span>
+                    <strong>PAC identity</strong>
+                    <small title={fetch.url}>{fetch.url}</small>
+                  </span>
+                </span>
+                <span className="program-state">
+                  {fetch.sha256 ? (
+                    <code title={`SHA-256 ${fetch.sha256}`}>
+                      {fetch.sha256.slice(0, 16)} · {fetch.size} bytes
+                    </code>
+                  ) : (
+                    <>
+                      <span className="badge warning">PAC not reachable</span>
+                      <code title={fetch.error}>{fetch.error}</code>
+                    </>
+                  )}
+                </span>
+                <time />
+              </div>
+            ))}
           {pac.compliance?.reason && (
             <div className="event-row">
               <span className="event-source">
