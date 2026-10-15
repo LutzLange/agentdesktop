@@ -365,9 +365,9 @@ mod envelope {
     /// directory, so the key entries are scoped to this identity.
     fn store_id(path: &Path) -> anyhow::Result<Option<String>> {
         let id_path = store_id_path(path)?;
-        match fs::read_to_string(&id_path) {
-            Ok(id) if is_store_id(&id) => Ok(Some(id)),
-            Ok(_) => Ok(None),
+        match fs::read(&id_path) {
+            // Anything else, including bytes that are not UTF-8, is malformed.
+            Ok(id) => Ok(String::from_utf8(id).ok().filter(|id| is_store_id(id))),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error).with_context(|| format!("read {}", id_path.display())),
         }
@@ -786,6 +786,24 @@ mod envelope {
                 get(&second, &keys, SERVICE, ACCOUNT).unwrap().as_deref(),
                 Some("second")
             );
+        }
+
+        #[test]
+        fn a_malformed_store_identity_is_replaced_by_the_next_write() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = entry(&directory, "entry");
+            let keys = FakeKeys::default();
+            set(&path, &keys, SERVICE, ACCOUNT, "secret").unwrap();
+
+            for malformed in [&b"\xff\xfe not utf-8"[..], b"too short"] {
+                fs::write(directory.path().join(".store-id"), malformed).unwrap();
+                assert_eq!(get(&path, &keys, SERVICE, ACCOUNT).unwrap(), None);
+                set(&path, &keys, SERVICE, ACCOUNT, "rewritten").unwrap();
+                assert_eq!(
+                    get(&path, &keys, SERVICE, ACCOUNT).unwrap().as_deref(),
+                    Some("rewritten")
+                );
+            }
         }
 
         #[test]
