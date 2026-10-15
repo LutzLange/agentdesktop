@@ -24,7 +24,7 @@ pub struct SecretStore {
 
 impl SecretStore {
     pub fn new(state_dir: &Path) -> anyhow::Result<Self> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let directory = state_dir.join("secrets");
             secure_fs::ensure_private_dir(&directory)?;
@@ -39,13 +39,6 @@ impl SecretStore {
             Ok(Self {
                 keychain: macos_keychain_domain(effective_uid),
             })
-        }
-
-        #[cfg(windows)]
-        {
-            let directory = state_dir.join("secrets");
-            secure_fs::ensure_private_dir(&directory)?;
-            Ok(Self { directory })
         }
     }
 
@@ -260,10 +253,22 @@ mod envelope {
                 return Err(error).with_context(|| format!("read secret from {}", path.display()));
             }
         };
-        let key = read_key(keys, service, account)?
-            .context("the key of a stored secret is missing")?
-            .context("the key of a stored secret is malformed")?;
-        open(&key, service, account, sealed).map(Some)
+        match read_key(keys, service, account)? {
+            StoredKey::Key(key) => open(&key, service, account, sealed).map(Some),
+            // Nothing can open the file any more (the credential store was
+            // reset, or the state directory restored without it), so the secret
+            // is gone. Reporting it as absent lets callers sign in again; the
+            // next write replaces the file.
+            StoredKey::Missing => {
+                tracing::warn!(
+                    service,
+                    path = %path.display(),
+                    "the key of a stored secret is missing; treating the secret as absent"
+                );
+                Ok(None)
+            }
+            StoredKey::Malformed => bail!("the key of a stored secret is malformed"),
+        }
     }
 
     pub(super) fn set(
@@ -278,8 +283,8 @@ mod envelope {
         // step that changes the stored secret. A key that cannot be decoded
         // cannot open the current file either, so it is replaced.
         let key = match read_key(keys, service, account)? {
-            Some(Some(key)) => key,
-            Some(None) | None => {
+            StoredKey::Key(key) => key,
+            StoredKey::Missing | StoredKey::Malformed => {
                 let mut key = [0; KEY_LEN];
                 aws_lc_rs::rand::fill(&mut key)
                     .map_err(|_| anyhow::anyhow!("generate secret file key"))?;
@@ -288,10 +293,13 @@ mod envelope {
                 key
             }
         };
+        // Only the first write can replace a value an earlier version stored
+        // directly; later writes skip the credential store lookup.
+        let first_write = !path.try_exists().unwrap_or(true);
         secure_fs::atomic_write(path, &seal(&key, service, account, secret)?, 0o600)
             .with_context(|| format!("store secret in {}", path.display()))?;
-        // The file now shadows a value an earlier version stored directly.
-        if let Err(error) = keys.delete(service, account) {
+        // The file now shadows that value; remove it so no stale copy is left.
+        if first_write && let Err(error) = keys.delete(service, account) {
             tracing::warn!(%error, service, "could not remove the replaced credential store entry");
         }
         Ok(())
@@ -323,22 +331,24 @@ mod envelope {
         format!("{service}{KEY_SERVICE_SUFFIX}")
     }
 
-    /// `None` when there is no key, `Some(None)` when the stored key cannot be
-    /// decoded.
-    fn read_key(
-        keys: &impl KeyBackend,
-        service: &str,
-        account: &str,
-    ) -> anyhow::Result<Option<Option<[u8; KEY_LEN]>>> {
-        let encoded = keys
+    enum StoredKey {
+        Missing,
+        Malformed,
+        Key([u8; KEY_LEN]),
+    }
+
+    fn read_key(keys: &impl KeyBackend, service: &str, account: &str) -> anyhow::Result<StoredKey> {
+        let Some(encoded) = keys
             .get(&key_service(service), account)
-            .context("read secret file key")?;
-        Ok(encoded.map(|encoded| {
-            STANDARD
-                .decode(encoded)
-                .ok()
-                .and_then(|key| key.try_into().ok())
-        }))
+            .context("read secret file key")?
+        else {
+            return Ok(StoredKey::Missing);
+        };
+        Ok(STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|key| key.try_into().ok())
+            .map_or(StoredKey::Malformed, StoredKey::Key))
     }
 
     /// Binds the file to its entry, so a file moved to another entry's path
@@ -417,6 +427,7 @@ mod envelope {
             entries: RefCell<BTreeMap<(String, String), String>>,
             fail_sets: Cell<bool>,
             fail_deletes_of: RefCell<Option<String>>,
+            deletes: Cell<usize>,
         }
 
         impl FakeKeys {
@@ -447,8 +458,9 @@ mod envelope {
                 if self.fail_sets.get() {
                     anyhow::bail!("injected set failure");
                 }
-                // Windows Credential Manager limit.
-                assert!(value.len() <= 2560, "credential too large: {}", value.len());
+                // Windows Credential Manager limit; keyring stores UTF-16.
+                let size = value.encode_utf16().count() * 2;
+                assert!(size <= 2560, "credential too large: {size} bytes");
                 self.entries
                     .borrow_mut()
                     .insert((service.to_owned(), account.to_owned()), value.to_owned());
@@ -456,6 +468,7 @@ mod envelope {
             }
 
             fn delete(&self, service: &str, account: &str) -> anyhow::Result<()> {
+                self.deletes.set(self.deletes.get() + 1);
                 if self.fail_deletes_of.borrow().as_deref() == Some(service) {
                     anyhow::bail!("injected delete failure");
                 }
@@ -526,6 +539,19 @@ mod envelope {
         }
 
         #[test]
+        fn only_the_first_write_removes_an_earlier_versions_value() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = entry(&directory, "entry");
+            let keys = FakeKeys::default();
+            keys.insert(SERVICE, "legacy");
+
+            set(&path, &keys, SERVICE, ACCOUNT, "first").unwrap();
+            assert_eq!(keys.deletes.get(), 1);
+            set(&path, &keys, SERVICE, ACCOUNT, "second").unwrap();
+            assert_eq!(keys.deletes.get(), 1);
+        }
+
+        #[test]
         fn a_failed_key_write_keeps_the_current_value() {
             let directory = tempfile::tempdir().unwrap();
             let path = entry(&directory, "entry");
@@ -586,7 +612,7 @@ mod envelope {
         }
 
         #[test]
-        fn a_tampered_file_or_missing_key_is_an_error_that_the_next_write_repairs() {
+        fn a_tampered_file_or_malformed_key_is_an_error_and_a_missing_key_reads_as_absent() {
             let directory = tempfile::tempdir().unwrap();
             let path = entry(&directory, "entry");
             let keys = FakeKeys::default();
@@ -603,7 +629,7 @@ mod envelope {
             );
 
             keys.entries.borrow_mut().clear();
-            assert!(get(&path, &keys, SERVICE, ACCOUNT).is_err());
+            assert_eq!(get(&path, &keys, SERVICE, ACCOUNT).unwrap(), None);
             set(&path, &keys, SERVICE, ACCOUNT, "rekeyed").unwrap();
             assert_eq!(
                 get(&path, &keys, SERVICE, ACCOUNT).unwrap().as_deref(),
