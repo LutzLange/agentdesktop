@@ -1,13 +1,27 @@
 import {
   CardHeader,
+  friendlyBrowser,
   friendlyTool,
   ModelRuntimeInventory,
   ToolIcon,
   ToolInventory,
+  UsageBreakdownTable,
+  UsageMetrics,
+  UsageNotes,
 } from "@agentdesktop/ui";
-import { ArrowLeft, Box, CircleAlert, Code2, Cpu, Trash2 } from "lucide-react";
+import {
+  ArrowLeft,
+  Box,
+  ChartColumn,
+  ChevronRight,
+  CircleAlert,
+  Code2,
+  Cpu,
+  Trash2,
+} from "lucide-react";
 import { useEffect, useRef } from "react";
 
+import { PacBadge, PacComplianceBadge } from "../components/BrowserPac";
 import {
   ConfigBadge,
   DefinitionList,
@@ -20,7 +34,7 @@ import {
   friendlyOs,
 } from "../format";
 import { Link } from "../router";
-import type { DeviceDetail, ProgramStatus } from "../types";
+import type { DeviceDetail, ProgramStatus, UsageReport } from "../types";
 
 export interface DeviceViewProps {
   deleteError: string | null;
@@ -30,6 +44,8 @@ export interface DeviceViewProps {
   onDeleteCancel: () => void;
   onDeleteConfirm: () => void;
   onDeleteRequest: () => void;
+  /** This device's last 30 days, when the controller has usage. */
+  usage?: UsageReport | null;
 }
 
 export function DeviceView({
@@ -40,6 +56,7 @@ export function DeviceView({
   onDeleteCancel,
   onDeleteConfirm,
   onDeleteRequest,
+  usage,
 }: DeviceViewProps) {
   const modelCount = device.model_runtimes.reduce(
     (total, runtime) => total + runtime.models.length,
@@ -143,6 +160,10 @@ export function DeviceView({
           )}
         </section>
       )}
+      {usage && (usage.enabled || usage.totals.requests > 0) ? (
+        <DeviceUsage deviceId={device.id} usage={usage} />
+      ) : null}
+      <BrowserPacCard device={device} />
       <section className="card table-card">
         <CardHeader
           title="Recent activity"
@@ -262,6 +283,54 @@ export function DeviceView({
   );
 }
 
+function DeviceUsage({
+  deviceId,
+  usage,
+}: {
+  deviceId: string;
+  usage: UsageReport;
+}) {
+  const tools = usage.breakdowns.tool ?? [];
+  const models = usage.breakdowns.model ?? [];
+  return (
+    <section className="card table-card device-usage">
+      <CardHeader
+        title="Usage"
+        description="Last 30 days"
+        action={
+          <Link
+            href={`/usage?${new URLSearchParams({ range: "30d", device: deviceId })}`}
+            className="text-link"
+          >
+            View in Usage <ChevronRight size={14} />
+          </Link>
+        }
+      />
+      {usage.totals.requests ? (
+        <>
+          <UsageMetrics totals={usage.totals} />
+          <UsageNotes totals={usage.totals} />
+          <UsageBreakdownTable
+            dimension="tool"
+            label="Usage by tool"
+            rows={tools}
+          />
+          <UsageBreakdownTable
+            dimension="model"
+            label="Usage by model"
+            rows={models}
+          />
+        </>
+      ) : (
+        <div className="empty-inline">
+          <ChartColumn size={20} />
+          <span>No LLM gateway usage in the last 30 days.</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function DeleteDeviceDialog({
   hostname,
   deleting,
@@ -351,6 +420,135 @@ const programStateLabels: Record<ProgramStatus["state"], string> = {
   failed: "Failed",
   unspecified: "Unknown",
 };
+
+function BrowserPacCard({ device }: { device: DeviceDetail }) {
+  const pac = device.browser_pac;
+  return (
+    <section className="card table-card">
+      <CardHeader
+        title={
+          pac.compliance ? "Browser PAC (compliance check)" : "Browser PAC"
+        }
+        description={
+          pac.compliance
+            ? "Compares the PAC configured in browser policy with the fleet's expected PAC URL. Agentdesktop does not configure browsers."
+            : "The proxy auto-config (PAC) URL set by browser policy"
+        }
+      />
+      {pac.state === "not_reported" ? (
+        <p className="empty-state compact">
+          No browser policy reported by this agent
+        </p>
+      ) : (
+        <div className="event-list">
+          <div className="event-row">
+            <span className="event-source">
+              <strong>Device</strong>
+            </span>
+            <span className="program-state">
+              <PacBadge pac={pac} />
+              {pac.url && <code title={pac.url}>{pac.url}</code>}
+            </span>
+            <time>
+              {pac.compliance && (
+                <PacComplianceBadge compliance={pac.compliance} />
+              )}
+            </time>
+          </div>
+          {(pac.sha256 || pac.fetch_error) && (
+            <div className="event-row">
+              <span className="event-source">
+                <span>
+                  <strong>PAC identity</strong>
+                  <small>SHA-256 of what the device fetched</small>
+                </span>
+              </span>
+              <span className="program-state">
+                {pac.sha256 ? (
+                  <code title={`SHA-256 ${pac.sha256}`}>
+                    {pac.sha256.slice(0, 16)} · {pac.size} bytes
+                  </code>
+                ) : (
+                  <>
+                    <span className="badge warning">PAC not reachable</span>
+                    <code title={pac.fetch_error ?? undefined}>
+                      {pac.fetch_error}
+                    </code>
+                  </>
+                )}
+              </span>
+              <time />
+            </div>
+          )}
+          {!pac.url &&
+            device.pac_fetches.map((fetch) => (
+              <div className="event-row" key={fetch.url}>
+                <span className="event-source">
+                  <span>
+                    <strong>PAC identity</strong>
+                    <small title={fetch.url}>{fetch.url}</small>
+                  </span>
+                </span>
+                <span className="program-state">
+                  {fetch.sha256 ? (
+                    <code title={`SHA-256 ${fetch.sha256}`}>
+                      {fetch.sha256.slice(0, 16)} · {fetch.size} bytes
+                    </code>
+                  ) : (
+                    <>
+                      <span className="badge warning">PAC not reachable</span>
+                      <code title={fetch.error}>{fetch.error}</code>
+                    </>
+                  )}
+                </span>
+                <time />
+              </div>
+            ))}
+          {pac.compliance?.reason && (
+            <div className="event-row">
+              <span className="event-source">
+                <strong>Not compliant because</strong>
+              </span>
+              <span className="program-state">
+                <code title={pac.compliance.reason}>
+                  {pac.compliance.reason}
+                </code>
+              </span>
+              <time />
+            </div>
+          )}
+          {device.browser_pacs.map((browser) => (
+            <div className="event-row" key={browser.browser}>
+              <span className="event-source">
+                <span>
+                  <strong>{friendlyBrowser(browser.browser)}</strong>
+                  {browser.packaging && <small>{browser.packaging}</small>}
+                </span>
+              </span>
+              <span className="program-state">
+                <code
+                  title={
+                    browser.detail ??
+                    (browser.source ? `From ${browser.source}` : undefined)
+                  }
+                >
+                  {browser.pac_url ?? browser.detail ?? "No PAC in policy"}
+                </code>
+                {browser.recommended && (
+                  <span className="badge warning">Recommended</span>
+                )}
+                {browser.locked && (
+                  <span className="badge neutral">Locked</span>
+                )}
+              </span>
+              <time />
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
 
 function ProgramBadge({ state }: { state: ProgramStatus["state"] }) {
   const tone =

@@ -8,6 +8,86 @@ pub struct Discovery {
     pub agents: Vec<Agent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_runtimes: Vec<ModelRuntime>,
+    /// Proxy auto-config (PAC) set by browser policy, one entry per browser
+    /// that is installed or has policy, as read from machine policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browser_pacs: Vec<BrowserPac>,
+    /// One fetch per distinct PAC URL in `browser_pacs`: the identity of the
+    /// PAC this device gets (SHA-256 of the body), never its content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pac_fetches: Vec<PacFetch>,
+}
+
+/// The result of fetching one PAC URL, as a browser on this device would.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PacFetch {
+    pub url: String,
+    /// Lowercase hex SHA-256 of the response body, when the fetch succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Body size in bytes, when the fetch succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Why the fetch failed, at most 1024 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The PAC a browser's policy sets, as read from machine policy.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPac {
+    /// `chrome`, `edge`, `chromium` or `firefox`.
+    pub browser: String,
+    /// How the browser is installed (`system`, `snap`, `flatpak`), or empty
+    /// when only policy was found.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub packaging: String,
+    /// The PAC URL, when policy selects PAC mode with a non-empty URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pac_url: Option<String>,
+    /// The value came from a location the user can override
+    /// (`policies/recommended`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recommended: bool,
+    /// Firefox `Proxy.Locked`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// The policy file the value came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
+    /// A read error or conflicting policy files, at most 1024 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One PAC value per device, derived from its browser rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DevicePac {
+    /// No browser's policy sets a PAC.
+    Absent,
+    /// Every browser row names this PAC URL.
+    Found(String),
+    /// Browsers disagree: different URLs, or some have a PAC and some don't.
+    Differs,
+}
+
+impl DevicePac {
+    /// Derives the device value. No browser rows at all is `Absent`.
+    pub fn from_browsers(browsers: &[BrowserPac]) -> Self {
+        let mut urls = browsers.iter().map(|browser| browser.pac_url.as_deref());
+        let Some(first) = urls.next() else {
+            return Self::Absent;
+        };
+        if urls.any(|url| url != first) {
+            return Self::Differs;
+        }
+        match first {
+            Some(url) => Self::Found(url.to_owned()),
+            None => Self::Absent,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -133,6 +213,25 @@ pub struct DaemonInfo {
     /// `daemon.llmProxy.listen` is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_proxy: Option<LlmProxyInfo>,
+    /// Receiver for usage from a gateway on this machine, when
+    /// `daemon.usage` is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_receiver: Option<UsageReceiverInfo>,
+}
+
+/// State of the daemon's receiver for gateway usage.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReceiverInfo {
+    /// Configured address; the bound address once the listener is up.
+    pub listen: String,
+    /// Whether the receiver accepts exports. `false` means its listener,
+    /// token, or database failed at startup; it stays off until the daemon
+    /// restarts.
+    pub bound: bool,
+    /// Why the receiver is off, when `bound` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// State of the daemon's loopback LLM proxy listener.
@@ -202,6 +301,62 @@ pub struct LlmGatewayLoginStatus {
     pub user_code: Option<String>,
 }
 
+/// Token and cost totals over a set of LLM gateway requests.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// API-billed cost in US dollars at the gateway's catalog prices.
+    pub cost_usd: f64,
+    /// Subscription-billed requests priced at API rates. A subscription is
+    /// not billed per token, so this is never part of `cost_usd`.
+    pub subscription_cost_usd: f64,
+    pub subscription_requests: u64,
+    /// Requests for models the gateway has no price for.
+    pub unpriced_requests: u64,
+}
+
+/// Usage totals for one value of a breakdown dimension.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageGroup {
+    pub key: String,
+    pub totals: UsageTotals,
+}
+
+/// Usage totals for one time bucket.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageBucket {
+    pub start_unix_seconds: u64,
+    pub totals: UsageTotals,
+}
+
+/// LLM gateway usage recorded for this device by its controller, or by the
+/// daemon itself when it has no controller.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceUsage {
+    /// False when the controller does not collect usage.
+    pub enabled: bool,
+    pub from_unix_seconds: u64,
+    pub to_unix_seconds: u64,
+    pub bucket_seconds: u64,
+    pub totals: UsageTotals,
+    pub buckets: Vec<UsageBucket>,
+    pub by_tool: Vec<UsageGroup>,
+    pub by_model: Vec<UsageGroup>,
+    /// Configured tools whose traffic does not reach the gateway's usage
+    /// records, such as VS Code with `copilotChat: githubModels`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmetered_tools: Vec<String>,
+}
+
 /// A timestamped telemetry observation emitted by a managed device.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -241,7 +396,43 @@ pub enum TelemetryEventKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControllerConnectionError, ControllerConnectionStatus};
+    use super::{BrowserPac, ControllerConnectionError, ControllerConnectionStatus, DevicePac};
+
+    fn browser(name: &str, pac_url: Option<&str>) -> BrowserPac {
+        BrowserPac {
+            browser: name.to_owned(),
+            pac_url: pac_url.map(str::to_owned),
+            ..BrowserPac::default()
+        }
+    }
+
+    #[test]
+    fn device_pac_is_one_value_when_browsers_agree() {
+        let pac = "https://pac.corp.example/ai.pac";
+        assert_eq!(DevicePac::from_browsers(&[]), DevicePac::Absent);
+        assert_eq!(
+            DevicePac::from_browsers(&[browser("chrome", None), browser("firefox", None)]),
+            DevicePac::Absent
+        );
+        assert_eq!(
+            DevicePac::from_browsers(&[
+                browser("chrome", Some(pac)),
+                browser("firefox", Some(pac))
+            ]),
+            DevicePac::Found(pac.to_owned())
+        );
+        assert_eq!(
+            DevicePac::from_browsers(&[browser("chrome", Some(pac)), browser("firefox", None)]),
+            DevicePac::Differs
+        );
+        assert_eq!(
+            DevicePac::from_browsers(&[
+                browser("chrome", Some(pac)),
+                browser("edge", Some("https://other.example/ai.pac")),
+            ]),
+            DevicePac::Differs
+        );
+    }
 
     #[test]
     fn controller_connection_error_is_a_closed_camel_case_set() {

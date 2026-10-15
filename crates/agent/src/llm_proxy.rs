@@ -1402,15 +1402,16 @@ mod tests {
                 "refreshToken": null, "refreshExpiresAt": 0,
             }).to_string()).unwrap();
             let config = parse_daemon(&format!("llmGateway:\n  url: http://{address}/gateway\n  githubOAuth:\n    clientId: github-test\n  authentication:\n    type: oidc\n    issuer: https://issuer.example/\n    clientId: proxy-test\n")).unwrap();
-            let (_, discovery) = watch::channel(Arc::new(Discovery { agents: vec![], model_runtimes: vec![] }));
+            let (_, discovery) = watch::channel(Arc::new(Discovery { agents: vec![], model_runtimes: vec![], browser_pacs: vec![], pac_fetches: vec![] }));
             let state = AppState {
                 controller_status: None,
                 config,
                 daemon_info: DaemonInfo { version: "test".into(), scope: DaemonScope::User,
                     config_path: String::new(), state_directory: String::new(),
-                    inventory_interval: Duration::from_secs(60), controller: None, llm_proxy: None },
+                    inventory_interval: Duration::from_secs(60), controller: None, llm_proxy: None,
+                    usage_receiver: None },
                 discovery, enrollment: EnrollmentState::new(false), state_dir: dir.path().to_owned(),
-                oidc_callback_listen: None, telemetry: None, logout: None,
+                oidc_callback_listen: None, telemetry: None, logout: None, usage: None,
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let proxy_address = listener.local_addr().unwrap();
@@ -2025,6 +2026,8 @@ mod tests {
             let (_, discovery) = watch::channel(Arc::new(Discovery {
                 agents: vec![],
                 model_runtimes: vec![],
+                browser_pacs: Vec::new(),
+                pac_fetches: Vec::new(),
             }));
             let state = AppState {
                 controller_status: None,
@@ -2037,6 +2040,7 @@ mod tests {
                     inventory_interval: Duration::from_secs(60),
                     controller: None,
                     llm_proxy: None,
+                    usage_receiver: None,
                 },
                 discovery,
                 enrollment: EnrollmentState::new(true),
@@ -2044,6 +2048,7 @@ mod tests {
                 oidc_callback_listen: None,
                 telemetry: None,
                 logout: None,
+                usage: None,
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let proxy_address = listener.local_addr().unwrap();
@@ -2412,6 +2417,8 @@ mod tests {
         let (_, discovery) = watch::channel(Arc::new(Discovery {
             agents: vec![],
             model_runtimes: vec![],
+            browser_pacs: Vec::new(),
+            pac_fetches: Vec::new(),
         }));
         let state = AppState {
             controller_status: None,
@@ -2424,6 +2431,7 @@ mod tests {
                 inventory_interval: Duration::from_secs(60),
                 controller: None,
                 llm_proxy: None,
+                usage_receiver: None,
             },
             discovery,
             enrollment: EnrollmentState::new(false),
@@ -2431,6 +2439,7 @@ mod tests {
             oidc_callback_listen: None,
             telemetry: None,
             logout: None,
+            usage: None,
         };
         (dir, state)
     }
@@ -2588,6 +2597,8 @@ mod tests {
         let (_, discovery) = watch::channel(Arc::new(Discovery {
             agents: vec![],
             model_runtimes: vec![],
+            browser_pacs: Vec::new(),
+            pac_fetches: Vec::new(),
         }));
         let state = AppState {
             controller_status: None,
@@ -2600,6 +2611,7 @@ mod tests {
                 inventory_interval: Duration::from_secs(60),
                 controller: None,
                 llm_proxy: None,
+                usage_receiver: None,
             },
             discovery,
             enrollment: EnrollmentState::new(false),
@@ -2607,6 +2619,7 @@ mod tests {
             oidc_callback_listen: None,
             telemetry: None,
             logout: None,
+            usage: None,
         };
         (dir, state)
     }
@@ -2655,6 +2668,8 @@ mod tests {
         let (_, discovery) = watch::channel(Arc::new(Discovery {
             agents: vec![],
             model_runtimes: vec![],
+            browser_pacs: Vec::new(),
+            pac_fetches: Vec::new(),
         }));
         let state = AppState {
             controller_status: None,
@@ -2667,6 +2682,7 @@ mod tests {
                 inventory_interval: Duration::from_secs(60),
                 controller: None,
                 llm_proxy: None,
+                usage_receiver: None,
             },
             discovery,
             enrollment: EnrollmentState::new(false),
@@ -2674,6 +2690,7 @@ mod tests {
             oidc_callback_listen: None,
             telemetry: None,
             logout: None,
+            usage: None,
         };
         (dir, state)
     }

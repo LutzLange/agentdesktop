@@ -3,7 +3,7 @@ use std::{net::SocketAddr, time::SystemTime};
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -13,11 +13,13 @@ use serde::Serialize;
 use tracing::info;
 
 use agentdesktop_core::config::DaemonConfig;
+use agentdesktop_usage::{UsageError, UsageQuery, UsageReport};
 
 use crate::{
     daemon_config::DaemonConfigStore,
     database::{Database, DeviceDetail, DeviceSummary},
     gateway_jwt::{self, GatewayJwks},
+    usage,
 };
 
 #[derive(Clone)]
@@ -25,6 +27,8 @@ pub struct AdminState {
     database: Database,
     daemon_config: DaemonConfigStore,
     settings: ControllerSettings,
+    /// `browserEgress.compliance.pacUrl` from the controller configuration.
+    expected_pac_url: Option<url::Url>,
 }
 
 #[derive(Clone, Serialize)]
@@ -34,6 +38,7 @@ pub struct ControllerSettings {
     pub oidc_enabled: bool,
     pub tls_enabled: bool,
     pub gateway_jwt_enabled: bool,
+    pub usage_enabled: bool,
 }
 
 impl AdminState {
@@ -41,11 +46,13 @@ impl AdminState {
         database: Database,
         daemon_config: DaemonConfigStore,
         settings: ControllerSettings,
+        expected_pac_url: Option<url::Url>,
     ) -> Self {
         Self {
             database,
             daemon_config,
             settings,
+            expected_pac_url,
         }
     }
 }
@@ -62,6 +69,24 @@ struct Overview {
     config_failures: usize,
     active_revision: Option<u64>,
     recent_devices: Vec<DeviceSummary>,
+    browser_pac: BrowserPacOverview,
+}
+
+/// Device counts by browser PAC value, and by compliance state when the
+/// fleet configuration has a compliance profile.
+#[derive(Serialize, Default)]
+struct BrowserPacOverview {
+    found: usize,
+    absent: usize,
+    differs: usize,
+    not_reported: usize,
+    /// `None` without a compliance profile.
+    expected_pac_url: Option<String>,
+    compliant: usize,
+    not_compliant: usize,
+    /// Devices that found a PAC, grouped by URL and SHA-256 of what they
+    /// fetched: more than one group per URL means devices get different PACs.
+    versions: Vec<crate::browser_pac::PacVersion>,
 }
 
 pub async fn serve(
@@ -78,6 +103,7 @@ pub async fn serve(
             get(device).delete(delete_device),
         )
         .route("/api/v1/settings", get(settings))
+        .route("/api/v1/usage", get(usage_report))
         .fallback(get(asset))
         .with_state(state)
         .merge(gateway_jwt::routes(gateway_jwks));
@@ -87,8 +113,45 @@ pub async fn serve(
     Ok(())
 }
 
+/// Fills in each device's PAC value and compliance at read time, so a
+/// profile change shows without waiting for the next inventory.
+fn with_browser_pac(state: &AdminState, mut devices: Vec<DeviceSummary>) -> Vec<DeviceSummary> {
+    let expected = state.expected_pac_url.as_ref();
+    for device in &mut devices {
+        device.browser_pac = crate::browser_pac::with_identity(
+            crate::browser_pac::evaluate(&device.browser_pacs, expected),
+            &device.pac_fetches,
+        );
+    }
+    devices
+}
+
 async fn overview(State(state): State<AdminState>) -> Result<Json<Overview>, AdminError> {
-    let devices = state.database.list_devices().await?;
+    let devices = with_browser_pac(&state, state.database.list_devices().await?);
+    let mut browser_pac = BrowserPacOverview {
+        expected_pac_url: state.expected_pac_url.clone().map(String::from),
+        ..BrowserPacOverview::default()
+    };
+    browser_pac.versions =
+        crate::browser_pac::pac_versions(devices.iter().map(|device| &device.browser_pac));
+    for device in &devices {
+        match device.browser_pac.state {
+            "found" => browser_pac.found += 1,
+            "absent" => browser_pac.absent += 1,
+            "differs" => browser_pac.differs += 1,
+            _ => browser_pac.not_reported += 1,
+        }
+        match device
+            .browser_pac
+            .compliance
+            .as_ref()
+            .map(|compliance| compliance.state)
+        {
+            Some("compliant") => browser_pac.compliant += 1,
+            Some("not_compliant") => browser_pac.not_compliant += 1,
+            _ => {}
+        }
+    }
     let now = unix_time_seconds();
     let online_devices = devices
         .iter()
@@ -109,23 +172,31 @@ async fn overview(State(state): State<AdminState>) -> Result<Json<Overview>, Adm
         config_failures,
         active_revision: state.daemon_config.current().map(|config| config.revision),
         recent_devices: devices.into_iter().take(5).collect(),
+        browser_pac,
     }))
 }
 
 async fn devices(State(state): State<AdminState>) -> Result<Json<Vec<DeviceSummary>>, AdminError> {
-    Ok(Json(state.database.list_devices().await?))
+    Ok(Json(with_browser_pac(
+        &state,
+        state.database.list_devices().await?,
+    )))
 }
 
 async fn device(
     State(state): State<AdminState>,
     Path(device_id): Path<String>,
 ) -> Result<Json<DeviceDetail>, AdminError> {
-    state
+    let mut detail = state
         .database
         .get_device(&device_id)
         .await?
-        .map(Json)
-        .ok_or(AdminError::NotFound)
+        .ok_or(AdminError::NotFound)?;
+    detail.device.browser_pac = crate::browser_pac::with_identity(
+        crate::browser_pac::evaluate(&detail.device.browser_pacs, state.expected_pac_url.as_ref()),
+        &detail.device.pac_fetches,
+    );
+    Ok(Json(detail))
 }
 
 async fn delete_device(
@@ -141,6 +212,22 @@ async fn delete_device(
 
 async fn settings(State(state): State<AdminState>) -> Json<ControllerSettings> {
     Json(state.settings)
+}
+
+async fn usage_report(
+    State(state): State<AdminState>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<UsageReport>, AdminError> {
+    let labels = usage::labels(&state.database).await?;
+    Ok(Json(
+        agentdesktop_usage::report(
+            &state.database.usage(),
+            &query,
+            state.settings.usage_enabled,
+            &labels,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Serialize)]
@@ -199,6 +286,7 @@ fn unix_time_seconds() -> i64 {
 enum AdminError {
     Internal(anyhow::Error),
     NotFound,
+    BadRequest(&'static str),
 }
 
 impl From<anyhow::Error> for AdminError {
@@ -207,10 +295,20 @@ impl From<anyhow::Error> for AdminError {
     }
 }
 
+impl From<UsageError> for AdminError {
+    fn from(error: UsageError) -> Self {
+        match error {
+            UsageError::InvalidQuery(message) => Self::BadRequest(message),
+            UsageError::Storage(error) => Self::Internal(error),
+        }
+    }
+}
+
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
         match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "device not found").into_response(),
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             Self::Internal(error) => {
                 tracing::error!(%error, "admin API operation failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "controller state error").into_response()

@@ -1,7 +1,10 @@
+import { emptyUsageTotals, type UsageTotals } from "@agentdesktop/ui";
+
 import type {
   Bootstrap,
   ConnectorSnapshot,
   DaemonInfo,
+  DeviceUsage,
   Discovery,
   ManagedDeviceSnapshot,
 } from "../types";
@@ -29,6 +32,21 @@ export const proxyUnboundDaemonInfo: DaemonInfo = {
     bound: false,
     clientId: "copilot-cli",
     error: "Address already in use (os error 98)",
+  },
+};
+
+export const usageReceiverDaemonInfo: DaemonInfo = {
+  ...standaloneDaemonInfo,
+  usageReceiver: { listen: "127.0.0.1:4319", bound: true },
+};
+
+export const usageReceiverOffDaemonInfo: DaemonInfo = {
+  ...standaloneDaemonInfo,
+  usageReceiver: {
+    listen: "127.0.0.1:4319",
+    bound: false,
+    error:
+      "read usage token from /Users/developer/.config/agentdesktop/usage-token: No such file or directory (os error 2)",
   },
 };
 
@@ -318,6 +336,130 @@ export const populatedDiscovery: Discovery = {
       models: [{ name: "gemma3:4b" }, { name: "qwen3:8b" }],
     },
   ],
+  pacFetches: [
+    {
+      url: "https://pac.corp.example/ai-egress.pac",
+      sha256:
+        "3f9a2c71d04be8a6c5e1f27d9b03a4c8e6f1d2a7b9c0e3f4a5b6c7d8e9f0a1b2",
+      size: 435,
+    },
+  ],
+  browserPacs: [
+    {
+      browser: "chrome",
+      packaging: "system",
+      pacUrl: "https://pac.corp.example/ai-egress.pac",
+      source: "/Library/Managed Preferences/com.google.Chrome.plist",
+    },
+    {
+      browser: "firefox",
+      packaging: "system",
+      pacUrl: "https://pac.corp.example/ai-egress.pac",
+      locked: true,
+      source: "/Library/Managed Preferences/org.mozilla.firefox.plist",
+    },
+  ],
 };
 
 export const emptyDiscovery: Discovery = { agents: [] };
+
+const day = 86400;
+const startOfToday = (() => {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  return Math.floor(date.getTime() / 1000);
+})();
+
+function usageTotals(totals: Partial<UsageTotals>): UsageTotals {
+  return { ...emptyUsageTotals, ...totals };
+}
+
+const dailyTokens = [310_000, 0, 820_000, 1_240_000, 560_000, 905_000, 410_000];
+
+export const deviceUsage: DeviceUsage = {
+  enabled: true,
+  fromUnixSeconds: startOfToday - 6 * day,
+  toUnixSeconds: startOfToday + day,
+  bucketSeconds: day,
+  totals: usageTotals({
+    requests: 912,
+    errors: 3,
+    inputTokens: 3_910_000,
+    outputTokens: 335_000,
+    cacheReadTokens: 2_600_000,
+    costUsd: 9.84,
+    subscriptionCostUsd: 14.62,
+    subscriptionRequests: 520,
+  }),
+  buckets: dailyTokens.map((tokens, index) => ({
+    startUnixSeconds: startOfToday - (6 - index) * day,
+    totals: usageTotals({
+      requests: Math.round(tokens / 4700),
+      inputTokens: Math.round(tokens * 0.92),
+      outputTokens: Math.round(tokens * 0.08),
+      costUsd: Math.round(tokens / 4000) / 100,
+      subscriptionCostUsd: Math.round(tokens / 2700) / 100,
+      subscriptionRequests: Math.round(tokens / 8200),
+    }),
+  })),
+  byTool: [
+    {
+      key: "claude-code",
+      totals: usageTotals({
+        requests: 520,
+        inputTokens: 2_480_000,
+        outputTokens: 210_000,
+        subscriptionCostUsd: 14.62,
+        subscriptionRequests: 520,
+      }),
+    },
+    {
+      key: "codex",
+      totals: usageTotals({
+        requests: 392,
+        inputTokens: 1_430_000,
+        outputTokens: 125_000,
+        costUsd: 9.84,
+      }),
+    },
+  ],
+  byModel: [
+    {
+      key: "claude-sonnet-4-5-20250929",
+      totals: usageTotals({
+        requests: 520,
+        inputTokens: 2_480_000,
+        outputTokens: 210_000,
+        subscriptionCostUsd: 14.62,
+        subscriptionRequests: 520,
+      }),
+    },
+    {
+      key: "gpt-5-codex",
+      totals: usageTotals({
+        requests: 392,
+        inputTokens: 1_430_000,
+        outputTokens: 125_000,
+        costUsd: 9.84,
+      }),
+    },
+  ],
+  unmeteredTools: ["vscode-copilot"],
+};
+
+export const noDeviceUsage: DeviceUsage = {
+  ...deviceUsage,
+  totals: emptyUsageTotals,
+  buckets: deviceUsage.buckets.map((bucket) => ({
+    ...bucket,
+    totals: emptyUsageTotals,
+  })),
+  byTool: [],
+  byModel: [],
+  unmeteredTools: [],
+};
+
+export const usageNotCollected: DeviceUsage = {
+  ...noDeviceUsage,
+  enabled: false,
+};

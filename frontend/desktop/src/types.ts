@@ -1,4 +1,9 @@
-import type { ColorMode } from "@agentdesktop/ui";
+import type {
+  ColorMode,
+  UsageBucket,
+  UsageGroup,
+  UsageTotals,
+} from "@agentdesktop/ui";
 
 export interface Settings {
   openOnStartup: boolean;
@@ -56,6 +61,13 @@ export interface DaemonInfo {
     clientId: string;
     error?: string;
   };
+  /** Receiver for usage from a gateway on this machine (`daemon.usage`). */
+  usageReceiver?: {
+    /** Bound address when `bound`, configured address otherwise. */
+    listen: string;
+    bound: boolean;
+    error?: string;
+  };
 }
 
 export interface ConnectorRuntime {
@@ -107,4 +119,39 @@ export interface Discovery {
     kind: string;
     models: Array<{ name: string }>;
   }>;
+  browserPacs?: BrowserPac[];
+  pacFetches?: Array<{
+    url: string;
+    sha256?: string;
+    size?: number;
+    error?: string;
+  }>;
+}
+
+/** The PAC one browser's machine policy sets, as read from policy. */
+export interface BrowserPac {
+  browser: string;
+  packaging?: string;
+  pacUrl?: string;
+  recommended?: boolean;
+  locked?: boolean;
+  source?: string;
+  detail?: string;
+}
+
+export type UsageRange = "24h" | "7d" | "30d";
+
+/** LLM gateway usage recorded for this device by its controller or daemon. */
+export interface DeviceUsage {
+  /** False when the controller does not collect usage. */
+  enabled: boolean;
+  fromUnixSeconds: number;
+  toUnixSeconds: number;
+  bucketSeconds: number;
+  totals: UsageTotals;
+  buckets: UsageBucket[];
+  byTool: UsageGroup[];
+  byModel: UsageGroup[];
+  /** Configured tools whose gateway traffic is not metered. */
+  unmeteredTools?: string[];
 }

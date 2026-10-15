@@ -4,7 +4,10 @@ import { expect, fn, userEvent, within } from "storybook/test";
 import { ControllerStoryFrame } from "../stories/ControllerStoryFrame";
 import {
   deviceDetail,
+  deviceUsageReport,
+  differsDeviceDetail,
   emptyDeviceDetail,
+  emptyUsageReport,
   failedDeviceDetail,
   oldAgentDeviceDetail,
 } from "../stories/fixtures";
@@ -86,6 +89,19 @@ export const OlderAgentWithoutProgramStatus: Story = {
   },
 };
 
+export const BrowsersSetDifferentPacs: Story = {
+  args: { device: differsDeviceDetail },
+  play: async ({ canvas }) => {
+    await expect(canvas.getByText("PAC differs")).toBeVisible();
+    await expect(
+      canvas.getByText("https://old-pac.corp.example/ai-egress.pac", {
+        selector: "small",
+      }),
+    ).toBeVisible();
+    await expect(canvas.getByText("PAC not reachable")).toBeVisible();
+  },
+};
+
 export const NoActivityOrTools: Story = {
   args: { device: emptyDeviceDetail },
 };
@@ -122,6 +138,27 @@ export const DeleteFailed: Story = {
 
 export const Deleting: Story = {
   args: { deleteOpen: true, deleting: true },
+};
+
+export const WithUsage: Story = {
+  args: { usage: deviceUsageReport },
+  play: async ({ canvas }) => {
+    await expect(canvas.getByRole("heading", { name: "Usage" })).toBeVisible();
+    const tools = within(canvas.getByRole("table", { name: "Usage by tool" }));
+    await expect(tools.getByText("Claude Code")).toBeVisible();
+    await expect(
+      canvas.getByRole("link", { name: "View in Usage" }),
+    ).toHaveAttribute("href", "/usage?range=30d&device=device-mac-12345678");
+  },
+};
+
+export const WithoutRecentUsage: Story = {
+  args: { usage: emptyUsageReport },
+  play: async ({ canvas }) => {
+    await expect(
+      canvas.getByText("No LLM gateway usage in the last 30 days."),
+    ).toBeVisible();
+  },
 };
 
 export const Dark: Story = {

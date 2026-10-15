@@ -14,6 +14,17 @@
       "type": "boolean",
       "default": false
     },
+    "browserEgress": {
+      "description": "Browser proxy (PAC) reporting. Devices always report the PAC their\nbrowser policy sets; these settings add a compliance check shown in\nthe management UI.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ControllerBrowserEgressConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "daemonConfig": {
       "description": "Daemon configuration distributed to enrolled devices.",
       "anyOf": [
@@ -53,6 +64,17 @@
     "tls": {
       "description": "TLS identities used by the device-facing fleet API.\n\nA string selects a directory containing `controller.pem`,\n`controller-key.pem`, `device-ca.pem`, and `device-ca-key.pem`.",
       "$ref": "#/$defs/ControllerTlsConfig"
+    },
+    "usage": {
+      "description": "Token and cost collection from agentgateway access logs.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ControllerUsageConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -61,6 +83,38 @@
     "tls"
   ],
   "$defs": {
+    "BrowserEgressCompliance": {
+      "description": "Expected browser proxy settings for the compliance check.",
+      "type": "object",
+      "properties": {
+        "pacUrl": {
+          "description": "The PAC URL browser policy is expected to set (exact match).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pacUrl"
+      ]
+    },
+    "ControllerBrowserEgressConfig": {
+      "description": "Browser proxy (PAC) settings of the controller.",
+      "type": "object",
+      "properties": {
+        "compliance": {
+          "description": "Compliance check: the controller compares the PAC each device's\nbrowser policy sets with these values and shows the result in the\nmanagement UI. Agentdesktop does not configure browsers from them.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BrowserEgressCompliance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "ControllerDaemonConfig": {
       "description": "Controller-owned daemon configuration file and its revision.",
       "type": "object",
@@ -175,6 +229,20 @@
         "key",
         "clientCaCertificate",
         "clientCaKey"
+      ]
+    },
+    "ControllerUsageConfig": {
+      "description": "Collection of LLM token and cost records that agentgateway exports to the\nfleet API as OTLP access logs over gRPC.",
+      "type": "object",
+      "properties": {
+        "tokenFile": {
+          "description": "Path to a file containing the bearer token agentgateway sends with each export. The token must be at least 32 characters.\n\nRelative paths are resolved from the controller configuration directory.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tokenFile"
       ]
     }
   }
