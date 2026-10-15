@@ -205,12 +205,7 @@ impl envelope::KeyBackend for CredentialManager {
 /// key store. Compiled on every platform for tests; used on Windows.
 #[cfg(any(windows, test))]
 mod envelope {
-    use std::{
-        fs,
-        io::ErrorKind,
-        path::Path,
-        sync::{Mutex, PoisonError},
-    };
+    use std::{fs, io::ErrorKind, path::Path};
 
     use anyhow::{Context, bail};
     use aws_lc_rs::aead::{AES_256_GCM, Aad, NONCE_LEN, Nonce, RandomizedNonceKey};
@@ -234,9 +229,25 @@ mod envelope {
         fn delete(&self, service: &str, account: &str) -> anyhow::Result<()>;
     }
 
-    /// Serializes writes so that two first writes of one secret cannot leave
-    /// one write's key next to the other's file.
-    static WRITES: Mutex<()> = Mutex::new(());
+    /// Serializes writes, across threads and processes (a second daemon
+    /// instance runs secret-using tasks before it finds the first one), so
+    /// two first writes of one secret cannot leave one write's key next to
+    /// the other's file. Released when the returned file is dropped.
+    fn lock_writes(path: &Path) -> anyhow::Result<fs::File> {
+        let lock_path = path
+            .parent()
+            .context("secret path has no parent")?
+            .join(".lock");
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open secret lock {}", lock_path.display()))?;
+        lock.lock()
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+        Ok(lock)
+    }
 
     pub(super) fn get(
         path: &Path,
@@ -284,7 +295,7 @@ mod envelope {
         account: &str,
         secret: &str,
     ) -> anyhow::Result<()> {
-        let _writes = WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+        let _writes = lock_writes(path)?;
         // The key is created once and reused, so replacing the file is the only
         // step that changes the stored secret. A key that cannot be decoded
         // cannot open the current file either, so it is replaced.
@@ -317,7 +328,7 @@ mod envelope {
         service: &str,
         account: &str,
     ) -> anyhow::Result<()> {
-        let _writes = WRITES.lock().unwrap_or_else(PoisonError::into_inner);
+        let _writes = lock_writes(path)?;
         // An earlier version's value goes first: it would be read again once
         // the file is gone, so a delete that stops halfway must not leave it.
         keys.delete(service, account)
@@ -584,6 +595,57 @@ mod envelope {
             );
         }
 
+        /// Thread-safe store whose key writes are slow, so unserialized first
+        /// writes would interleave.
+        #[derive(Default)]
+        struct SlowKeys(std::sync::Mutex<BTreeMap<(String, String), String>>);
+
+        impl KeyBackend for SlowKeys {
+            fn get(&self, service: &str, account: &str) -> anyhow::Result<Option<String>> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get(&(service.to_owned(), account.to_owned()))
+                    .cloned())
+            }
+
+            fn set(&self, service: &str, account: &str, value: &str) -> anyhow::Result<()> {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert((service.to_owned(), account.to_owned()), value.to_owned());
+                Ok(())
+            }
+
+            fn delete(&self, service: &str, account: &str) -> anyhow::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .remove(&(service.to_owned(), account.to_owned()));
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn competing_first_writes_leave_a_readable_secret() {
+            // Each write opens its own lock handle, as a second process would.
+            for _ in 0..10 {
+                let directory = tempfile::tempdir().unwrap();
+                let path = entry(&directory, "entry");
+                let keys = SlowKeys::default();
+                std::thread::scope(|scope| {
+                    for writer in ["one", "two", "three"] {
+                        let (path, keys) = (&path, &keys);
+                        scope.spawn(move || set(path, keys, SERVICE, ACCOUNT, writer).unwrap());
+                    }
+                });
+                let stored = get(&path, &keys, SERVICE, ACCOUNT).unwrap().unwrap();
+                assert!(["one", "two", "three"].contains(&stored.as_str()));
+            }
+        }
+
         #[test]
         fn only_the_first_write_removes_an_earlier_versions_value() {
             let directory = tempfile::tempdir().unwrap();
@@ -620,9 +682,11 @@ mod envelope {
             let keys = FakeKeys::default();
             set(&path, &keys, SERVICE, ACCOUNT, "current").unwrap();
 
-            // Writing into a directory that does not exist fails.
-            let missing = directory.path().join("missing").join("entry");
-            assert!(set(&missing, &keys, SERVICE, ACCOUNT, "new").is_err());
+            // Replacing a non-empty directory with the new file fails.
+            let blocked = entry(&directory, "blocked");
+            fs::create_dir(&blocked).unwrap();
+            fs::write(blocked.join("occupied"), "").unwrap();
+            assert!(set(&blocked, &keys, SERVICE, ACCOUNT, "new").is_err());
             assert_eq!(
                 get(&path, &keys, SERVICE, ACCOUNT).unwrap().as_deref(),
                 Some("current")
