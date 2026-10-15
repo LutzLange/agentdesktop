@@ -230,11 +230,13 @@ mod envelope {
         fn delete(&self, service: &str, account: &str) -> anyhow::Result<()>;
     }
 
-    /// Serializes writes, across threads and processes (a second daemon
-    /// instance runs secret-using tasks before it finds the first one), so
-    /// two first writes of one secret cannot leave one write's key next to
-    /// the other's file. Released when the returned file is dropped.
-    fn lock_writes(path: &Path) -> anyhow::Result<fs::File> {
+    /// Locks the store across threads and processes (a second daemon instance
+    /// runs secret-using tasks before it finds the first one). Writes and
+    /// deletes take it exclusively, so two first writes cannot leave one
+    /// write's key next to the other's file; reads take it shared, so a read
+    /// never pairs a file with a key that a delete and a new write replaced
+    /// in between. Released when the returned file is dropped.
+    fn lock_store(path: &Path, exclusive: bool) -> anyhow::Result<fs::File> {
         let lock_path = path
             .parent()
             .context("secret path has no parent")?
@@ -245,8 +247,12 @@ mod envelope {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open secret lock {}", lock_path.display()))?;
-        lock.lock()
-            .with_context(|| format!("lock {}", lock_path.display()))?;
+        if exclusive {
+            lock.lock()
+        } else {
+            lock.lock_shared()
+        }
+        .with_context(|| format!("lock {}", lock_path.display()))?;
         Ok(lock)
     }
 
@@ -256,20 +262,11 @@ mod envelope {
         service: &str,
         account: &str,
     ) -> anyhow::Result<Option<String>> {
-        let sealed = match read_sealed(path)? {
-            Some(sealed) => sealed,
+        let _reading = lock_store(path, false)?;
+        let Some(sealed) = read_sealed(path)? else {
             // A secret stored directly in the credential store by an earlier
             // version, or none at all.
-            None => match keys.get(service, account)? {
-                Some(value) => return Ok(Some(value)),
-                // A first write may have stored the file and removed that value
-                // since the file was looked up. It writes the file first, so the
-                // file is there now if that happened.
-                None => match read_sealed(path)? {
-                    Some(sealed) => sealed,
-                    None => return Ok(None),
-                },
-            },
+            return keys.get(service, account);
         };
         let stored_key = match store_id(path)? {
             Some(id) => read_key(keys, &key_entry(&id, service, account))?,
@@ -300,7 +297,7 @@ mod envelope {
         account: &str,
         secret: &str,
     ) -> anyhow::Result<()> {
-        let _writes = lock_writes(path)?;
+        let _writes = lock_store(path, true)?;
         let entry = key_entry(&create_store_id(path)?, service, account);
         // The key is created once and reused, so replacing the file is the only
         // step that changes the stored secret. A key that cannot be decoded
@@ -338,7 +335,7 @@ mod envelope {
         service: &str,
         account: &str,
     ) -> anyhow::Result<()> {
-        let _writes = lock_writes(path)?;
+        let _writes = lock_store(path, true)?;
         // An earlier version's value goes first: it would be read again once
         // the file is gone, so a delete that stops halfway must not leave it.
         keys.delete(service, account)
@@ -529,9 +526,9 @@ mod envelope {
             fail_sets: Cell<bool>,
             fail_deletes_of: RefCell<Option<String>>,
             deletes: Cell<usize>,
-            /// Runs a concurrent first write (installs the file, removes the
-            /// earlier version's value) when that value is looked up.
-            first_write_during_lookup: RefCell<Option<(PathBuf, PathBuf)>>,
+            /// When a file key is looked up, records whether a writer could take
+            /// the lock in this directory right then.
+            writer_could_lock_during_key_read: RefCell<Option<(PathBuf, Option<bool>)>>,
             /// Records whether this file exists when a new key is stored.
             file_at_key_write: RefCell<Option<(PathBuf, bool)>>,
         }
@@ -569,13 +566,20 @@ mod envelope {
 
         impl KeyBackend for FakeKeys {
             fn get(&self, service: &str, account: &str) -> anyhow::Result<Option<String>> {
-                if service == SERVICE
-                    && let Some((staged, path)) = self.first_write_during_lookup.take()
+                if service.ends_with(KEY_SERVICE_SUFFIX)
+                    && let Some((directory, could_lock)) =
+                        self.writer_could_lock_during_key_read.borrow_mut().as_mut()
                 {
-                    fs::rename(staged, path).unwrap();
-                    self.entries
-                        .borrow_mut()
-                        .remove(&(service.to_owned(), account.to_owned()));
+                    // A separate handle, as another process's writer would use.
+                    let lock = fs::OpenOptions::new()
+                        .write(true)
+                        .open(directory.join(".lock"))
+                        .unwrap();
+                    *could_lock = Some(match lock.try_lock() {
+                        Ok(()) => true,
+                        Err(fs::TryLockError::WouldBlock) => false,
+                        Err(fs::TryLockError::Error(error)) => panic!("{error}"),
+                    });
                 }
                 Ok(self
                     .entries
@@ -674,21 +678,27 @@ mod envelope {
         }
 
         #[test]
-        fn a_read_racing_the_first_write_still_finds_the_secret() {
+        fn a_read_holds_off_writers_until_it_has_the_key() {
+            // Otherwise a delete and a new write between reading the file and
+            // reading its key would pair the old file with the new key.
             let directory = tempfile::tempdir().unwrap();
             let path = entry(&directory, "entry");
-            let staged = entry(&directory, "staged");
             let keys = FakeKeys::default();
-            set(&path, &keys, SERVICE, ACCOUNT, "migrated").unwrap();
-            fs::rename(&path, &staged).unwrap();
-            keys.insert(SERVICE, "legacy");
+            set(&path, &keys, SERVICE, ACCOUNT, "secret").unwrap();
 
-            // The read misses the file, then the write lands before the
-            // fallback lookup.
-            *keys.first_write_during_lookup.borrow_mut() = Some((staged, path.clone()));
+            *keys.writer_could_lock_during_key_read.borrow_mut() =
+                Some((directory.path().to_owned(), None));
             assert_eq!(
                 get(&path, &keys, SERVICE, ACCOUNT).unwrap().as_deref(),
-                Some("migrated")
+                Some("secret")
+            );
+            assert_eq!(
+                keys.writer_could_lock_during_key_read
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .1,
+                Some(false)
             );
         }
 
