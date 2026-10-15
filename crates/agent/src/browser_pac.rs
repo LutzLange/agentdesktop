@@ -241,6 +241,92 @@ fn firefox_proxy(policies: &Value) -> Option<(Option<String>, bool)> {
     Some((pac_url, locked))
 }
 
+/// Chromium policy JSON: Chromium's loader accepts comments and trailing
+/// commas (`JSON_PARSE_CHROMIUM_EXTENSIONS | JSON_ALLOW_TRAILING_COMMAS`).
+#[cfg(any(target_os = "linux", test))]
+fn read_chromium_json(file: &Path) -> Result<Value, String> {
+    let contents = std::fs::read_to_string(file)
+        .map_err(|error| format!("read {}: {error}", file.display()))?;
+    serde_json::from_str(&strip_jsonc(&contents))
+        .map_err(|error| format!("parse {}: {error}", file.display()))
+}
+
+/// Removes `//` and `/* */` comments, then trailing commas, outside
+/// strings, in two scans; a comma looks ahead only past whitespace.
+#[cfg(any(target_os = "linux", test))]
+fn strip_jsonc(input: &str) -> String {
+    let mut uncommented = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            uncommented.push(c);
+            match c {
+                '\\' => uncommented.extend(chars.next()),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('/', Some('/')) => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        uncommented.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut previous = '\0';
+                for next in chars.by_ref() {
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+                uncommented.push(' ');
+            }
+            _ => {
+                in_string = c == '"';
+                uncommented.push(c);
+            }
+        }
+    }
+
+    let chars: Vec<char> = uncommented.chars().collect();
+    let mut out = String::with_capacity(uncommented.len());
+    let mut in_string = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let c = chars[index];
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(next) = chars.get(index + 1) {
+                    out.push(*next);
+                    index += 1;
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == ','
+            && matches!(
+                chars[index + 1..].iter().find(|next| !next.is_whitespace()),
+                Some('}' | ']')
+            )
+        {
+            // trailing comma: dropped
+        } else {
+            in_string = c == '"';
+            out.push(c);
+        }
+        index += 1;
+    }
+    out
+}
+
 #[cfg(any(target_os = "linux", windows, test))]
 fn read_json(file: &Path) -> Result<Value, String> {
     let contents = std::fs::read_to_string(file)
@@ -292,10 +378,10 @@ mod linux {
         ("opt/firefox/firefox", "system"),
     ];
 
-    /// Firefox policy files, system-wide first (read by the deb and the
-    /// snap), then the install's `distribution/`. The first file that sets
-    /// `Proxy` is reported; Firefox's own precedence between the two is not
-    /// verified here.
+    /// Firefox policy files in Firefox's own order: it uses
+    /// `/etc/firefox/policies/policies.json` when that file exists (read by
+    /// the deb and the snap) and otherwise the install's `distribution/`
+    /// file, never both.
     const FIREFOX_POLICY_FILES: &[&str] = &[
         "etc/firefox/policies/policies.json",
         "usr/lib/firefox/distribution/policies.json",
@@ -400,6 +486,7 @@ mod linux {
     ) -> Result<Option<(ProxyPolicy, PathBuf)>, String> {
         const KEYS: [&str; 3] = ["ProxySettings", "ProxyMode", "ProxyPacUrl"];
         let mut merged: Vec<(&str, Value, PathBuf)> = Vec::new();
+        let mut conflicts: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
         for directory in directories {
             let entries = match std::fs::read_dir(directory) {
                 Ok(entries) => entries,
@@ -419,7 +506,7 @@ mod linux {
                 .collect();
             files.sort();
             for file in files {
-                let value = match read_json(&file) {
+                let value = match read_chromium_json(&file) {
                     Ok(value) => value,
                     Err(error) => {
                         unreadable.push(error);
@@ -432,17 +519,27 @@ mod linux {
                     };
                     match merged.iter().find(|(existing, _, _)| *existing == key) {
                         Some((_, existing, first)) if existing != setting => {
-                            return Err(format!(
-                                "conflicting proxy policy in {} and {}",
-                                first.display(),
-                                file.display()
-                            ));
+                            conflicts.push((key, first.clone(), file.clone()));
                         }
                         Some(_) => {}
                         None => merged.push((key, setting.clone(), file.clone())),
                     }
                 }
             }
+        }
+        // ProxySettings overrides the legacy keys, so their conflicts only
+        // matter when it isn't set (or conflicts itself).
+        let settings_in_effect = merged.iter().any(|(key, _, _)| *key == "ProxySettings")
+            && !conflicts.iter().any(|(key, _, _)| *key == "ProxySettings");
+        if let Some((_, first, second)) = conflicts
+            .iter()
+            .find(|(key, _, _)| !settings_in_effect || *key == "ProxySettings")
+        {
+            return Err(format!(
+                "conflicting proxy policy in {} and {}",
+                first.display(),
+                second.display()
+            ));
         }
         // The source shown is the file that set the PAC URL, if any.
         let Some(source) = ["ProxySettings", "ProxyPacUrl", "ProxyMode"]
@@ -469,26 +566,27 @@ mod linux {
             ..BrowserPac::default()
         };
         let mut found_policy = false;
-        for file in FIREFOX_POLICY_FILES.iter().map(|file| root.join(file)) {
-            if !file.is_file() {
-                continue;
-            }
-            let value = match read_json(&file) {
-                Ok(value) => value,
+        // Only the file Firefox uses; a Proxy section in a file it ignores
+        // must not count.
+        if let Some(file) = FIREFOX_POLICY_FILES
+            .iter()
+            .map(|file| root.join(file))
+            .find(|file| file.is_file())
+        {
+            match read_json(&file) {
+                Ok(value) => {
+                    if let Some((pac_url, locked)) = firefox_proxy(&value) {
+                        row.pac_url = pac_url;
+                        row.locked = locked;
+                        row.source = Some(file);
+                        found_policy = true;
+                    }
+                }
                 Err(detail) => {
                     row.detail = Some(crate::reconcile::truncate_detail(detail));
                     found_policy = true;
-                    break;
                 }
-            };
-            let Some((pac_url, locked)) = firefox_proxy(&value) else {
-                continue;
-            };
-            row.pac_url = pac_url;
-            row.locked = locked;
-            row.source = Some(file);
-            found_policy = true;
-            break;
+            }
         }
         (packaging.is_some() || found_policy).then_some(row)
     }
@@ -650,6 +748,90 @@ mod linux {
                     .contains("conflicting proxy policy")
             );
             assert_eq!(by_name("firefox").pac_url, None);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn chromium_policy_files_may_have_comments_and_trailing_commas() {
+            let root = temp_root("jsonc");
+            write(
+                &root,
+                "etc/opt/chrome/policies/managed/egress.json",
+                &format!(
+                    "// AI egress\n{{\n  /* PAC */ \"ProxySettings\": {{\"ProxyMode\": \"pac_script\", \"ProxyPacUrl\": \"{PAC}\",}},\n}}\n"
+                ),
+            );
+            assert_eq!(discover(&root)[0].pac_url.as_deref(), Some(PAC));
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn strip_jsonc_keeps_strings_intact() {
+            assert_eq!(
+                strip_jsonc(
+                    r#"{"u": "http://a/b,}", /* c */ "v": [1, 2,], // x
+}"#
+                ),
+                "{\"u\": \"http://a/b,}\",   \"v\": [1, 2] \n}"
+            );
+            assert_eq!(strip_jsonc(r#"{"q": "a\"//b"}"#), r#"{"q": "a\"//b"}"#);
+        }
+
+        #[test]
+        fn proxy_settings_wins_over_conflicting_legacy_keys() {
+            let root = temp_root("precedence");
+            write(
+                &root,
+                "etc/opt/chrome/policies/managed/a.json",
+                r#"{"ProxyMode":"pac_script","ProxyPacUrl":"https://old.example/a.pac"}"#,
+            );
+            write(
+                &root,
+                "etc/opt/chrome/policies/managed/b.json",
+                r#"{"ProxyPacUrl":"https://old.example/b.pac"}"#,
+            );
+            write(
+                &root,
+                "etc/opt/chrome/policies/managed/c.json",
+                &format!(
+                    r#"{{"ProxySettings":{{"ProxyMode":"pac_script","ProxyPacUrl":"{PAC}"}}}}"#
+                ),
+            );
+            let chrome = &discover(&root)[0];
+            assert_eq!(chrome.pac_url.as_deref(), Some(PAC));
+            assert_eq!(chrome.detail, None);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn firefox_reads_only_the_file_it_uses() {
+            let root = temp_root("ffactive");
+            write(&root, "usr/lib/firefox/firefox", "");
+            // /etc exists without Proxy: the distribution file is ignored.
+            write(
+                &root,
+                "etc/firefox/policies/policies.json",
+                r#"{"policies":{"DisableAppUpdate":true}}"#,
+            );
+            write(
+                &root,
+                "usr/lib/firefox/distribution/policies.json",
+                &format!(
+                    r#"{{"policies":{{"Proxy":{{"Mode":"autoConfig","AutoConfigURL":"{PAC}","Locked":true}}}}}}"#
+                ),
+            );
+            let firefox = discover(&root)
+                .into_iter()
+                .find(|row| row.browser == "firefox")
+                .unwrap();
+            assert_eq!(firefox.pac_url, None);
+            assert!(!firefox.locked);
+            fs::remove_file(root.join("etc/firefox/policies/policies.json")).unwrap();
+            let firefox = discover(&root)
+                .into_iter()
+                .find(|row| row.browser == "firefox")
+                .unwrap();
+            assert_eq!(firefox.pac_url.as_deref(), Some(PAC));
             fs::remove_dir_all(root).unwrap();
         }
 
