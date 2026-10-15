@@ -320,8 +320,7 @@ mod envelope {
         // Only the first write can replace a value an earlier version stored
         // directly; later writes skip the credential store lookup.
         let first_write = !path.try_exists().unwrap_or(true);
-        secure_fs::atomic_write(path, &seal(&key, service, account, secret)?, 0o600)
-            .with_context(|| format!("store secret in {}", path.display()))?;
+        write_sealed(path, &seal(&key, service, account, secret)?)?;
         // The file now shadows that value; remove it so no stale copy is left.
         if first_write && let Err(error) = keys.delete(service, account) {
             tracing::warn!(%error, service, "could not remove the replaced credential store entry");
@@ -347,6 +346,21 @@ mod envelope {
         let entry = key_entry(&id, service, account);
         keys.delete(&entry.service, &entry.account)
             .context("delete secret file key")
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Makes the next secret file write on this thread fail.
+        static FAIL_NEXT_FILE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn write_sealed(path: &Path, sealed: &[u8]) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_FILE_WRITE.with(|fail| fail.replace(false)) {
+            bail!("injected file write failure");
+        }
+        secure_fs::atomic_write(path, sealed, 0o600)
+            .with_context(|| format!("store secret in {}", path.display()))
     }
 
     fn remove_file(path: &Path) -> anyhow::Result<()> {
@@ -513,7 +527,8 @@ mod envelope {
         };
 
         use super::{
-            KEY_SERVICE_SUFFIX, KeyBackend, delete, get, key_entry, key_service, set, store_id,
+            FAIL_NEXT_FILE_WRITE, KEY_SERVICE_SUFFIX, KeyBackend, delete, get, key_entry,
+            key_service, set, store_id,
         };
 
         const SERVICE: &str = "dev.agentdesktop.test";
@@ -851,12 +866,11 @@ mod envelope {
             let path = entry(&directory, "entry");
             let keys = FakeKeys::default();
             set(&path, &keys, SERVICE, ACCOUNT, "current").unwrap();
+            let before = fs::read(&path).unwrap();
 
-            // Replacing a non-empty directory with the new file fails.
-            let blocked = entry(&directory, "blocked");
-            fs::create_dir(&blocked).unwrap();
-            fs::write(blocked.join("occupied"), "").unwrap();
-            assert!(set(&blocked, &keys, SERVICE, ACCOUNT, "new").is_err());
+            FAIL_NEXT_FILE_WRITE.with(|fail| fail.set(true));
+            assert!(set(&path, &keys, SERVICE, ACCOUNT, "new").is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
             assert_eq!(
                 get(&path, &keys, SERVICE, ACCOUNT).unwrap().as_deref(),
                 Some("current")
