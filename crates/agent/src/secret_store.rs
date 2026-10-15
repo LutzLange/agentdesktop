@@ -244,14 +244,20 @@ mod envelope {
         service: &str,
         account: &str,
     ) -> anyhow::Result<Option<String>> {
-        let sealed = match fs::read(path) {
-            Ok(sealed) => sealed,
+        let sealed = match read_sealed(path)? {
+            Some(sealed) => sealed,
             // A secret stored directly in the credential store by an earlier
             // version, or none at all.
-            Err(error) if error.kind() == ErrorKind::NotFound => return keys.get(service, account),
-            Err(error) => {
-                return Err(error).with_context(|| format!("read secret from {}", path.display()));
-            }
+            None => match keys.get(service, account)? {
+                Some(value) => return Ok(Some(value)),
+                // A first write may have stored the file and removed that value
+                // since the file was looked up. It writes the file first, so the
+                // file is there now if that happened.
+                None => match read_sealed(path)? {
+                    Some(sealed) => sealed,
+                    None => return Ok(None),
+                },
+            },
         };
         match read_key(keys, service, account)? {
             StoredKey::Key(key) => open(&key, service, account, sealed).map(Some),
@@ -325,6 +331,16 @@ mod envelope {
         }
         keys.delete(&key_service(service), account)
             .context("delete secret file key")
+    }
+
+    fn read_sealed(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+        match fs::read(path) {
+            Ok(sealed) => Ok(Some(sealed)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("read secret from {}", path.display()))
+            }
+        }
     }
 
     fn key_service(service: &str) -> String {
@@ -428,6 +444,9 @@ mod envelope {
             fail_sets: Cell<bool>,
             fail_deletes_of: RefCell<Option<String>>,
             deletes: Cell<usize>,
+            /// Runs a concurrent first write (installs the file, removes the
+            /// earlier version's value) when that value is looked up.
+            first_write_during_lookup: RefCell<Option<(PathBuf, PathBuf)>>,
         }
 
         impl FakeKeys {
@@ -447,6 +466,14 @@ mod envelope {
 
         impl KeyBackend for FakeKeys {
             fn get(&self, service: &str, account: &str) -> anyhow::Result<Option<String>> {
+                if service == SERVICE
+                    && let Some((staged, path)) = self.first_write_during_lookup.take()
+                {
+                    fs::rename(staged, path).unwrap();
+                    self.entries
+                        .borrow_mut()
+                        .remove(&(service.to_owned(), account.to_owned()));
+                }
                 Ok(self
                     .entries
                     .borrow()
@@ -539,6 +566,25 @@ mod envelope {
         }
 
         #[test]
+        fn a_read_racing_the_first_write_still_finds_the_secret() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = entry(&directory, "entry");
+            let staged = entry(&directory, "staged");
+            let keys = FakeKeys::default();
+            set(&path, &keys, SERVICE, ACCOUNT, "migrated").unwrap();
+            fs::rename(&path, &staged).unwrap();
+            keys.insert(SERVICE, "legacy");
+
+            // The read misses the file, then the write lands before the
+            // fallback lookup.
+            *keys.first_write_during_lookup.borrow_mut() = Some((staged, path.clone()));
+            assert_eq!(
+                get(&path, &keys, SERVICE, ACCOUNT).unwrap().as_deref(),
+                Some("migrated")
+            );
+        }
+
+        #[test]
         fn only_the_first_write_removes_an_earlier_versions_value() {
             let directory = tempfile::tempdir().unwrap();
             let path = entry(&directory, "entry");
@@ -605,7 +651,14 @@ mod envelope {
             let other = entry(&directory, "other");
             let keys = FakeKeys::default();
             set(&path, &keys, SERVICE, ACCOUNT, "secret").unwrap();
+            // Same key for both entries, so only the binding can reject the copy.
+            let key = keys.value(&key_service(SERVICE)).unwrap();
+            keys.insert(&key_service("dev.agentdesktop.other"), &key);
             set(&other, &keys, "dev.agentdesktop.other", ACCOUNT, "other").unwrap();
+            assert_eq!(
+                keys.value(&key_service("dev.agentdesktop.other")).unwrap(),
+                key
+            );
 
             fs::copy(&path, &other).unwrap();
             assert!(get(&other, &keys, "dev.agentdesktop.other", ACCOUNT).is_err());
