@@ -662,8 +662,9 @@ What the box can see: the workspace, `~\.claude` (skills, agents, commands,
 a private `tmp`. Read-only: the Claude Code and Git installations, the
 Agentdesktop client, `~\.claude\settings.json`, `~\.claude\hooks`,
 `~\.claude\plugins`, the workspace's `.claude\settings*.json`, `.claude\hooks`,
-`.mcp.json`, a `HEAD` file at the workspace root, and `.git\HEAD`, `.git\config`,
-`.git\hooks` and `.git\commondir` of the workspace repository.
+`.mcp.json`, a `HEAD` file at the workspace root, and `.git\config`,
+`.git\hooks` and `.git\commondir` of the workspace repository (`.git\HEAD`
+stays writable so branch switches work).
 Each of those is denied when it does not exist, so the box cannot create it
 either; a workspace without `.git` cannot `git init` one. Always denied:
 `~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
@@ -671,9 +672,11 @@ either; a workspace without `.git` cannot `git init` one. Always denied:
 directory or one of its ancestors, or anything under `%SystemRoot%`,
 `%ProgramFiles%`, `%ProgramData%`, `AppData`, `~\.claude`, the daemon's state
 directory or a denied path (`%ProgramFiles(x86)%` counts as a system
-directory). Outbound network and connections to loopback services are open in
-this preview, while the box accepts no inbound loopback connections; the
-clipboard is off in the box; a gateway behind a private CA is not supported yet.
+directory). Outbound network is open in this preview; whether the box can reach
+loopback services on the host, and whether it accepts inbound loopback
+connections, follows the request's network block (`egress` open, host loopback
+ingress denied) and is not yet verified in the lab; the clipboard is off in the
+box; a gateway behind a private CA is not supported yet.
 
 The box gets no pipe to the daemon and no sign-in: the daemon writes the
 gateway credential to a private file named by `AGENTDESKTOP_CREDENTIAL_FILE`,

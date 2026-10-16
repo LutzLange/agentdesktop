@@ -55,8 +55,7 @@
       "C:\\lab\\ws pr1\\.claude\\settings.local.json",
       "C:\\lab\\ws pr1\\.mcp.json",
       "C:\\lab\\ws pr1\\.git\\config",
-      "C:\\lab\\ws pr1\\.git\\hooks",
-      "C:\\lab\\ws pr1\\.git\\HEAD"
+      "C:\\lab\\ws pr1\\.git\\hooks"
     ],
     "deniedPaths": [
       "C:\\Users\\dev\\.claude\\hooks",

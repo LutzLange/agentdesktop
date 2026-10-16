@@ -237,8 +237,8 @@ mod handler {
         }
     }
 
-    struct Recorder {
-        request_json: Mutex<Option<String>>,
+    pub(super) struct Recorder {
+        pub(super) request_json: Mutex<Option<String>>,
     }
 
     struct Running;
@@ -268,27 +268,19 @@ mod handler {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn the_credential_directory_is_granted_read_only_to_the_box() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(temp.path()).unwrap();
-        let home = root.join("home");
-        let cwd = home.join("work");
-        let state_dir = root.join("state");
-        std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir_all(home.join(".local").join("bin")).unwrap();
-        std::fs::write(home.join(".local").join("bin").join("claude.exe"), b"MZ").unwrap();
-        std::fs::create_dir_all(&state_dir).unwrap();
+    /// A launch state over a fake host rooted in temp directories.
+    pub(super) fn state(home: PathBuf, state_dir: PathBuf, executor: Arc<Recorder>) -> LaunchState {
         let daemon_info = serde_json::from_value(serde_json::json!({
             "version": "test", "scope": "user", "configPath": "", "stateDirectory": "",
             "inventoryInterval": "60s", "controller": null,
         }))
         .unwrap();
-        let (_sender, discovery) =
+        let (sender, discovery) =
             tokio::sync::watch::channel(Arc::new(agentdesktop_core::model::Discovery {
                 agents: vec![],
                 model_runtimes: vec![],
             }));
+        std::mem::forget(sender);
         let app = api::AppState {
             config: agentdesktop_core::config::parse_daemon(
                 "llmGateway:\n  url: https://gateway.example.com\n  authentication:\n    type: oidc\n    issuer: https://login.example.com\n    clientId: agentdesktop\nprograms:\n  claudeCode: {}\n",
@@ -304,17 +296,11 @@ mod handler {
             logout: None,
             usage: None,
         };
-        let recorder = Arc::new(Recorder {
-            request_json: Mutex::new(None),
-        });
-        let state = LaunchState {
+        LaunchState {
             app,
-            executor: recorder.clone(),
+            executor,
             credentials: Arc::new(Credentials),
-            host: Arc::new(Host {
-                home: home.clone(),
-                state_dir: state_dir.clone(),
-            }),
+            host: Arc::new(Host { home, state_dir }),
             registry: LaunchRegistry::new(),
             availability: Some(ContainmentInfo {
                 executor: "wxc-exec.exe".into(),
@@ -322,7 +308,24 @@ mod handler {
                 error: None,
             }),
             daemon_sid: None,
-        };
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_credential_directory_is_granted_read_only_to_the_box() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let home = root.join("home");
+        let cwd = home.join("work");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(home.join(".local").join("bin")).unwrap();
+        std::fs::write(home.join(".local").join("bin").join("claude.exe"), b"MZ").unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let recorder = Arc::new(Recorder {
+            request_json: Mutex::new(None),
+        });
+        let state = state(home.clone(), state_dir.clone(), recorder.clone());
 
         let (status, Json(launch)) = launch(
             State(state),
@@ -387,4 +390,48 @@ fn a_canonical_workspace_with_a_percent_sign_is_rejected() {
     );
     assert!(validate_cwd(Path::new("/home/dev/link"), &ctx, &fs).is_err());
     assert!(validate_cwd(Path::new("/home/dev/plain"), &ctx, &fs).is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resolved_program_path_with_a_percent_sign_is_rejected() {
+    use std::sync::{Arc, Mutex};
+
+    use agentdesktop_core::model::LaunchRequest;
+    use axum::{Json, extract::State, http::StatusCode};
+
+    // The home (and so `<home>\.local\bin\claude.exe`) carries a `%`; the
+    // workspace lives outside it, so the workspace rules pass first.
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let home = root.join("h%me");
+    let cwd = root.join("work");
+    let state_dir = root.join("state");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(home.join(".local").join("bin")).unwrap();
+    std::fs::write(home.join(".local").join("bin").join("claude.exe"), b"MZ").unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let state = handler::state(
+        home,
+        state_dir,
+        Arc::new(handler::Recorder {
+            request_json: Mutex::new(None),
+        }),
+    );
+
+    let error = launch(
+        State(state),
+        Json(LaunchRequest {
+            program: "claude-code".into(),
+            cwd,
+            args: vec![],
+        }),
+    )
+    .await
+    .expect_err("a program path cmd.exe would interpret is refused");
+
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1,
+        "program path contains a character cmd.exe interprets"
+    );
 }

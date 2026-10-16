@@ -502,7 +502,9 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
     {
         // A repository directory: git reads config and hooks unsandboxed
         // later, and `commondir` would redirect it to a writable directory.
-        executable_config.push(join(&git, "HEAD"));
+        // `.git\HEAD` stays writable: git replaces it by rename on every
+        // branch switch, and the root `HEAD` rule already blocks a bare-repo
+        // fall-through.
         executable_config.push(join(&git, "config"));
         executable_config.push(join(&git, "hooks"));
         executable_config.push(join(&git, "commondir"));
