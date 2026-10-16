@@ -340,7 +340,8 @@ pub struct MxcProcess {
     pub command_line: String,
     pub cwd: String,
     pub inherit_default_env: bool,
-    pub env: BTreeMap<String, String>,
+    /// `KEY=VALUE` entries: MXC 1.0.0 rejects an object here (lab-verified).
+    pub env: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -483,14 +484,25 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         join(&claude_dir, "settings.json"),
         join(&claude_dir, "hooks"),
         join(&claude_dir, "plugins"),
-        join(&cwd, r".claude\settings.json"),
-        join(&cwd, r".claude\settings.local.json"),
-        join(&cwd, r".claude\hooks"),
         join(&cwd, ".mcp.json"),
         // A `HEAD` file at the workspace root would let git treat the
         // workspace itself as a bare repository with box-written config.
         join(&cwd, "HEAD"),
     ];
+    // MXC refuses a denied path whose parent folder does not exist
+    // (lab-verified, 0x80070003), so a workspace without `.claude` gets the
+    // folder itself denied instead of its three executable-config entries.
+    let workspace_claude = join(&cwd, ".claude");
+    let workspace_claude_entries = [
+        join(&workspace_claude, "settings.json"),
+        join(&workspace_claude, "settings.local.json"),
+        join(&workspace_claude, "hooks"),
+    ];
+    if exists(&workspace_claude) || workspace_claude_entries.iter().any(|path| exists(path)) {
+        executable_config.extend(workspace_claude_entries);
+    } else {
+        denied.push(workspace_claude);
+    }
     let git = join(&cwd, ".git");
     if !exists(&git) {
         // No repository: deny `.git` so the box cannot `git init` one that
@@ -543,7 +555,10 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
             command_line,
             cwd: cwd.clone(),
             inherit_default_env: false,
-            env,
+            env: env
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect(),
         },
         filesystem: MxcFilesystem {
             readwrite_paths: vec![cwd, claude_dir, tmp],
@@ -909,9 +924,18 @@ async fn start_launch(
     let launch_dir = state_dir.join("launches").join(&launch_id);
     let log_path = launch_dir.join("wxc-exec.log");
     let fail = |launch_dir: &Path, message: String| {
+        tracing::warn!(launch_id = %launch_id, %message, "sandboxed launch failed");
         let _ = std::fs::remove_dir_all(launch_dir);
         Err((StatusCode::INTERNAL_SERVER_ERROR, message))
     };
+    // `~\.claude` is granted read-write and its entries are denied or
+    // read-only: every one of those needs the folder to exist.
+    if let Err(error) = std::fs::create_dir_all(host.home().join(".claude")) {
+        return fail(
+            &launch_dir,
+            format!("prepare launch: create ~\\.claude: {error}"),
+        );
+    }
     // The credential directory exists before the request is built: a
     // read-only grant is only honoured for a path that exists.
     if let Err(error) = create_launch_dir(&launch_dir, &input.credential.credential) {

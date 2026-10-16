@@ -435,3 +435,49 @@ async fn a_resolved_program_path_with_a_percent_sign_is_rejected() {
         "program path contains a character cmd.exe interprets"
     );
 }
+
+#[test]
+fn the_environment_is_a_list_of_key_value_entries_and_a_missing_workspace_claude_folder_is_denied_whole()
+ {
+    use std::collections::BTreeMap;
+
+    let exists = |_: &Path| false;
+    let request = build_request(&LaunchInput {
+        launch_id: "0123456789abcdef".into(),
+        executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
+        client_exe_dir: PathBuf::from(r"C:\Program Files\Agentdesktop"),
+        cwd: PathBuf::from(r"C:\ws"),
+        args: vec![],
+        home: PathBuf::from(r"C:\Users\dev"),
+        state_dir: PathBuf::from(r"C:\Users\dev\.local\state\agentdesktop"),
+        launch_dir: PathBuf::from(
+            r"C:\Users\dev\.local\state\agentdesktop\launches\0123456789abcdef",
+        ),
+        git_dir: None,
+        program_files_claude: None,
+        gateway_url: "https://gateway.example.com/".into(),
+        base_env: BTreeMap::from([("SystemRoot".to_owned(), r"C:\Windows".to_owned())]),
+        exists: &exists,
+    });
+    // MXC 1.0.0 takes `env` as `KEY=VALUE` strings, not an object (lab L2).
+    assert!(request.process.env.iter().all(|entry| entry.contains('=')));
+    assert!(
+        request
+            .process
+            .env
+            .contains(&"TERM=xterm-256color".to_owned())
+    );
+    let json = serde_json::to_value(&request).unwrap();
+    assert!(json["process"]["env"].is_array());
+    // MXC refuses a denied path under a missing folder (lab L2, 0x80070003):
+    // the folder is denied instead of its entries.
+    let denied = request.filesystem.denied_paths;
+    assert!(denied.contains(&r"C:\ws\.claude".to_owned()));
+    assert!(
+        !denied
+            .iter()
+            .any(|path| path.starts_with(r"C:\ws\.claude\"))
+    );
+    // Entries whose parent is granted read-write stay individual.
+    assert!(denied.contains(&r"C:\Users\dev\.claude\settings.json".to_owned()));
+}

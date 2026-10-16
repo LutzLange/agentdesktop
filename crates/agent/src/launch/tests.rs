@@ -693,9 +693,21 @@ fn base_env() -> BTreeMap<String, String> {
     .collect()
 }
 
+/// `process.env` as a map (the request carries `KEY=VALUE` entries).
+fn env_map(request: &serde_json::Value) -> BTreeMap<String, String> {
+    list(request, "/process/env")
+        .into_iter()
+        .map(|entry| {
+            let (key, value) = entry.split_once('=').expect("KEY=VALUE");
+            (key.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
 /// The paths of the snapshot scenario that exist on the host.
 fn snapshot_existing() -> BTreeSet<String> {
     [
+        r"C:\lab\ws pr1\.claude",
         r"C:\Users\dev\.local\bin",
         r"C:\Users\dev\.local\share\claude",
         r"C:\Program Files\Git",
@@ -838,7 +850,7 @@ fn the_command_line_starts_the_program_through_cmd_without_autorun_or_delayed_ex
 #[test]
 fn the_environment_is_closed_and_expands_the_path_from_system_root() {
     let request = request_json(&snapshot_existing(), |_| {});
-    let env = request["process"]["env"].as_object().unwrap();
+    let env = env_map(&request);
     assert_eq!(
         env["PATH"],
         r"C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Program Files\Git\cmd;C:\Users\dev\.local\bin;C:\lab\agentdesktop"
@@ -869,7 +881,8 @@ fn the_environment_is_closed_and_expands_the_path_from_system_root() {
 #[test]
 fn the_path_has_no_git_entry_without_git() {
     let request = request_json(&snapshot_existing(), |input| input.git_dir = None);
-    let path = request["process"]["env"]["PATH"].as_str().unwrap();
+    let env = env_map(&request);
+    let path = env["PATH"].as_str();
     assert_eq!(
         path,
         r"C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0;C:\Users\dev\.local\bin;C:\lab\agentdesktop"
@@ -897,7 +910,7 @@ fn the_request_contains_no_percent_sign_and_no_forward_slash_in_any_path() {
         "CLAUDE_CONFIG_DIR",
         "AGENTDESKTOP_CREDENTIAL_FILE",
     ] {
-        paths.push(request["process"]["env"][key].as_str().unwrap().to_owned());
+        paths.push(env_map(&request)[key].clone());
     }
     for path in paths {
         assert!(!path.contains('/'), "{path}");
@@ -911,7 +924,7 @@ fn a_url_in_the_request_keeps_its_slashes() {
         input.gateway_url = "https://gateway.example.com/anthropic".into();
     });
     assert_eq!(
-        request["process"]["env"]["ANTHROPIC_BASE_URL"],
+        env_map(&request)["ANTHROPIC_BASE_URL"],
         "https://gateway.example.com/anthropic"
     );
 }
@@ -2278,20 +2291,14 @@ async fn the_credential_and_request_files_exist_before_the_executor_starts() {
         request["containerId"],
         format!("agentdesktop-{}", launched.launch_id)
     );
-    let env = &request["process"]["env"];
+    let env = env_map(&request);
     assert!(
-        env["ANTHROPIC_BASE_URL"]
-            .as_str()
-            .unwrap()
-            .starts_with("https://gateway.example.com"),
-        "{env}"
+        env["ANTHROPIC_BASE_URL"].starts_with("https://gateway.example.com"),
+        "{env:?}"
     );
     assert!(
-        env["AGENTDESKTOP_CREDENTIAL_FILE"]
-            .as_str()
-            .unwrap()
-            .ends_with(r"credential\token"),
-        "{env}"
+        env["AGENTDESKTOP_CREDENTIAL_FILE"].ends_with(r"credential\token"),
+        "{env:?}"
     );
     assert!(
         !request.to_string().contains("gateway-token"),
