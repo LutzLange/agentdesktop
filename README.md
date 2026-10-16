@@ -626,6 +626,78 @@ routes:
 This route is a pass-through, not an LLM route, so requests on it have no
 token or cost records; see [Token and cost usage](#token-and-cost-usage).
 
+## Sandboxed launch (Windows, preview)
+
+`agentdesktop run claude` starts Claude Code inside a Windows AppContainer so the
+agent sees the workspace, its own state and little else. The daemon drives
+Microsoft's MXC executor; nothing is installed on the device by Agentdesktop
+itself. Startup setting (local only, user mode):
+
+```yaml
+daemon:
+  user: true
+  containment:
+    executor: C:\Program Files\mxc\x64\wxc-exec.exe
+```
+
+The daemon reports the setting as `containment` in daemon-info (`available`
+with the reason when not). Then, from the workspace directory:
+
+```powershell
+agentdesktop run claude -- --model opus
+```
+
+Everything after `--` goes to Claude Code. The daemon answers `409` when the
+effective configuration has no `llmGateway` with `authentication`, no
+`programs.claudeCode` with `useLlmGateway: true`, uses subscription sign-in
+(not available inside the box yet), or sets a top-level `sandbox` (Claude
+Code's own sandbox does not run inside the box; remove it or launch without
+`run`). `daemon.claudeCode.config` must stay unset: the box reads
+`~\.claude\settings.json`. With controller JWT authentication, `claude-code`
+must be in the controller's `allowedClientIds`; with `authentication.type: oidc`
+the client ID has no effect.
+
+What the box can see: the workspace, `~\.claude` (skills, agents, commands,
+`CLAUDE.md` and `.claude.json` stay writable; `CLAUDE_CONFIG_DIR` points there),
+a private `tmp`. Read-only: the Claude Code and Git installations, the
+Agentdesktop client, `~\.claude\settings.json`, `~\.claude\hooks`,
+`~\.claude\plugins`, the workspace's `.claude\settings*.json`, `.claude\hooks`,
+`.mcp.json`, and `.git\config` plus `.git\hooks` of the workspace repository.
+Each of those is denied when it does not exist, so the box cannot create it
+either; a workspace without `.git` cannot `git init` one. Always denied:
+`~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.ssh`, `~\.aws`,
+`~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
+directory or one of its ancestors, or anything under `%SystemRoot%`,
+`%ProgramFiles%`, `%ProgramData%`, `AppData`, `~\.claude`, the daemon's state
+directory or a denied path. Loopback and outbound network are open in this
+preview; the clipboard is off in the box; a gateway behind a private CA is not
+supported yet.
+
+The box gets no pipe to the daemon and no sign-in: the daemon writes the
+gateway credential to a private file named by `AGENTDESKTOP_CREDENTIAL_FILE`,
+which `agentdesktop credential --client-id claude-code` reads inside the box.
+The daemon rewrites that file shortly before the credential expires, without
+ever opening a browser; if the gateway refuses the refresh the file stays until
+the credential expires, if the configuration no longer allows the launch the
+file is removed at once. The box's own `TEMP` lives under the launch directory.
+Telemetry hooks do not reach the daemon from inside the box in this preview.
+Arguments containing `" % ^ & | < > !` or control characters are rejected,
+because `cmd.exe` starts the box's console window.
+
+Launches are listed by `GET /v1/launches` (running ones plus the last 32 that
+exited). A daemon restart keeps running boxes alive but stops refreshing their
+credential; their launch directories are removed once they exit. Residual risk:
+files the agent creates in the workspace are not gated yet; nested repositories
+under the workspace and editor task files such as `.vscode\tasks.json` are not
+protected; managed `allowManaged*Only` settings arrive with the policy profile.
+
+Behaviour change for the user-mode daemon on Windows: its pipe now admits the
+owning user only (SYSTEM and that user's SID), no longer every interactive user.
+On a device that also runs the system service, set `daemon.socket` to a per-user
+pipe (for example `\\.\pipe\agentdesktop-<username>`) and pass it to `run` with
+`--socket` (or `AGENTDESKTOP_SOCKET` in the unified binary); this preview adds no
+pipe discovery or Windows logon autostart.
+
 ## Periodic re-apply (opt-in)
 
 The daemon applies its configuration at startup and whenever the controller

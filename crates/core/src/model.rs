@@ -137,6 +137,10 @@ pub struct DaemonInfo {
     /// `daemon.usage` is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_receiver: Option<UsageReceiverInfo>,
+    /// Sandboxed launch (`agentdesktop run`), when `daemon.containment` is
+    /// configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<ContainmentInfo>,
 }
 
 /// Whether `agentdesktop run` can launch a sandboxed program on this daemon.

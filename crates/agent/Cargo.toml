@@ -31,6 +31,7 @@ base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 hostname.workspace = true
+humantime.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
@@ -84,4 +85,6 @@ windows-sys = { version = "0.61", features = [
 	"Win32_Foundation",
 	"Win32_Security",
 	"Win32_Security_Authorization",
+	"Win32_System_Pipes",
+	"Win32_System_Threading",
 ] }

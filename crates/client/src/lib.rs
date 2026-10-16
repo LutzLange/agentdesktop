@@ -152,8 +152,16 @@ pub struct StatusError {
 }
 
 impl std::fmt::Display for StatusError {
-    fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!("PR 1: StatusError Display")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = hyper::StatusCode::from_u16(self.status)
+            .ok()
+            .and_then(|status| status.canonical_reason())
+            .unwrap_or("");
+        write!(
+            formatter,
+            "daemon returned {} {reason}: {}",
+            self.status, self.body
+        )
     }
 }
 
@@ -166,8 +174,40 @@ where
     B: Serialize,
     T: DeserializeOwned,
 {
-    let _ = (endpoint, path, body);
-    todo!("PR 1: post_json_response")
+    let stream = connect(endpoint).await?;
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+        .await
+        .context("start HTTP connection")?;
+
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::debug!(%error, "local HTTP connection failed");
+        }
+    });
+
+    let encoded = serde_json::to_vec(body).context("encode request body")?;
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(encoded)))?;
+    let response = sender.send_request(request).await.context("send request")?;
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .context("read response")?
+        .to_bytes();
+    if !status.is_success() {
+        return Err(StatusError {
+            status: status.as_u16(),
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        }
+        .into());
+    }
+    serde_json::from_slice(&bytes).context("decode daemon response")
 }
 
 #[cfg(test)]

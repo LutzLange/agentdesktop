@@ -37,8 +37,8 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 #[cfg(windows)]
 use crate::windows_security::SecurityDescriptor;
 use crate::{
-    api, enrollment::EnrollmentState, gateway_oidc, inventory_watch::InventoryWatch, llm_proxy,
-    reconcile, remote, secure_fs,
+    api, enrollment::EnrollmentState, gateway_oidc, inventory_watch::InventoryWatch, launch,
+    llm_proxy, reconcile, remote, secure_fs,
 };
 
 #[cfg(unix)]
@@ -96,6 +96,10 @@ struct ResolvedDaemonArgs {
     reconcile_interval: Option<Duration>,
     once: bool,
     dry_run: bool,
+    /// `daemon.containment`; `None` for `--once` and `--dry-run`.
+    containment: Option<config::ContainmentStartupConfig>,
+    /// Whether `daemon.claudeCode.config` was set: a box reads the default path.
+    claude_settings_overridden: bool,
 }
 
 struct ResolvedToolConfigPath {
@@ -148,6 +152,16 @@ impl DaemonArgs {
             .usage
             .clone()
             .filter(|_| !(self.once || self.dry_run));
+        // A sandboxed launch runs as the daemon's user with that user's gateway
+        // credential; like the proxy, it has no meaning in system mode.
+        let containment = startup
+            .containment
+            .clone()
+            .filter(|_| !(self.once || self.dry_run));
+        if containment.is_some() && !user {
+            bail!("daemon.containment requires --user (or daemon.user: true)");
+        }
+        let claude_settings_overridden = startup.claude_code.config.is_some();
         // VS Code's chatLanguageModels.json and settings.json live in the
         // user's own profile, like the Copilot CLI providers file: a system
         // daemon has no user file to manage, so an explicit override is
@@ -223,6 +237,8 @@ impl DaemonArgs {
                 reconcile_interval: startup.reconcile_interval,
                 once: self.once || self.dry_run,
                 dry_run: self.dry_run,
+                containment,
+                claude_settings_overridden,
             });
         }
 
@@ -311,6 +327,8 @@ impl DaemonArgs {
             reconcile_interval: startup.reconcile_interval,
             once: self.once || self.dry_run,
             dry_run: self.dry_run,
+            containment,
+            claude_settings_overridden,
         })
     }
 }
@@ -454,6 +472,36 @@ where
     }
 
     secure_fs::ensure_private_dir(&args.state_dir)?;
+    // Launch directories a previous daemon left behind: secrets go now, the
+    // directory of a box that still runs stays until it exits.
+    #[cfg(windows)]
+    if args.user {
+        launch::sweep(&args.state_dir, &launch::host::process_alive)
+            .context("sweep previous sandboxed launches")?;
+    }
+    let containment = launch::containment_info(
+        args.containment.as_ref(),
+        args.user,
+        cfg!(windows),
+        args.claude_settings_overridden,
+        &|path| path.exists(),
+    );
+    #[cfg(windows)]
+    let daemon_sid = if args.user {
+        // The user-mode pipe admits this SID only; without it the daemon must
+        // not fall back to the interactive-users descriptor.
+        let identity =
+            launch::peer_identity(std::process::id()).context("read the daemon's own user SID")?;
+        Some(
+            identity
+                .user_sid
+                .context("the daemon's token has no user SID")?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let daemon_sid: Option<String> = None;
     let (usage_store, usage_receiver) = match &args.usage {
         Some(usage) => {
             let (store, receiver) = start_usage(usage, &args.state_dir).await;
@@ -463,6 +511,7 @@ where
     };
     let daemon_info = DaemonInfo {
         usage_receiver,
+        containment: containment.clone(),
         ..describe_daemon(&config, &args.config, &args.state_dir, args.user, llm_proxy)
     };
     start_gateway_authentication(
@@ -588,7 +637,23 @@ where
         logout,
         usage: usage_store,
     };
-    let app = api::router(state.clone());
+    let launch_state = launch::LaunchState {
+        app: state.clone(),
+        executor: Arc::new(launch::host::ProcessExecutor),
+        credentials: Arc::new(launch::host::GatewayCredentialSource { app: state.clone() }),
+        host: Arc::new(launch::host::HostEnvironment::new(
+            home_directory().unwrap_or_default(),
+            state.state_dir.clone(),
+            agentdesktop_client_executable()?
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+        )),
+        registry: launch::LaunchRegistry::new(),
+        availability: containment,
+        daemon_sid: daemon_sid.clone(),
+    };
+    let app = api::router(state.clone()).merge(launch::router(launch_state));
     // The proxy is optional at runtime too: if serving fails (for example the
     // TLS root store cannot be built), log it and keep the daemon running
     // without the proxy rather than dropping the device out of the fleet.
@@ -616,7 +681,7 @@ where
     #[cfg(unix)]
     let local_api = serve_unix(&socket, local_api_access()?, app, shutdown);
     #[cfg(windows)]
-    let local_api = serve_named_pipe(&socket, app, shutdown);
+    let local_api = serve_named_pipe(&socket, app, shutdown, daemon_sid);
     tokio::select! {
         result = local_api => result?,
         result = proxy => result?,
@@ -795,6 +860,7 @@ fn describe_daemon(
         controller,
         llm_proxy,
         usage_receiver: None,
+        containment: None,
     }
 }
 
@@ -1158,8 +1224,17 @@ async fn serve_named_pipe(
     socket: &std::path::Path,
     app: axum::Router,
     shutdown: impl Future<Output = anyhow::Result<()>> + Send,
+    peer_check: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut server = bind_named_pipe(socket, true)?;
+    // Full access for SYSTEM and Administrators, read/write for interactive
+    // users: the system daemon serves every user of the device. A user-mode
+    // daemon admits its own user only (`peer_check` is that user's SID).
+    const SYSTEM_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+    let sddl = match &peer_check {
+        Some(sid) => launch::user_mode_pipe_sddl(sid),
+        None => SYSTEM_PIPE_SDDL.to_owned(),
+    };
+    let mut server = bind_named_pipe(socket, true, &sddl)?;
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -1169,8 +1244,13 @@ async fn serve_named_pipe(
                 // Keep an unconnected instance available while the accepted
                 // connection is being served. Without this, clients can see a
                 // transient pipe-not-found error between connections.
-                server = bind_named_pipe(socket, false)?;
-                let app = app.clone();
+                server = bind_named_pipe(socket, false, &sddl)?;
+                let app = match &peer_check {
+                    // The launch routes check the caller: its identity rides
+                    // on this connection's router as an extension.
+                    Some(_) => app.clone().layer(axum::Extension(pipe_peer(&connected))),
+                    None => app.clone(),
+                };
                 tokio::spawn(async move {
                     if let Err(error) = serve_local_connection(connected, app).await {
                         tracing::warn!(%error, "failed to serve local API connection");
@@ -1186,16 +1266,44 @@ async fn serve_named_pipe(
     Ok(())
 }
 
+/// The identity of the process at the client end of a freshly accepted pipe;
+/// an unreadable identity is a peer with no SID, which the launch routes refuse.
 #[cfg(windows)]
-fn bind_named_pipe(path: &std::path::Path, first: bool) -> anyhow::Result<NamedPipeServer> {
-    // Full access for SYSTEM and Administrators, read/write for interactive users.
-    const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+fn pipe_peer(connected: &NamedPipeServer) -> launch::PipePeer {
+    use std::os::windows::io::AsRawHandle;
 
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+
+    let mut pid = 0u32;
+    // SAFETY: the handle is a connected pipe instance; `pid` is a valid out-parameter.
+    let ok = unsafe { GetNamedPipeClientProcessId(connected.as_raw_handle() as _, &mut pid) };
+    if ok == 0 {
+        tracing::debug!(error = %std::io::Error::last_os_error(), "pipe client pid unavailable");
+        return launch::PipePeer {
+            user_sid: None,
+            app_container: false,
+        };
+    }
+    launch::peer_identity(pid).unwrap_or_else(|error| {
+        tracing::debug!(pid, error = %format!("{error:#}"), "pipe client identity unavailable");
+        launch::PipePeer {
+            user_sid: None,
+            app_container: false,
+        }
+    })
+}
+
+#[cfg(windows)]
+fn bind_named_pipe(
+    path: &std::path::Path,
+    first: bool,
+    sddl: &str,
+) -> anyhow::Result<NamedPipeServer> {
     let mut options = ServerOptions::new();
     options
         .first_pipe_instance(first)
         .reject_remote_clients(true);
-    let descriptor = SecurityDescriptor::from_sddl(PIPE_SDDL)?;
+    let descriptor = SecurityDescriptor::from_sddl(sddl)?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.as_ptr(),

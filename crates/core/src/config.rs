@@ -141,8 +141,28 @@ pub fn validate_containment_startup(
     cfg: &ContainmentStartupConfig,
     windows: bool,
 ) -> Result<(), String> {
-    let _ = (cfg, windows);
-    todo!("PR 1: validate_containment_startup")
+    if !windows {
+        return Ok(());
+    }
+    let text = cfg.executor.to_string_lossy();
+    let bytes = text.as_bytes();
+    let drive_absolute =
+        bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    let unc_absolute = text.starts_with("\\\\")
+        && text[2..]
+            .split('\\')
+            .filter(|part| !part.is_empty())
+            .count()
+            >= 3;
+    let exe = text
+        .rsplit('\\')
+        .next()
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".exe"));
+    if (drive_absolute || unc_absolute) && exe {
+        Ok(())
+    } else {
+        Err("daemon.containment.executor must be an absolute path to wxc-exec.exe".to_owned())
+    }
 }
 
 /// Token and cost collection for a daemon without a controller. agentgateway

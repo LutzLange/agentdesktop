@@ -4,10 +4,11 @@ use agentdesktop_client as client;
 use agentdesktop_core::{
     config::DaemonConfig,
     model::{
-        Discovery, EnrollmentStatus, Health, LaunchRequest, LlmGatewayCredential,
+        Discovery, EnrollmentStatus, Health, Launch, LaunchRequest, LlmGatewayCredential,
         LlmGatewayLoginStatus, TelemetryEventKind,
     },
 };
+use anyhow::Context;
 use clap::Subcommand;
 use serde::Deserialize;
 
@@ -129,6 +130,15 @@ pub async fn run(command: ClientCommand, socket: PathBuf) -> anyhow::Result<()> 
             );
         }
         ClientCommand::Credential { client_id } => {
+            // Inside a sandboxed launch the daemon's pipe is out of reach; the
+            // launch directory carries the credential instead.
+            if let Some(credential) = file_credential(
+                &client_id,
+                std::env::var_os("AGENTDESKTOP_CREDENTIAL_FILE").as_deref(),
+            ) {
+                println!("{credential}");
+                return Ok(());
+            }
             let client_id: String =
                 url::form_urlencoded::byte_serialize(client_id.as_bytes()).collect();
             let response: LlmGatewayCredential = client::get(
@@ -138,7 +148,31 @@ pub async fn run(command: ClientCommand, socket: PathBuf) -> anyhow::Result<()> 
             .await?;
             println!("{}", response.credential);
         }
-        ClientCommand::Run { .. } => todo!("PR 1: run"),
+        ClientCommand::Run { program, args } => {
+            let cwd = std::env::current_dir().context("read the current directory")?;
+            let request = run_request(&program, cwd, args);
+            match client::post_json_response::<_, Launch>(&socket, "/v1/launch", &request).await {
+                Ok(launch) => {
+                    let valid_until = launch
+                        .credential_expires_at_unix_seconds
+                        .map(|seconds| {
+                            humantime::format_rfc3339_seconds(
+                                std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                            )
+                            .to_string()
+                        })
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    println!(
+                        "launched {} (container {}, credential valid until {valid_until})",
+                        launch.launch_id, launch.container_id
+                    );
+                }
+                Err(error) => {
+                    eprintln!("{}", run_error_message(&error));
+                    std::process::exit(1);
+                }
+            }
+        }
         ClientCommand::Hook {
             hook: HookCommand::ClaudePreToolUse { include_input },
         } => {
@@ -163,21 +197,39 @@ pub async fn run(command: ClientCommand, socket: PathBuf) -> anyhow::Result<()> 
 /// `claude-code`, and `None` when the variable is unset or the file is
 /// unreadable or empty after trimming.
 pub fn file_credential(client_id: &str, var: Option<&OsStr>) -> Option<String> {
-    let _ = (client_id, var);
-    todo!("PR 1: file_credential")
+    if client_id != "claude-code" {
+        return None;
+    }
+    let path = var.filter(|value| !value.is_empty())?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let credential = contents.trim();
+    (!credential.is_empty()).then(|| credential.to_owned())
 }
 
 /// The launch request for `agentdesktop run <program>`; the alias `claude`
 /// maps to the provider id `claude-code`.
 pub fn run_request(program: &str, cwd: PathBuf, args: Vec<String>) -> LaunchRequest {
-    let _ = (program, cwd, args);
-    todo!("PR 1: run_request")
+    let program = if program == "claude" {
+        "claude-code"
+    } else {
+        program
+    };
+    LaunchRequest {
+        program: program.to_owned(),
+        cwd,
+        args,
+    }
 }
 
 /// The line `agentdesktop run` prints on stderr for a failed launch request.
 pub fn run_error_message(error: &anyhow::Error) -> String {
-    let _ = error;
-    todo!("PR 1: run_error_message")
+    match error.downcast_ref::<agentdesktop_client::StatusError>() {
+        Some(status) if status.status == 404 => {
+            "this daemon does not support `run` (upgrade agentdesktop)".to_owned()
+        }
+        Some(status) => status.to_string(),
+        None => format!("{error:#}"),
+    }
 }
 
 async fn report_claude_pre_tool_use(

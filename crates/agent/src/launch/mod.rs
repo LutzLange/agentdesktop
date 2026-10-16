@@ -39,7 +39,7 @@ pub mod host;
 #[cfg(test)]
 mod tests;
 
-/// Provider id of the only program PR 1 can launch.
+/// Provider id of the only program the launcher can start.
 const PROGRAM: &str = "claude-code";
 /// Exited launches kept in the registry after the running ones.
 const KEPT_EXITED: usize = 32;
