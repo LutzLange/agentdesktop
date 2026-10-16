@@ -198,7 +198,8 @@ Controller JWT authentication uses client ID `vscode` by default on the
 prefix-less route; choose another ID with `daemon.llmProxy.clientId`. Every client
 ID the proxy presents (`vscode` or your choice, plus `copilot-cli` and
 `vscode-copilot` for the routes below) must be in the controller's
-`allowedClientIds`. With `authentication.type: oidc` the client ID has no effect: the
+`allowedClientIds`, and so must the client ID of every session registered for
+`/sandbox/`. With `authentication.type: oidc` the client ID has no effect: the
 OIDC token is the same for every route. The listen address must be loopback.
 
 **Routes.** Besides the prefix-less route (the manual shape used above, with the
@@ -218,11 +219,13 @@ paths on the prefix-less route:
 | `/vscode-copilot/` | `vscode-copilot` | gateway identity only | `llmGateway.url` |
 | `/vscode-copilot-passthrough/` | `vscode-copilot` | gateway identity in `Authorization`, the client's own bearer token in `x-llm-token` | `llmGateway.proxyUrl` (required) |
 | `/vscode-copilot-capi/<pairing>/` | `vscode-copilot` | as the pass-through route; a credential-less `GET /_ping` is forwarded without `x-llm-token`; the only route that tunnels WebSocket upgrades | `llmGateway.proxyUrl` (required) |
+| `/sandbox/` | the registered session's (see **Sandbox route and per-session pairing**) | gateway identity only | `llmGateway.url` |
 
-**Pairing.** Every route requires the per-device pairing value in the
-`x-agentdesktop-pairing` header, except `/vscode-copilot-capi/`, which takes it
+**Pairing.** Every route except `/sandbox/` requires the per-device pairing
+value in the `x-agentdesktop-pairing` header; `/vscode-copilot-capi/` takes it
 as the first path segment after the prefix (VS Code cannot add a header there)
-and ignores the header. The daemon creates it in its state directory
+and ignores the header, and `/sandbox/` takes a per-session pairing in the
+header instead. The daemon creates it in its state directory
 (`llm-proxy-pairing`, owner-only) on first use and keeps it across restarts; a
 manual setup copies it from there. The state directory in `--user` mode is
 `$XDG_STATE_HOME/agentdesktop`, by default `~/.local/state/agentdesktop` (the
@@ -628,13 +631,13 @@ token or cost records; see [Token and cost usage](#token-and-cost-usage).
 
 ### Sandbox route and per-session pairing
 
-A program that runs inside a sandbox (for example a Windows AppContainer the
-daemon starts) must not hold the device pairing or any gateway credential, and
-needs no network beyond loopback. For that the proxy has a fifth route,
-`/sandbox`, whose pairing is a **per-session** value: whoever starts the
-sandboxed program registers a session over the local API, puts the session's
-pairing into the program's environment, and revokes the session when the
-program exits.
+A program that runs inside a sandbox (for example a Windows AppContainer) must
+not hold the device pairing or any gateway credential, and needs no network
+beyond loopback. For that the proxy has a further route, `/sandbox`, whose
+pairing is a **per-session** value: whoever starts the sandboxed program (a
+launcher in the user's session) registers a session over the local API, puts
+the session's pairing into the program's environment, and revokes the session
+when the program exits.
 
 ```sh
 agentdesktop llm-proxy session create --client-id claude-code --label "project x"
@@ -654,8 +657,10 @@ agentdesktop llm-proxy session revoke 0123456789abcdef
 The same operations are `POST`/`GET /v1/llm-proxy/sessions` and
 `DELETE /v1/llm-proxy/sessions/{id}` on the local API; `POST` takes
 `{"clientId": "...", "label": "...", "ttlSeconds": 28800}` and answers `409`
-while the proxy is not running. For Claude Code the sandboxed program's
-environment is:
+when the proxy could not be bound at startup (`llmProxy.bound: false`). A
+proxy that stopped later still has its address, so a session created then
+gets a `baseUrl` nothing serves until the daemon restarts. For Claude Code the
+sandboxed program's environment is:
 
 ```
 ANTHROPIC_BASE_URL=http://127.0.0.1:4000/sandbox
@@ -677,15 +682,18 @@ client id only labels the log.
 
 Sessions live in memory and expire `ttlSeconds` after their last request
 (default 28800, at most 86400 and at least 60; the timeout restarts on every
-accepted request, so a session in use never expires on its own). A daemon
+request that presents the session's pairing, whether the proxy then forwards
+or refuses it, so a session in use never expires on its own). Revoking a
+session refuses its next request; a response already streaming completes. A daemon
 holds at most 64 unexpired sessions (`429`); expired ones are dropped every
 60 seconds. A daemon restart drops all sessions: the sandboxed program then
 gets `403 pairing_invalid` on its next request and has to be started again
 with a new session. Each request on `/sandbox` leaves one line in the daemon
 log, `LLM proxy sandbox request`, with the session id, client id, method, path
 (prefix stripped, no query), status, refusal code, request and response bytes,
-duration and whether the response completed or was cut off; never a header,
-a body or a pairing value.
+duration and whether the response completed or was cut off (for a request the
+proxy refused, the response bytes are 0: the error body is not counted); never
+a header, a body or a pairing value.
 
 What a session pairing is worth: it is a bearer secret for `/sandbox` on this
 machine. Any local process that holds it gets the user's gateway identity for
