@@ -54,8 +54,6 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bytes of `wxc-exec.log` returned with an early-exit error.
 const LOG_TAIL: usize = 4096;
 
-// ---------------------------------------------------------------- AC 2 / AC 4
-
 /// Startup snapshot for `daemon-info`. `None` when `daemon.containment` is
 /// unconfigured; otherwise `available` only with
 /// `user && windows && exists(executor) && !claude_settings_overridden`.
@@ -489,6 +487,9 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         join(&cwd, r".claude\settings.local.json"),
         join(&cwd, r".claude\hooks"),
         join(&cwd, ".mcp.json"),
+        // A `HEAD` file at the workspace root would let git treat the
+        // workspace itself as a bare repository with box-written config.
+        join(&cwd, "HEAD"),
     ];
     let git = join(&cwd, ".git");
     if !exists(&git) {
@@ -501,6 +502,7 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
     {
         // A repository directory: git reads config and hooks unsandboxed
         // later, and `commondir` would redirect it to a writable directory.
+        executable_config.push(join(&git, "HEAD"));
         executable_config.push(join(&git, "config"));
         executable_config.push(join(&git, "hooks"));
         executable_config.push(join(&git, "commondir"));
@@ -1185,19 +1187,21 @@ pub fn sweep(state_dir: &Path, alive: &dyn Fn(u32, u64) -> bool) -> anyhow::Resu
             .ok()
             .and_then(|text| parse_pid_file(&text))
             .is_some_and(|(pid, start_time)| alive(pid, start_time));
-        if live {
-            for secret in [dir.join("credential"), dir.join("request.json")] {
-                let removed = if secret.is_dir() {
-                    std::fs::remove_dir_all(&secret)
-                } else {
-                    std::fs::remove_file(&secret)
-                };
-                if let Err(error) = removed
-                    && error.kind() != io::ErrorKind::NotFound
-                {
-                    tracing::warn!(launch_id, %error, path = %secret.display(), "failed to remove a launch secret");
-                }
+        // Secrets go first either way, so a directory that cannot be removed
+        // as a whole never keeps a token behind.
+        for secret in [dir.join("credential"), dir.join("request.json")] {
+            let removed = if secret.is_dir() {
+                std::fs::remove_dir_all(&secret)
+            } else {
+                std::fs::remove_file(&secret)
+            };
+            if let Err(error) = removed
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(launch_id, %error, path = %secret.display(), "failed to remove a launch secret");
             }
+        }
+        if live {
             tracing::info!(
                 launch_id,
                 "launch {launch_id} still running; its credential is no longer refreshed"

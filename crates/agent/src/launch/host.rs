@@ -239,9 +239,19 @@ impl Executor for ProcessExecutor {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
         let pid = child.id();
-        let start_time = process_start_time(&child);
+        // Without its creation time the sweep could not tell this box from a
+        // reused pid later; better not to start it at all.
+        let start_time = match process_start_time(&child) {
+            Ok(start_time) => start_time,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(io::Error::other(format!(
+                    "read process start time: {error:#}"
+                )));
+            }
+        };
         Ok(Box::new(ProcessChild {
             child,
             pid,
@@ -251,14 +261,14 @@ impl Executor for ProcessExecutor {
 }
 
 #[cfg(windows)]
-fn process_start_time(child: &Child) -> u64 {
+fn process_start_time(child: &Child) -> anyhow::Result<u64> {
     use std::os::windows::io::AsRawHandle;
-    windows::creation_time(child.as_raw_handle() as _).unwrap_or_default()
+    windows::creation_time(child.as_raw_handle() as _)
 }
 
 #[cfg(not(windows))]
-fn process_start_time(_child: &Child) -> u64 {
-    0
+fn process_start_time(_child: &Child) -> anyhow::Result<u64> {
+    Ok(0)
 }
 
 /// The gateway credential for a launch: the local API's own path, with the

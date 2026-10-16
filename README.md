@@ -662,8 +662,8 @@ What the box can see: the workspace, `~\.claude` (skills, agents, commands,
 a private `tmp`. Read-only: the Claude Code and Git installations, the
 Agentdesktop client, `~\.claude\settings.json`, `~\.claude\hooks`,
 `~\.claude\plugins`, the workspace's `.claude\settings*.json`, `.claude\hooks`,
-`.mcp.json`, and `.git\config`, `.git\hooks` and `.git\commondir` of the
-workspace repository.
+`.mcp.json`, a `HEAD` file at the workspace root, and `.git\HEAD`, `.git\config`,
+`.git\hooks` and `.git\commondir` of the workspace repository.
 Each of those is denied when it does not exist, so the box cannot create it
 either; a workspace without `.git` cannot `git init` one. Always denied:
 `~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
@@ -704,8 +704,9 @@ the credential and request files of every earlier launch, and the directory of
 a launch whose box has exited. Residual risk: files the agent creates in the
 workspace are not gated yet; nested repositories under the workspace, a renamed
 or recreated `.git` or `.claude` directory, and editor task files such as
-`.vscode\tasks.json` are not protected; managed `allowManaged*Only` settings
-arrive with the policy profile.
+`.vscode\tasks.json` are not protected; `~\.claude\.claude.json` (user-scope
+MCP servers) and skills under `~\.claude` stay writable so the agent keeps its
+context; managed `allowManaged*Only` settings arrive with the policy profile.
 
 Behaviour change for the user-mode daemon on Windows: its pipe now admits the
 owning user only (SYSTEM and that user's SID), no longer every interactive user.

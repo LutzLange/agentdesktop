@@ -55,7 +55,8 @@
       "C:\\lab\\ws pr1\\.claude\\settings.local.json",
       "C:\\lab\\ws pr1\\.mcp.json",
       "C:\\lab\\ws pr1\\.git\\config",
-      "C:\\lab\\ws pr1\\.git\\hooks"
+      "C:\\lab\\ws pr1\\.git\\hooks",
+      "C:\\lab\\ws pr1\\.git\\HEAD"
     ],
     "deniedPaths": [
       "C:\\Users\\dev\\.claude\\hooks",
@@ -68,7 +69,8 @@
       "C:\\Users\\dev\\.azure",
       "C:\\Users\\dev\\.kube",
       "C:\\lab\\ws pr1\\.git\\commondir",
-      "C:\\Users\\dev\\.claude\\ide"
+      "C:\\Users\\dev\\.claude\\ide",
+      "C:\\lab\\ws pr1\\HEAD"
     ]
   },
   "network": {

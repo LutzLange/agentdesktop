@@ -197,7 +197,7 @@ pub async fn run(command: ClientCommand, socket: PathBuf) -> anyhow::Result<()> 
 /// `claude-code`, and `None` when the variable is unset or the file is
 /// unreadable or empty after trimming.
 pub fn file_credential(client_id: &str, var: Option<&OsStr>) -> Option<String> {
-    if client_id != "claude-code" {
+    if client_id != crate::provider::claude_code::ClaudeCode::ID {
         return None;
     }
     let path = var.filter(|value| !value.is_empty())?;
