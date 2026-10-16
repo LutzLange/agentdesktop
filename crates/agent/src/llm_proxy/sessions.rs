@@ -410,6 +410,9 @@ async fn revoke_session(
     State(state): State<SessionApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    // A session that has idled out is gone for the caller even before the
+    // sweep has dropped it: it is neither listed nor revocable.
+    state.registry.sweep(super::now_unix());
     if state.registry.revoke(&id) {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1294,5 +1297,64 @@ mod tests {
         assert!(!debug.contains(&created.pairing), "{debug}");
         let listing = call(&api.app, "GET", "/v1/llm-proxy/sessions", None).await;
         assert!(!listing.body.contains(&created.pairing));
+    }
+
+    // --- the production policy: the effective configuration's rules.
+
+    fn config_policy(yaml: &str) -> (tempfile::TempDir, ConfigPolicy) {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ConfigPolicy {
+            config: agentdesktop_core::config::parse_daemon(yaml).expect("test configuration"),
+            state_dir: dir.path().to_owned(),
+        };
+        (dir, policy)
+    }
+
+    const CONTROLLER_JWT: &str = "llmGateway:\n  url: https://gateway.example.com\n  authentication:\n    type: controllerJwt\n    audience: agentgateway\n    allowedClientIds: [claude-code, copilot-cli]\n";
+    const OIDC: &str = "llmGateway:\n  url: https://gateway.example.com\n  authentication:\n    type: oidc\n    issuer: https://login.example.com\n    clientId: agentdesktop\n";
+
+    #[tokio::test]
+    async fn config_policy_admits_a_client_id_the_controller_policy_allows() {
+        let (_dir, policy) = config_policy(CONTROLLER_JWT);
+        assert_eq!(policy.check("claude-code").await, Ok(()));
+        assert_eq!(policy.check("copilot-cli").await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn config_policy_refuses_a_client_id_missing_from_allowed_client_ids() {
+        let (_dir, policy) = config_policy(CONTROLLER_JWT);
+        let (status, message) = policy.check("codex").await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            message,
+            "client id codex is not in llmGateway.authentication.allowedClientIds"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_policy_does_not_check_client_ids_with_oidc_or_without_authentication() {
+        let (_dir, policy) = config_policy(OIDC);
+        assert_eq!(policy.check("anything-goes").await, Ok(()));
+        let (_dir, policy) = config_policy("llmGateway:\n  url: https://gateway.example.com\n");
+        assert_eq!(policy.check("anything-goes").await, Ok(()));
+        let (_dir, policy) = config_policy("{}");
+        assert_eq!(policy.check("anything-goes").await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn config_policy_refuses_a_program_in_subscription_mode() {
+        let (_dir, policy) = config_policy(&format!(
+            "{OIDC}programs:\n  claudeCode:\n    auth: subscription\n  claudeDesktop:\n    auth: subscription\n"
+        ));
+        for client_id in ["claude-code", "claude-desktop"] {
+            let (status, message) = policy.check(client_id).await.unwrap_err();
+            assert_eq!(status, StatusCode::CONFLICT, "{client_id}");
+            assert_eq!(
+                message, "subscription mode is not supported on the sandbox route",
+                "{client_id}"
+            );
+        }
+        let (_dir, policy) = config_policy(&format!("{OIDC}programs:\n  claudeCode: {{}}\n"));
+        assert_eq!(policy.check("claude-code").await, Ok(()));
     }
 }

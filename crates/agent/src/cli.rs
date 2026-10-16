@@ -85,15 +85,27 @@ pub enum SessionCommand {
 fn session_error_message(error: &anyhow::Error) -> String {
     match error.downcast_ref::<agentdesktop_client::StatusError>() {
         Some(status) if status.status == 404 && !status.body.is_empty() => status.body.clone(),
-        Some(status) if status.status == 429 => {
-            "too many sessions (64); revoke unused ones".to_owned()
+        Some(status) if status.status == 404 => {
+            "this daemon has no session API (upgrade agentdesktop)".to_owned()
         }
+        Some(status) if status.status == 429 => format!(
+            "too many sessions ({}); revoke unused ones",
+            crate::llm_proxy::sessions::MAX_SESSIONS
+        ),
         Some(status) => status.to_string(),
         None => format!("{error:#}"),
     }
 }
 
 const SESSIONS_PATH: &str = "/v1/llm-proxy/sessions";
+
+/// A session id as the daemon mints it: 16 lowercase hexadecimal characters.
+fn valid_session_id(id: &str) -> bool {
+    id.len() == 16
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 async fn run_session_command(command: SessionCommand, socket: &Path) -> anyhow::Result<()> {
     match command {
@@ -126,6 +138,9 @@ async fn run_session_command(command: SessionCommand, socket: &Path) -> anyhow::
             }
         }
         SessionCommand::Revoke { id } => {
+            if !valid_session_id(&id) {
+                anyhow::bail!("session id must be 16 lowercase hexadecimal characters");
+            }
             client::delete(socket, &format!("{SESSIONS_PATH}/{id}")).await?;
         }
     }
@@ -493,5 +508,37 @@ mod tests {
         assert_eq!(tool_input.as_ref().unwrap()["command"], "cargo test");
         assert!(!serialized.contains("session-secret"));
         assert!(!serialized.contains("transcript"));
+    }
+}
+
+#[cfg(test)]
+mod session_cli_tests {
+    use super::{session_error_message, valid_session_id};
+
+    #[test]
+    fn a_session_id_is_sixteen_lowercase_hex_characters() {
+        assert!(valid_session_id("0123456789abcdef"));
+        for bad in [
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "a?b",
+            "",
+            "a b",
+        ] {
+            assert!(!valid_session_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_404_means_an_older_daemon_without_the_session_api() {
+        let error = anyhow::Error::new(agentdesktop_client::StatusError {
+            status: 404,
+            body: String::new(),
+        });
+        assert_eq!(
+            session_error_message(&error),
+            "this daemon has no session API (upgrade agentdesktop)"
+        );
     }
 }

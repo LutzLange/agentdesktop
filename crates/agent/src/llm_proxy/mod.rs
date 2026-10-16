@@ -267,11 +267,12 @@ pub(crate) enum RouteIdentity {
     Session,
 }
 
-/// A fixed path prefix the proxy serves for one managed program.
+/// A fixed path prefix the proxy serves.
 ///
-/// The prefix is what a reconciler writes into that program's client file, so
-/// the client id is decided by the file the daemon owns, never by request
-/// headers. The prefix is stripped before forwarding.
+/// For a managed program the prefix is what its reconciler writes into the
+/// client file, so the client id is decided by the file the daemon owns, never
+/// by request headers; on the sandbox route the client id is the registered
+/// session's. The prefix is stripped before forwarding.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProxyRoute {
     pub prefix: &'static str,
@@ -298,10 +299,11 @@ pub(crate) const CAPI_ROUTE: &str = "/vscode-copilot-capi";
 /// The route for a program inside a sandbox: its pairing is a per-session
 /// value minted over the local API (`sessions`), never the device pairing, and
 /// the client id is the session's. The box needs nothing but this route, so
-/// it holds no credential and reaches nothing but loopback.
+/// it holds no credential and needs nothing but loopback.
 pub(crate) const SANDBOX_ROUTE: &str = "/sandbox";
 
-/// Routes for the Copilot programs. A prefix matches only at a `/` boundary, so
+/// The prefixed routes: the Copilot programs and the sandbox route. A prefix
+/// matches only at a `/` boundary, so
 /// `/vscode-copilot-passthrough/...` never matches `/vscode-copilot`.
 pub(crate) const ROUTES: &[ProxyRoute] = &[
     ProxyRoute {
@@ -441,7 +443,8 @@ pub(crate) struct ProxyConfig {
     /// Client id for requests that match no prefixed route (the original,
     /// hand-configured shape from the README).
     pub default_client_id: String,
-    /// Pairing value required on every route.
+    /// Device pairing value required on every route except the sandbox
+    /// route, which takes a session pairing from `sessions`.
     pub pairing: Arc<str>,
     /// Per-session pairings accepted on the `/sandbox` route.
     pub sessions: SessionRegistry,
@@ -698,8 +701,10 @@ impl SandboxRequest {
 }
 
 /// Response body of a sandbox request: counts the data bytes delivered and
-/// emits the request log once, when the upstream body ends (`complete`),
-/// fails, or is dropped first because the client went away (`aborted`).
+/// emits the request log once, when the upstream body ends (`complete`, also
+/// when hyper drops a body that has reported its end without polling for the
+/// trailing `None`), fails, or is dropped before its end because the client
+/// went away (`aborted`).
 pub(crate) struct LoggedBody {
     inner: ProxyBody,
     log: SandboxRequest,
@@ -739,6 +744,12 @@ impl hyper::body::Body for LoggedBody {
                 if let Some(data) = frame.data_ref() {
                     self.bytes_out += data.len() as u64;
                 }
+                // hyper stops polling once the body reports its end (a
+                // Content-Length body after its last frame) and never asks
+                // for the trailing `None`: that is a completed response too.
+                if hyper::body::Body::is_end_stream(&self.inner) {
+                    self.finish("complete");
+                }
             }
             std::task::Poll::Ready(Some(Err(_))) => self.finish("aborted"),
             std::task::Poll::Ready(None) => self.finish("complete"),
@@ -758,7 +769,14 @@ impl hyper::body::Body for LoggedBody {
 
 impl Drop for LoggedBody {
     fn drop(&mut self) {
-        self.finish("aborted");
+        // An empty body (204, HEAD) is never polled at all; a body dropped
+        // before its end was cut off by the client.
+        let outcome = if hyper::body::Body::is_end_stream(&self.inner) {
+            "complete"
+        } else {
+            "aborted"
+        };
+        self.finish(outcome);
     }
 }
 
@@ -1009,7 +1027,8 @@ async fn forward(
             "agentdesktop proxy: OPTIONS is not supported",
         ));
     }
-    // The pairing value is required on every route. It travels in its own
+    // A pairing value is required on every route: the device pairing, or a
+    // session pairing on the sandbox route. It travels in its own
     // header, so Authorization keeps one meaning (the client's own token on the
     // pass-through shapes) and the pairing is never mistaken for a credential.
     // The CAPI route's client (VS Code) cannot add a header, so there the
@@ -4448,6 +4467,87 @@ mod tests {
             .unwrap()
             .trim_matches('"')
             .to_owned()
+    }
+
+    /// hyper never polls a body past its declared end, so a `Content-Length`
+    /// response and an empty one (204) finish through `Drop`: still `complete`.
+    #[tokio::test]
+    async fn sandbox_request_log_records_sized_and_empty_responses_as_complete() {
+        let (logs, _guard) = capture_logs();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            let path = request.uri().path().to_owned();
+                            let _ = request.into_body().collect().await;
+                            let response = if path.ends_with("/v1/models") {
+                                Response::builder()
+                                    .status(StatusCode::NO_CONTENT)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap()
+                            } else {
+                                Response::builder()
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(b"{\"ok\":true}")))
+                                    .unwrap()
+                            };
+                            Ok::<_, Infallible>(response)
+                        }),
+                    )
+                    .await;
+            });
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            let sized = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/sandbox/v1/messages"))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            let response = client.request(sized).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "{\"ok\":true}"
+            );
+            let lines = logs.wait_for_lines(1).await;
+            assert_eq!(log_field(&lines[0], "status"), "200");
+            assert_eq!(log_field(&lines[0], "bytes_out"), "11");
+            assert_eq!(log_field(&lines[0], "outcome"), "complete", "{}", lines[0]);
+
+            let empty = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{proxy_address}/sandbox/v1/models"))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response = client.request(empty).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let lines = logs.wait_for_lines(2).await;
+            assert_eq!(log_field(&lines[1], "status"), "204");
+            assert_eq!(log_field(&lines[1], "bytes_out"), "0");
+            assert_eq!(log_field(&lines[1], "outcome"), "complete", "{}", lines[1]);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(logs.sandbox_lines().len(), 2, "one event per request");
+
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
