@@ -16,7 +16,7 @@ use std::{
 };
 
 use agentdesktop_core::{
-    config::{ContainmentStartupConfig, DaemonConfig, ProgramAuthentication},
+    config::{ContainmentStartupConfig, DaemonConfig},
     model::{
         ContainmentInfo, DaemonScope, Launch, LaunchRequest, LaunchStatus, LlmGatewayCredential,
     },
@@ -38,9 +38,11 @@ use crate::{api, secure_fs};
 pub mod host;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod writer_tests;
 
 /// Provider id of the only program the launcher can start.
-const PROGRAM: &str = "claude-code";
+const PROGRAM: &str = crate::provider::claude_code::ClaudeCode::ID;
 /// Exited launches kept in the registry after the running ones.
 const KEPT_EXITED: usize = 32;
 /// How long the handler watches a fresh box for an early exit.
@@ -117,8 +119,6 @@ pub fn user_mode_pipe_sddl(sid: &str) -> String {
     format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")
 }
 
-// ----------------------------------------------------------------------- AC 5
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathKind {
     pub is_dir: bool,
@@ -194,6 +194,9 @@ pub fn validate_cwd(cwd: &Path, ctx: &CwdContext, fs: &dyn CwdFs) -> Result<Path
         }
         Err(error) => return Err(format!("workspace {}: {error}", cwd.display())),
     }
+    if canonical.to_string_lossy().contains(PATH_FORBIDDEN) {
+        return Err("workspace path contains a character cmd.exe interprets".to_owned());
+    }
     if is_root(&canonical) {
         return Err("workspace may not be a drive or share root".to_owned());
     }
@@ -235,8 +238,6 @@ pub fn validate_cwd(cwd: &Path, ctx: &CwdContext, fs: &dyn CwdFs) -> Result<Path
     Ok(canonical)
 }
 
-// ----------------------------------------------------------------------- AC 6
-
 pub trait ProgramFs {
     fn canonicalize(&self, p: &Path) -> io::Result<PathBuf>;
     fn is_file(&self, p: &Path) -> bool;
@@ -251,12 +252,18 @@ pub fn resolve_program(
     path_dirs: &[PathBuf],
     fs: &dyn ProgramFs,
 ) -> Result<PathBuf, String> {
+    // An empty entry (a trailing `;` in PATH) would make every path "under" it.
+    let path_dirs: Vec<&Path> = path_dirs
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
     let mut candidates = vec![home.join(".local").join("bin").join("claude.exe")];
     candidates.extend(path_dirs.iter().map(|dir| dir.join("claude.exe")));
     // A candidate counts only when it really lives under the user's home or a
     // PATH directory: both sides canonical, so a junction elsewhere is caught.
     let mut roots: Vec<PathBuf> = Vec::new();
-    for root in std::iter::once(home).chain(path_dirs.iter().map(PathBuf::as_path)) {
+    for root in std::iter::once(home).chain(path_dirs.iter().copied()) {
         roots.push(root.to_owned());
         if let Ok(canonical) = fs.canonicalize(root) {
             roots.push(strip_verbatim(canonical));
@@ -308,8 +315,6 @@ pub fn check_args(args: &[String]) -> Result<Vec<String>, String> {
         })
         .collect()
 }
-
-// ----------------------------------------------------------------------- AC 7
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -494,9 +499,11 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         .iter()
         .any(|name| exists(&join(&git, name)))
     {
-        // A repository directory: git reads config and hooks unsandboxed later.
+        // A repository directory: git reads config and hooks unsandboxed
+        // later, and `commondir` would redirect it to a writable directory.
         executable_config.push(join(&git, "config"));
         executable_config.push(join(&git, "hooks"));
+        executable_config.push(join(&git, "commondir"));
     }
     // A `.git` file (worktree, submodule) is left as it is.
     for path in executable_config {
@@ -509,6 +516,8 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
     for secret in [
         join(&claude_dir, ".credentials.json"),
         join(&claude_dir, "history.jsonl"),
+        // IDE lock files carry auth tokens for the editor bridge.
+        join(&claude_dir, "ide"),
         join(&home, ".ssh"),
         join(&home, ".aws"),
         join(&home, ".azure"),
@@ -558,8 +567,6 @@ pub fn write_request(launch_dir: &Path, request: &MxcRequest) -> anyhow::Result<
     secure_fs::atomic_write(&path, &contents, 0o600)?;
     Ok(path)
 }
-
-// ----------------------------------------------------------------------- AC 8
 
 /// When the credential refresh next runs: `max(expires_at - 50, now + 10)`.
 pub fn refresh_at(expires_at: u64, now: u64) -> u64 {
@@ -624,7 +631,7 @@ pub(crate) fn preconditions(effective: &DaemonConfig) -> Result<(), String> {
     if !claude_code.use_llm_gateway {
         return Err("programs.claudeCode.useLlmGateway must be true for run".to_owned());
     }
-    if claude_code.auth == Some(ProgramAuthentication::Subscription) {
+    if api::program_uses_subscription(effective, PROGRAM) {
         return Err(
             "programs.claudeCode.auth: subscription sign-in is not available inside the box in PR 1"
                 .to_owned(),
@@ -638,8 +645,6 @@ pub(crate) fn preconditions(effective: &DaemonConfig) -> Result<(), String> {
     }
     Ok(())
 }
-
-// ----------------------------------------------------------------------- AC 9
 
 pub trait LaunchChild: Send {
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
@@ -835,6 +840,11 @@ async fn launch(
     let args = check_args(&request.args).map_err(bad_request)?;
     let executable =
         resolve_program(&host.home(), &host.path_dirs(), host.program_fs()).map_err(bad_request)?;
+    if win(&executable).contains(PATH_FORBIDDEN) {
+        return Err(bad_request(
+            "program path contains a character cmd.exe interprets".to_owned(),
+        ));
+    }
     let effective =
         api::load_effective_config(&state.app.config, &state.app.state_dir).map_err(|error| {
             (
@@ -846,51 +856,99 @@ async fn launch(
     let gateway_url = effective
         .llm_gateway
         .as_ref()
-        .map(|gateway| gateway.url.as_str().trim_end_matches('/').to_owned())
+        .map(|gateway| gateway.url.as_str().to_owned())
         .unwrap_or_default();
     let credential = state.credentials.credential(PROGRAM, true).await?;
 
+    // From here on the work runs in its own task: a client that disconnects
+    // during the early-exit watch must not leave a running box unregistered,
+    // unpolled and with a token nobody refreshes or removes.
+    let started = tokio::spawn(start_launch(
+        state,
+        StartInput {
+            executor,
+            executable,
+            cwd,
+            args,
+            gateway_url,
+            credential,
+        },
+    ));
+    match started.await {
+        Ok(result) => result,
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("launch task failed: {error}"),
+        )),
+    }
+}
+
+/// What `start_launch` needs beyond the state: the checked request.
+struct StartInput {
+    executor: PathBuf,
+    executable: PathBuf,
+    cwd: PathBuf,
+    args: Vec<String>,
+    gateway_url: String,
+    credential: LlmGatewayCredential,
+}
+
+/// Creates the launch directory, starts the executor, watches it for an early
+/// exit and registers the launch with its poller and refresh task.
+async fn start_launch(
+    state: LaunchState,
+    input: StartInput,
+) -> Result<(StatusCode, Json<Launch>), LaunchError> {
+    let host = state.host.clone();
     let launch_id = format!("{:016x}", rand::random::<u64>());
     let state_dir = state.app.state_dir.clone();
     let launch_dir = state_dir.join("launches").join(&launch_id);
+    let log_path = launch_dir.join("wxc-exec.log");
+    let fail = |launch_dir: &Path, message: String| {
+        let _ = std::fs::remove_dir_all(launch_dir);
+        Err((StatusCode::INTERNAL_SERVER_ERROR, message))
+    };
+    // The credential directory exists before the request is built: a
+    // read-only grant is only honoured for a path that exists.
+    if let Err(error) = create_launch_dir(&launch_dir, &input.credential.credential) {
+        return fail(&launch_dir, format!("prepare launch: {error:#}"));
+    }
     let exists = |path: &Path| host.exists(path);
     let mxc = build_request(&LaunchInput {
         launch_id: launch_id.clone(),
-        executable,
+        executable: input.executable,
         client_exe_dir: host.client_exe_dir(),
-        cwd: cwd.clone(),
-        args,
+        cwd: input.cwd.clone(),
+        args: input.args,
         home: host.home(),
         state_dir,
         launch_dir: launch_dir.clone(),
         git_dir: host.git_dir(),
         program_files_claude: host.program_files_claude(),
-        gateway_url,
+        gateway_url: input.gateway_url,
         base_env: host.base_env(),
         exists: &exists,
     });
-    let started =
-        prepare_launch_dir(&launch_dir, &mxc, &credential.credential).and_then(|request_path| {
-            let log_path = launch_dir.join("wxc-exec.log");
-            state
-                .executor
-                .spawn(&launch_id, &executor, &request_path, &log_path)
-                .map_err(|error| anyhow::anyhow!("start wxc-exec: {error}"))
-                .map(|child| (child, log_path))
-        });
-    let (mut child, log_path) = match started {
-        Ok(started) => started,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&launch_dir);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")));
-        }
+    let request_path = match write_request(&launch_dir, &mxc) {
+        Ok(path) => path,
+        Err(error) => return fail(&launch_dir, format!("prepare launch: {error:#}")),
     };
+    let mut child =
+        match state
+            .executor
+            .spawn(&launch_id, &input.executor, &request_path, &log_path)
+        {
+            Ok(child) => child,
+            Err(error) => return fail(&launch_dir, format!("start wxc-exec: {error}")),
+        };
     let started_at = host.now();
+    // The pid file is the sweep's only way to tell a live box from a stale
+    // directory; without it the launch is not started.
     if let Err(error) = std::fs::write(
         launch_dir.join("pid"),
         format!("{} {}", child.pid(), child.start_time()),
     ) {
-        tracing::warn!(launch_id, %error, "failed to record the launch pid");
+        return fail(&launch_dir, format!("record the launch pid: {error}"));
     }
 
     // A box that dies within seconds (bad request, missing tier, MXC refusal)
@@ -901,22 +959,15 @@ async fn launch(
             Ok(None) => {}
             Ok(Some(code)) => {
                 let tail = log_tail(&log_path);
-                let _ = std::fs::remove_dir_all(&launch_dir);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                return fail(
+                    &launch_dir,
                     format!(
                         "wxc-exec exited with code {code} within {}s: {tail}",
                         EARLY_EXIT_WATCH.as_secs()
                     ),
-                ));
+                );
             }
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&launch_dir);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("watch wxc-exec: {error}"),
-                ));
-            }
+            Err(error) => return fail(&launch_dir, format!("watch wxc-exec: {error}")),
         }
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -927,13 +978,13 @@ async fn launch(
     let launch = Launch {
         launch_id: launch_id.clone(),
         program: PROGRAM.to_owned(),
-        cwd,
+        cwd: input.cwd,
         container_id: format!("agentdesktop-{launch_id}"),
         status: LaunchStatus::Running,
         exit_code: None,
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
-        credential_expires_at_unix_seconds: Some(credential.expires_at_unix_seconds),
+        credential_expires_at_unix_seconds: Some(input.credential.expires_at_unix_seconds),
     };
     state.registry.insert(launch.clone());
     tracing::info!(launch_id, cwd = %launch.cwd.display(), "sandboxed launch started");
@@ -943,7 +994,7 @@ async fn launch(
         state.registry.clone(),
         launch_id.clone(),
         launch_dir.join("credential").join("token"),
-        credential.expires_at_unix_seconds,
+        input.credential.expires_at_unix_seconds,
     ));
     tokio::spawn(poll_task(
         child,
@@ -957,19 +1008,15 @@ async fn launch(
     Ok((StatusCode::CREATED, Json(launch)))
 }
 
-/// Writes `request.json` and `credential\token` (both private) and creates
-/// the box's `tmp`; returns the request path.
-fn prepare_launch_dir(
-    launch_dir: &Path,
-    request: &MxcRequest,
-    credential: &str,
-) -> anyhow::Result<PathBuf> {
-    let request_path = write_request(launch_dir, request)?;
+/// Creates the private launch directory with `credential\token` and the box's
+/// `tmp`, before the request that grants them is built.
+pub(crate) fn create_launch_dir(launch_dir: &Path, credential: &str) -> anyhow::Result<()> {
+    secure_fs::ensure_private_dir(launch_dir)?;
     let credential_dir = launch_dir.join("credential");
     secure_fs::ensure_private_dir(&credential_dir)?;
     secure_fs::atomic_write(&credential_dir.join("token"), credential.as_bytes(), 0o600)?;
     std::fs::create_dir_all(launch_dir.join("tmp")).context("create launch tmp")?;
-    Ok(request_path)
+    Ok(())
 }
 
 /// The last 4 KiB of the executor's log, for an early-exit error.
@@ -1023,10 +1070,11 @@ fn copy_log_lines(launch_id: &str, log_path: &Path, offset: u64) -> u64 {
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return offset;
     }
-    let mut text = String::new();
-    if file.read_to_string(&mut text).is_err() {
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
         return offset;
     }
+    let text = String::from_utf8_lossy(&bytes);
     let Some(complete) = text.rfind('\n') else {
         return offset;
     };
@@ -1096,9 +1144,7 @@ async fn refresh_task(
                     };
             }
             RefreshAction::Delete => {
-                match std::fs::remove_file(&token_path) {
-                    Ok(()) | Err(_) => {}
-                }
+                let _ = std::fs::remove_file(&token_path);
                 tracing::warn!(
                     launch_id,
                     "credential removed; the box can no longer reach the gateway"
@@ -1123,7 +1169,13 @@ pub fn sweep(state_dir: &Path, alive: &dyn Fn(u32, u64) -> bool) -> anyhow::Resu
         }
     };
     for entry in entries {
-        let entry = entry.with_context(|| format!("read {}", launches.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "skipping an unreadable launch directory entry");
+                continue;
+            }
+        };
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
@@ -1143,16 +1195,15 @@ pub fn sweep(state_dir: &Path, alive: &dyn Fn(u32, u64) -> bool) -> anyhow::Resu
                 if let Err(error) = removed
                     && error.kind() != io::ErrorKind::NotFound
                 {
-                    return Err(error).with_context(|| format!("remove {}", secret.display()));
+                    tracing::warn!(launch_id, %error, path = %secret.display(), "failed to remove a launch secret");
                 }
             }
             tracing::info!(
                 launch_id,
                 "launch {launch_id} still running; its credential is no longer refreshed"
             );
-        } else {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("remove stale launch {}", dir.display()))?;
+        } else if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(launch_id, %error, "failed to remove a stale launch directory");
         }
     }
     Ok(())

@@ -475,9 +475,10 @@ where
     // Launch directories a previous daemon left behind: secrets go now, the
     // directory of a box that still runs stays until it exits.
     #[cfg(windows)]
-    if args.user {
-        launch::sweep(&args.state_dir, &launch::host::process_alive)
-            .context("sweep previous sandboxed launches")?;
+    if args.user
+        && let Err(error) = launch::sweep(&args.state_dir, &launch::host::process_alive)
+    {
+        tracing::warn!(error = %format!("{error:#}"), "sweep of previous sandboxed launches failed");
     }
     let containment = launch::containment_info(
         args.containment.as_ref(),
@@ -2191,6 +2192,79 @@ programs:
         ) {
             Ok(_) => panic!("resolve succeeded unexpectedly"),
             Err(error) => error,
+        }
+    }
+
+    fn startup_with_containment() -> config::DaemonStartupConfig {
+        config::DaemonStartupConfig {
+            containment: Some(config::ContainmentStartupConfig {
+                executor: PathBuf::from(r"C:\mxc\x64\wxc-exec.exe"),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn system_mode_rejects_containment() {
+        let error = resolve_error(daemon_args(false), startup_with_containment());
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.containment requires --user (or daemon.user: true)"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn user_mode_resolves_containment_and_records_a_claude_settings_override() {
+        let resolved = daemon_args(true)
+            .resolve(
+                startup_with_containment(),
+                PathBuf::from("config.yaml"),
+                PathBuf::from(DEFAULT_SOCKET_PATH),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved
+                .containment
+                .as_ref()
+                .map(|cfg| cfg.executor.clone()),
+            Some(PathBuf::from(r"C:\mxc\x64\wxc-exec.exe"))
+        );
+        assert!(!resolved.claude_settings_overridden);
+
+        let mut startup = startup_with_containment();
+        startup.claude_code.config = Some(PathBuf::from("/tmp/settings.json"));
+        let resolved = daemon_args(true)
+            .resolve(
+                startup,
+                PathBuf::from("config.yaml"),
+                PathBuf::from(DEFAULT_SOCKET_PATH),
+            )
+            .unwrap();
+        assert!(resolved.claude_settings_overridden);
+    }
+
+    #[test]
+    fn one_shot_runs_drop_containment() {
+        for (once, dry_run) in [(true, false), (true, true)] {
+            let args = DaemonArgs {
+                user: true,
+                once,
+                dry_run,
+                config: None,
+            };
+            let resolved = args
+                .resolve(
+                    startup_with_containment(),
+                    PathBuf::from("config.yaml"),
+                    PathBuf::from(DEFAULT_SOCKET_PATH),
+                )
+                .unwrap();
+            assert!(
+                resolved.containment.is_none(),
+                "once={once} dry_run={dry_run}"
+            );
         }
     }
 

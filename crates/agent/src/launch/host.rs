@@ -318,7 +318,7 @@ pub fn process_alive(pid: u32, start_time: u64) -> bool {
 pub use windows::peer_identity;
 
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use std::ffi::c_void;
 
     use anyhow::{Context, bail};
@@ -363,7 +363,7 @@ mod windows {
     }
 
     /// The creation FILETIME of an open process handle.
-    pub(super) fn creation_time(handle: HANDLE) -> anyhow::Result<u64> {
+    pub(crate) fn creation_time(handle: HANDLE) -> anyhow::Result<u64> {
         let empty = FILETIME {
             dwLowDateTime: 0,
             dwHighDateTime: 0,

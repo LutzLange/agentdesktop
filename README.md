@@ -662,34 +662,50 @@ What the box can see: the workspace, `~\.claude` (skills, agents, commands,
 a private `tmp`. Read-only: the Claude Code and Git installations, the
 Agentdesktop client, `~\.claude\settings.json`, `~\.claude\hooks`,
 `~\.claude\plugins`, the workspace's `.claude\settings*.json`, `.claude\hooks`,
-`.mcp.json`, and `.git\config` plus `.git\hooks` of the workspace repository.
+`.mcp.json`, and `.git\config`, `.git\hooks` and `.git\commondir` of the
+workspace repository.
 Each of those is denied when it does not exist, so the box cannot create it
 either; a workspace without `.git` cannot `git init` one. Always denied:
-`~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.ssh`, `~\.aws`,
-`~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
+`~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
+`~\.ssh`, `~\.aws`, `~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
 directory or one of its ancestors, or anything under `%SystemRoot%`,
 `%ProgramFiles%`, `%ProgramData%`, `AppData`, `~\.claude`, the daemon's state
-directory or a denied path. Loopback and outbound network are open in this
-preview; the clipboard is off in the box; a gateway behind a private CA is not
-supported yet.
+directory or a denied path (`%ProgramFiles(x86)%` counts as a system
+directory). Outbound network and connections to loopback services are open in
+this preview, while the box accepts no inbound loopback connections; the
+clipboard is off in the box; a gateway behind a private CA is not supported yet.
 
 The box gets no pipe to the daemon and no sign-in: the daemon writes the
 gateway credential to a private file named by `AGENTDESKTOP_CREDENTIAL_FILE`,
 which `agentdesktop credential --client-id claude-code` reads inside the box.
-The daemon rewrites that file shortly before the credential expires, without
-ever opening a browser; if the gateway refuses the refresh the file stays until
-the credential expires, if the configuration no longer allows the launch the
-file is removed at once. The box's own `TEMP` lives under the launch directory.
-Telemetry hooks do not reach the daemon from inside the box in this preview.
-Arguments containing `" % ^ & | < > !` or control characters are rejected,
-because `cmd.exe` starts the box's console window.
+That token is the box's single secret. Inside the box the agent can read a
+valid gateway token and send it anywhere, because outbound traffic is open in
+this preview; the local relay route removes the token from the box. The daemon
+rewrites the file shortly before the credential expires (about 50 s before),
+without ever opening a browser; if the gateway refuses the refresh the file
+stays until the credential expires, and if the configuration no longer allows
+the launch the file is removed at that next refresh. After logout or a policy
+change a running box therefore keeps model access for at most the remaining
+credential lifetime. Restarting the daemon ends model access for running
+sandboxed sessions within the credential lifetime; start a new `run` with
+`--resume`. The box's own `TEMP` lives under the launch directory. Telemetry
+hooks do not reach the daemon from inside the box in this preview. Arguments
+containing `" % ^ & | < > !` or control characters are rejected, because
+`cmd.exe` starts the box's console window.
 
-Launches are listed by `GET /v1/launches` (running ones plus the last 32 that
-exited). A daemon restart keeps running boxes alive but stops refreshing their
-credential; their launch directories are removed once they exit. Residual risk:
-files the agent creates in the workspace are not gated yet; nested repositories
-under the workspace and editor task files such as `.vscode\tasks.json` are not
-protected; managed `allowManaged*Only` settings arrive with the policy profile.
+`run` answers `400` for a rejected program, workspace or argument, `403` when
+another user calls a user-mode daemon on Windows, `409` for the configuration
+rules above, `401`/`424`/`502` straight from the credential request, and `500`
+when the executor cannot be started or exits within three seconds (its last
+log lines are in the message). Launches are listed by `GET /v1/launches`
+(running ones plus the last 32 that exited). A daemon restart keeps running
+boxes alive but stops refreshing their credential: at startup the daemon removes
+the credential and request files of every earlier launch, and the directory of
+a launch whose box has exited. Residual risk: files the agent creates in the
+workspace are not gated yet; nested repositories under the workspace, a renamed
+or recreated `.git` or `.claude` directory, and editor task files such as
+`.vscode\tasks.json` are not protected; managed `allowManaged*Only` settings
+arrive with the policy profile.
 
 Behaviour change for the user-mode daemon on Windows: its pipe now admits the
 owning user only (SYSTEM and that user's SID), no longer every interactive user.
