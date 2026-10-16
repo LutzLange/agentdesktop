@@ -204,10 +204,11 @@ OIDC token is the same for every route. The listen address must be loopback.
 
 **Routes.** Besides the prefix-less route (the manual shape used above, with the
 credential mode from `llmGateway.githubOAuth` and the upstream from
-`llmGateway.proxyUrl`), the proxy serves fixed path prefixes for the managed
-Copilot programs, one per program route, so the client ID is decided by the file
-the daemon writes and never by request headers. The prefix is stripped before
-forwarding. A path whose first segment looks like a route name without matching
+`llmGateway.proxyUrl`), the proxy serves fixed path prefixes: one per managed
+Copilot program route, whose client ID is decided by the file the daemon writes
+and never by request headers, and `/sandbox/`, whose client ID comes from the
+registered session (the route name is unrelated to the top-level `sandbox`
+configuration key). The prefix is stripped before forwarding. A path whose first segment looks like a route name without matching
 one exactly is refused with `404 route_unknown` rather than served as the
 prefix-less route; this also applies to a gateway sub-path that happens to start
 with a route name (for example `/vscode-copilot-proxy/...`), so do not use such
@@ -677,8 +678,10 @@ subscription token: with `programs.claudeCode.auth: subscription` (or the
 same for `claudeDesktop`) a session for that program is refused with `409`.
 With `authentication.type: controllerJwt` the session's client id must be in
 `allowedClientIds`; that is checked when the session is created, so a refused
-id fails at `session create` rather than at the first prompt. With `oidc` the
-client id only labels the log.
+id fails at `session create` rather than at the first prompt; a session that
+already exists keeps its gateway identity when the configuration later switches
+that program to subscription mode or narrows `allowedClientIds`, until it is
+revoked or idles out. With `oidc` the client id only labels the log.
 
 Sessions live in memory and expire `ttlSeconds` after their last request
 (default 28800, at most 86400 and at least 60; the timeout restarts on every
