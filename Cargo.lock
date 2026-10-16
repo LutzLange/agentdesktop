@@ -105,6 +105,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
