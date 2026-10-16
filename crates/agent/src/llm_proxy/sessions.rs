@@ -1,7 +1,11 @@
 //! Per-session pairing for the `/sandbox` route and the local API that manages
-//! sessions. Stubs only: the registry and the router are implemented after the
-//! baseline tests.
-#![allow(dead_code, unused_variables)]
+//! sessions.
+//!
+//! A session is minted over the local API by whoever starts a sandboxed
+//! program (the launcher, the CLI, a test). It binds a one-off pairing secret
+//! to a credential-policy client id; the proxy accepts that secret on the
+//! `/sandbox` route only and presents the session's client id to the gateway.
+//! Sessions live in memory: a daemon restart drops them all.
 
 use std::{
     net::SocketAddr,
@@ -9,8 +13,28 @@ use std::{
     time::Duration,
 };
 
-use agentdesktop_core::model::SessionInfo;
-use axum::{Router, http::StatusCode};
+use agentdesktop_core::model::{SessionCreated, SessionInfo, SessionRequest};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest, Sha256};
+
+use super::constant_time_eq;
+
+/// Idle timeout a session gets when the request names none.
+pub(crate) const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(28_800);
+/// Bounds for a requested idle timeout, in seconds.
+const MIN_TTL_SECONDS: u64 = 60;
+const MAX_TTL_SECONDS: u64 = 86_400;
+/// Unexpired sessions a daemon holds at most: a launcher that leaks sessions
+/// fails loudly instead of growing the registry.
+pub(crate) const MAX_SESSIONS: usize = 64;
+/// Longest a label may be, in Unicode scalar values.
+const MAX_LABEL_CHARS: usize = 128;
 
 /// Why a session could not be registered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +58,14 @@ pub(crate) struct Session {
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!("redacting Debug (PR 3)")
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("pairing", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .field("label", &self.label)
+            .field("created_at_unix_seconds", &self.created_at_unix_seconds)
+            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
+            .finish()
     }
 }
 
@@ -45,12 +76,59 @@ pub(crate) struct SessionRef {
     pub client_id: String,
 }
 
+/// One registered session. Only the SHA-256 digest of the pairing is kept, so
+/// a memory dump or a `Debug` print never yields a usable secret.
+struct Entry {
+    id: String,
+    pairing_hash: [u8; 32],
+    client_id: String,
+    label: String,
+    idle_ttl: Duration,
+    created_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+}
+
+impl Entry {
+    fn expired(&self, now: u64) -> bool {
+        self.expires_at_unix_seconds <= now
+    }
+
+    fn info(&self) -> SessionInfo {
+        SessionInfo {
+            id: self.id.clone(),
+            client_id: self.client_id.clone(),
+            label: self.label.clone(),
+            created_at_unix_seconds: self.created_at_unix_seconds,
+            expires_at_unix_seconds: self.expires_at_unix_seconds,
+        }
+    }
+}
+
+/// The sessions the proxy accepts on the `/sandbox` route. Clones share one
+/// registry. The lock is held for plain memory work only, never across an
+/// `.await`.
 #[derive(Clone, Default)]
 pub(crate) struct SessionRegistry {
-    entries: Arc<Mutex<Vec<()>>>,
+    entries: Arc<Mutex<Vec<Entry>>>,
+}
+
+fn pairing_hash(pairing: &str) -> [u8; 32] {
+    Sha256::digest(pairing.as_bytes()).into()
+}
+
+fn expiry(now: u64, idle_ttl: Duration) -> u64 {
+    now.saturating_add(idle_ttl.as_secs())
 }
 
 impl SessionRegistry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Entry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Registers a session that expires `idle_ttl` after its last request.
+    /// Expired entries are swept first; the bound counts unexpired ones.
     pub(crate) fn register(
         &self,
         client_id: &str,
@@ -58,50 +136,285 @@ impl SessionRegistry {
         idle_ttl: Duration,
         now: u64,
     ) -> Result<Session, SessionError> {
-        todo!("register (PR 3)")
+        if !agentdesktop_core::config::valid_client_id(client_id) {
+            return Err(SessionError::InvalidClientId);
+        }
+        if !valid_label(label) {
+            return Err(SessionError::InvalidLabel);
+        }
+        let id = format!("{:016x}", rand::random::<u64>());
+        let secret: [u8; 32] = rand::random();
+        let pairing: Arc<str> = URL_SAFE_NO_PAD.encode(secret).into();
+        let mut entries = self.lock();
+        entries.retain(|entry| !entry.expired(now));
+        if entries.len() >= MAX_SESSIONS {
+            return Err(SessionError::Full);
+        }
+        let expires_at_unix_seconds = expiry(now, idle_ttl);
+        entries.push(Entry {
+            id: id.clone(),
+            pairing_hash: pairing_hash(&pairing),
+            client_id: client_id.to_owned(),
+            label: label.to_owned(),
+            idle_ttl,
+            created_at_unix_seconds: now,
+            expires_at_unix_seconds,
+        });
+        Ok(Session {
+            id,
+            pairing,
+            client_id: client_id.to_owned(),
+            label: label.to_owned(),
+            created_at_unix_seconds: now,
+            expires_at_unix_seconds,
+        })
     }
 
+    /// The session a pairing belongs to, with its idle timeout restarted
+    /// (`expires_at = max(expires_at, now + idle_ttl)`). The digest is compared
+    /// against every unexpired entry without an early return, so the time a
+    /// lookup takes does not depend on which entry matches.
     pub(crate) fn authorize(&self, pairing: &str, now: u64) -> Option<SessionRef> {
-        todo!("authorize (PR 3)")
+        let offered = pairing_hash(pairing);
+        let mut entries = self.lock();
+        let mut found = None;
+        for (index, entry) in entries.iter().enumerate() {
+            let matches = constant_time_eq(&offered, &entry.pairing_hash) & !entry.expired(now);
+            if matches {
+                found = Some(index);
+            }
+        }
+        let entry = &mut entries[found?];
+        entry.expires_at_unix_seconds = entry
+            .expires_at_unix_seconds
+            .max(expiry(now, entry.idle_ttl));
+        Some(SessionRef {
+            id: entry.id.clone(),
+            client_id: entry.client_id.clone(),
+        })
     }
 
+    /// Removes the session; `false` when no session has that id.
     pub(crate) fn revoke(&self, id: &str) -> bool {
-        todo!("revoke (PR 3)")
+        let mut entries = self.lock();
+        let before = entries.len();
+        entries.retain(|entry| entry.id != id);
+        entries.len() != before
     }
 
+    /// Unexpired sessions, oldest first, without their pairings.
     pub(crate) fn list(&self, now: u64) -> Vec<SessionInfo> {
-        todo!("list (PR 3)")
+        let entries = self.lock();
+        let mut listed: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.expired(now))
+            .map(Entry::info)
+            .collect();
+        listed.sort_by_key(|info| info.created_at_unix_seconds);
+        listed
     }
 
+    /// Drops expired sessions.
     pub(crate) fn sweep(&self, now: u64) {
-        todo!("sweep (PR 3)")
+        self.lock().retain(|entry| !entry.expired(now));
     }
 
+    /// Number of unexpired sessions.
     pub(crate) fn len(&self, now: u64) -> usize {
-        todo!("len (PR 3)")
+        self.lock()
+            .iter()
+            .filter(|entry| !entry.expired(now))
+            .count()
     }
 }
 
 /// A label is 1-128 Unicode scalar values with no control characters.
 pub(crate) fn valid_label(label: &str) -> bool {
-    todo!("valid_label (PR 3)")
+    let count = label.chars().count();
+    (1..=MAX_LABEL_CHARS).contains(&count) && !label.chars().any(char::is_control)
 }
 
-/// Decides whether a client id may be registered as a session.
+/// Decides whether a client id may be registered as a session: the effective
+/// configuration's credential policy, read when the session is created so a
+/// refused id fails at `session create` and not at the first prompt.
 #[async_trait::async_trait]
 pub(crate) trait SessionPolicy: Send + Sync {
     async fn check(&self, client_id: &str) -> Result<(), (StatusCode, String)>;
 }
 
+/// The production policy: the effective configuration's gateway
+/// authentication and program settings, reloaded on every check.
+pub(crate) struct ConfigPolicy {
+    pub config: agentdesktop_core::config::DaemonConfig,
+    pub state_dir: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SessionPolicy for ConfigPolicy {
+    async fn check(&self, client_id: &str) -> Result<(), (StatusCode, String)> {
+        let effective =
+            crate::api::load_effective_config(&self.config, &self.state_dir).map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not read the applied configuration: {error:#}"),
+                )
+            })?;
+        // With controller-issued credentials the gateway policy names the
+        // client ids it serves; a session for another id would fail at its
+        // first prompt. OIDC tokens carry no client id.
+        if let Some(agentdesktop_core::config::LlmGatewayAuthentication::ControllerJwt {
+            allowed_client_ids,
+            ..
+        }) = effective
+            .llm_gateway
+            .as_ref()
+            .and_then(|gateway| gateway.authentication.as_ref())
+            && !allowed_client_ids.contains(client_id)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "client id {client_id} is not in llmGateway.authentication.allowedClientIds"
+                ),
+            ));
+        }
+        // The sandbox route presents the gateway identity only; a program in
+        // subscription mode would silently switch billing path inside the box.
+        if crate::api::program_uses_subscription(&effective, client_id) {
+            return Err((
+                StatusCode::CONFLICT,
+                "subscription mode is not supported on the sandbox route".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// How often expired sessions are dropped from the registry.
+pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Drops expired sessions every `SWEEP_INTERVAL`, for as long as the daemon runs.
+pub(crate) async fn sweep_forever(registry: SessionRegistry) {
+    let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        registry.sweep(super::now_unix());
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SessionApiState {
     pub registry: SessionRegistry,
+    /// The bound proxy listener; `None` when the proxy is off.
     pub proxy_address: Option<SocketAddr>,
     pub policy: Arc<dyn SessionPolicy>,
 }
 
+/// `POST`/`GET /v1/llm-proxy/sessions` and `DELETE /v1/llm-proxy/sessions/{id}`
+/// on the local API. Errors are plain text like the rest of the local API.
 pub(crate) fn session_router(state: SessionApiState) -> Router {
-    todo!("session_router (PR 3)")
+    Router::new()
+        .route(
+            "/v1/llm-proxy/sessions",
+            get(list_sessions).post(create_session),
+        )
+        .route("/v1/llm-proxy/sessions/{id}", delete(revoke_session))
+        .with_state(state)
+}
+
+type ApiError = (StatusCode, String);
+
+async fn create_session(
+    State(state): State<SessionApiState>,
+    Json(request): Json<SessionRequest>,
+) -> Result<(StatusCode, Json<SessionCreated>), ApiError> {
+    let Some(address) = state.proxy_address else {
+        return Err((
+            StatusCode::CONFLICT,
+            "the local LLM proxy is not running (daemon.llmProxy.listen)".to_owned(),
+        ));
+    };
+    if !agentdesktop_core::config::valid_client_id(&request.client_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "clientId {:?} is not a valid client id (1-64 characters from A-Z, a-z, 0-9, '.', '_' and '-')",
+                request.client_id
+            ),
+        ));
+    }
+    if !valid_label(&request.label) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("label must be 1-{MAX_LABEL_CHARS} characters without control characters"),
+        ));
+    }
+    let idle_ttl = match request.ttl_seconds {
+        None => DEFAULT_IDLE_TTL,
+        Some(seconds) if (MIN_TTL_SECONDS..=MAX_TTL_SECONDS).contains(&seconds) => {
+            Duration::from_secs(seconds)
+        }
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("ttlSeconds must be between {MIN_TTL_SECONDS} and {MAX_TTL_SECONDS}"),
+            ));
+        }
+    };
+    state.policy.check(&request.client_id).await?;
+    let session = state
+        .registry
+        .register(
+            &request.client_id,
+            &request.label,
+            idle_ttl,
+            super::now_unix(),
+        )
+        .map_err(|error| match error {
+            SessionError::Full => (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("too many sessions ({MAX_SESSIONS}); revoke unused ones"),
+            ),
+            // Both were checked above; a race with the registry's own
+            // validation would be a bug, reported as such.
+            SessionError::InvalidClientId | SessionError::InvalidLabel => (
+                StatusCode::BAD_REQUEST,
+                "invalid session request".to_owned(),
+            ),
+        })?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SessionCreated {
+            id: session.id,
+            pairing: session.pairing.to_string(),
+            client_id: session.client_id,
+            label: session.label,
+            created_at_unix_seconds: session.created_at_unix_seconds,
+            expires_at_unix_seconds: session.expires_at_unix_seconds,
+            base_url: sandbox_base_url(address),
+        }),
+    ))
+}
+
+/// What a client sets as its API base URL to reach the sandbox route.
+pub(crate) fn sandbox_base_url(address: SocketAddr) -> String {
+    format!("http://{address}{}", super::SANDBOX_ROUTE)
+}
+
+async fn list_sessions(State(state): State<SessionApiState>) -> Json<Vec<SessionInfo>> {
+    Json(state.registry.list(super::now_unix()))
+}
+
+async fn revoke_session(
+    State(state): State<SessionApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if state.registry.revoke(&id) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("no session {id}")))
+    }
 }
 
 #[cfg(test)]

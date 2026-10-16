@@ -1,11 +1,14 @@
-use std::{io::Read, path::PathBuf};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use agentdesktop_client as client;
 use agentdesktop_core::{
     config::DaemonConfig,
     model::{
         Discovery, EnrollmentStatus, Health, LlmGatewayCredential, LlmGatewayLoginStatus,
-        TelemetryEventKind,
+        SessionCreated, SessionInfo, SessionRequest, TelemetryEventKind,
     },
 };
 use clap::Subcommand;
@@ -76,10 +79,57 @@ pub enum SessionCommand {
     },
 }
 
-/// The message printed for a failed `llm-proxy session` command.
-#[allow(dead_code)]
-fn session_error_message(_error: &anyhow::Error) -> String {
-    todo!("session_error_message (PR 3)")
+/// The message printed for a failed `llm-proxy session` command: the daemon's
+/// own text for a missing session, a hint at the bound, else the status and
+/// body as the client reports them.
+fn session_error_message(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<agentdesktop_client::StatusError>() {
+        Some(status) if status.status == 404 && !status.body.is_empty() => status.body.clone(),
+        Some(status) if status.status == 429 => {
+            "too many sessions (64); revoke unused ones".to_owned()
+        }
+        Some(status) => status.to_string(),
+        None => format!("{error:#}"),
+    }
+}
+
+const SESSIONS_PATH: &str = "/v1/llm-proxy/sessions";
+
+async fn run_session_command(command: SessionCommand, socket: &Path) -> anyhow::Result<()> {
+    match command {
+        SessionCommand::Create {
+            client_id,
+            label,
+            ttl_seconds,
+        } => {
+            // The only place the pairing is shown: the caller passes it into
+            // the sandboxed program's environment.
+            let created: SessionCreated = client::post_json_response(
+                socket,
+                SESSIONS_PATH,
+                &SessionRequest {
+                    client_id,
+                    label,
+                    ttl_seconds,
+                },
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&created)?);
+        }
+        SessionCommand::List => {
+            let sessions: Vec<SessionInfo> = client::get(socket, SESSIONS_PATH).await?;
+            for session in sessions {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    session.id, session.client_id, session.label, session.expires_at_unix_seconds
+                );
+            }
+        }
+        SessionCommand::Revoke { id } => {
+            client::delete(socket, &format!("{SESSIONS_PATH}/{id}")).await?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -172,7 +222,11 @@ pub async fn run(command: ClientCommand, socket: PathBuf) -> anyhow::Result<()> 
             .await?;
             println!("{}", response.credential);
         }
-        ClientCommand::LlmProxy { .. } => todo!("llm-proxy session commands (PR 3)"),
+        ClientCommand::LlmProxy {
+            command: LlmProxyCommand::Session { command },
+        } => run_session_command(command, &socket)
+            .await
+            .map_err(|error| anyhow::anyhow!(session_error_message(&error)))?,
         ClientCommand::Hook {
             hook: HookCommand::ClaudePreToolUse { include_input },
         } => {

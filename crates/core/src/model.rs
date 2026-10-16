@@ -345,8 +345,16 @@ pub struct SessionCreated {
 }
 
 impl std::fmt::Debug for SessionCreated {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!("redacting Debug (PR 3)")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionCreated")
+            .field("id", &self.id)
+            .field("pairing", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .field("label", &self.label)
+            .field("created_at_unix_seconds", &self.created_at_unix_seconds)
+            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
+            .field("base_url", &self.base_url)
+            .finish()
     }
 }
 

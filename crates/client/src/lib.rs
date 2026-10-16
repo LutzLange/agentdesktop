@@ -151,27 +151,92 @@ pub struct StatusError {
 }
 
 impl std::fmt::Display for StatusError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!("StatusError display (PR 3)")
+    /// `daemon returned <status> <reason>: <body>`, the shape of the other
+    /// helpers' errors, so a caller can show it as is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "daemon returned {}", self.status)?;
+        if let Some(reason) = hyper::StatusCode::from_u16(self.status)
+            .ok()
+            .and_then(|status| status.canonical_reason())
+        {
+            write!(f, " {reason}")?;
+        }
+        write!(f, ": {}", self.body)
     }
 }
 
 impl std::error::Error for StatusError {}
 
+/// Sends a request with an optional JSON body and returns the status and the
+/// raw response body.
+async fn exchange(
+    endpoint: &Path,
+    method: &str,
+    path: &str,
+    json: Option<Vec<u8>>,
+) -> anyhow::Result<(hyper::StatusCode, Bytes)> {
+    let stream = connect(endpoint).await?;
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+        .await
+        .context("start HTTP connection")?;
+
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::debug!(%error, "local HTTP connection failed");
+        }
+    });
+
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost");
+    if json.is_some() {
+        request = request.header("content-type", "application/json");
+    }
+    let request = request.body(Full::new(Bytes::from(json.unwrap_or_default())))?;
+    let response = sender.send_request(request).await.context("send request")?;
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .context("read response")?
+        .to_bytes();
+    Ok((status, body))
+}
+
+fn status_error(status: hyper::StatusCode, body: &Bytes) -> anyhow::Error {
+    StatusError {
+        status: status.as_u16(),
+        body: String::from_utf8_lossy(body).into_owned(),
+    }
+    .into()
+}
+
 /// Sends a POST with a JSON body and decodes the JSON response. A non-2xx
-/// response is an error carrying a [`StatusError`].
-pub async fn post_json_response<B, T>(_endpoint: &Path, _path: &str, _body: &B) -> anyhow::Result<T>
+/// response is an error carrying a [`StatusError`], so the caller can map
+/// statuses to messages.
+pub async fn post_json_response<B, T>(endpoint: &Path, path: &str, body: &B) -> anyhow::Result<T>
 where
     B: Serialize,
     T: DeserializeOwned,
 {
-    todo!("post_json_response (PR 3)")
+    let json = serde_json::to_vec(body).context("encode request body")?;
+    let (status, body) = exchange(endpoint, "POST", path, Some(json)).await?;
+    if !status.is_success() {
+        return Err(status_error(status, &body));
+    }
+    serde_json::from_slice(&body).context("decode daemon response")
 }
 
-/// Sends a DELETE; any 2xx is success. A non-2xx response is an error carrying
-/// a [`StatusError`].
-pub async fn delete(_endpoint: &Path, _path: &str) -> anyhow::Result<()> {
-    todo!("delete (PR 3)")
+/// Sends a DELETE; any 2xx is success and the body is not decoded. A non-2xx
+/// response is an error carrying a [`StatusError`].
+pub async fn delete(endpoint: &Path, path: &str) -> anyhow::Result<()> {
+    let (status, body) = exchange(endpoint, "DELETE", path, None).await?;
+    if !status.is_success() {
+        return Err(status_error(status, &body));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,8 +397,7 @@ mod tests {
                     &Payload { value: "x".into() },
                 )
                 .await
-                .err()
-                .expect("a non-2xx response is an error");
+                .expect_err("a non-2xx response is an error");
                 let status_error = error
                     .downcast_ref::<StatusError>()
                     .unwrap_or_else(|| panic!("no StatusError in {error:#}"));
@@ -359,8 +423,7 @@ mod tests {
             let daemon = fake_daemon("delete-404", 404, "no session abc");
             let error = delete(&daemon.socket, "/v1/things/abc")
                 .await
-                .err()
-                .expect("a 404 is an error");
+                .expect_err("a 404 is an error");
             let status_error = error
                 .downcast_ref::<StatusError>()
                 .unwrap_or_else(|| panic!("no StatusError in {error:#}"));
