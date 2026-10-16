@@ -143,6 +143,37 @@ where
     Ok(())
 }
 
+/// A non-2xx response from the daemon's local API.
+#[derive(Debug)]
+pub struct StatusError {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        todo!("StatusError display (PR 3)")
+    }
+}
+
+impl std::error::Error for StatusError {}
+
+/// Sends a POST with a JSON body and decodes the JSON response. A non-2xx
+/// response is an error carrying a [`StatusError`].
+pub async fn post_json_response<B, T>(_endpoint: &Path, _path: &str, _body: &B) -> anyhow::Result<T>
+where
+    B: Serialize,
+    T: DeserializeOwned,
+{
+    todo!("post_json_response (PR 3)")
+}
+
+/// Sends a DELETE; any 2xx is success. A non-2xx response is an error carrying
+/// a [`StatusError`].
+pub async fn delete(_endpoint: &Path, _path: &str) -> anyhow::Result<()> {
+    todo!("delete (PR 3)")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -157,5 +188,184 @@ mod tests {
             connect_error(endpoint),
             "connect to /tmp/agentdesktop.sock\nCheck that the Agentdesktop daemon is running."
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_error_display_names_the_status_and_the_body() {
+        let error = super::StatusError {
+            status: 404,
+            body: "no session abc".to_owned(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("404"), "{text}");
+        assert!(text.contains("no session abc"), "{text}");
+    }
+
+    #[cfg(target_os = "linux")]
+    mod socket {
+        use std::{
+            convert::Infallible,
+            path::PathBuf,
+            sync::{Arc, Mutex},
+        };
+
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use hyper::{Request, Response, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        use serde::{Deserialize, Serialize};
+        use tokio::net::UnixListener;
+
+        use crate::{StatusError, delete, post_json_response};
+
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Payload {
+            value: String,
+        }
+
+        /// (method, path, content-type, body)
+        type Seen = Arc<Mutex<Vec<(String, String, String, String)>>>;
+
+        /// A daemon stand-in on a Unix socket that answers every request with
+        /// `status` and `body`.
+        struct FakeDaemon {
+            socket: PathBuf,
+            seen: Seen,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        impl Drop for FakeDaemon {
+            fn drop(&mut self) {
+                self.task.abort();
+                let _ = std::fs::remove_file(&self.socket);
+            }
+        }
+
+        fn fake_daemon(name: &str, status: u16, canned: &'static str) -> FakeDaemon {
+            let socket = std::env::temp_dir().join(format!(
+                "agentdesktop-client-test-{}-{name}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket).unwrap();
+            let seen: Seen = Arc::default();
+            let record = seen.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let record = record.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(stream),
+                                service_fn(move |request: Request<hyper::body::Incoming>| {
+                                    let record = record.clone();
+                                    async move {
+                                        let method = request.method().to_string();
+                                        let path = request.uri().path().to_owned();
+                                        let content_type = request
+                                            .headers()
+                                            .get("content-type")
+                                            .and_then(|value| value.to_str().ok())
+                                            .unwrap_or("")
+                                            .to_owned();
+                                        let body =
+                                            request.into_body().collect().await.unwrap().to_bytes();
+                                        record.lock().unwrap().push((
+                                            method,
+                                            path,
+                                            content_type,
+                                            String::from_utf8_lossy(&body).into_owned(),
+                                        ));
+                                        Ok::<_, Infallible>(
+                                            Response::builder()
+                                                .status(status)
+                                                .body(Full::new(Bytes::from_static(
+                                                    canned.as_bytes(),
+                                                )))
+                                                .unwrap(),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+            FakeDaemon { socket, seen, task }
+        }
+
+        #[tokio::test]
+        async fn post_json_response_sends_json_and_decodes_the_reply() {
+            let daemon = fake_daemon("post-ok", 201, r#"{"value":"created"}"#);
+            let reply: Payload = post_json_response(
+                &daemon.socket,
+                "/v1/things",
+                &Payload {
+                    value: "asked".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                reply,
+                Payload {
+                    value: "created".into()
+                }
+            );
+            let seen = daemon.seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "POST");
+            assert_eq!(seen[0].1, "/v1/things");
+            assert!(seen[0].2.starts_with("application/json"), "{}", seen[0].2);
+            assert_eq!(seen[0].3, r#"{"value":"asked"}"#);
+        }
+
+        #[tokio::test]
+        async fn post_json_response_carries_a_status_error_for_non_2xx() {
+            for (status, body) in [(409u16, "the proxy is not running"), (429, "too many")] {
+                let daemon = fake_daemon(&format!("post-{status}"), status, body);
+                let error = post_json_response::<_, Payload>(
+                    &daemon.socket,
+                    "/v1/things",
+                    &Payload { value: "x".into() },
+                )
+                .await
+                .err()
+                .expect("a non-2xx response is an error");
+                let status_error = error
+                    .downcast_ref::<StatusError>()
+                    .unwrap_or_else(|| panic!("no StatusError in {error:#}"));
+                assert_eq!(status_error.status, status);
+                assert_eq!(status_error.body, body);
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_succeeds_on_any_2xx_without_decoding_the_body() {
+            for (status, body) in [(204u16, ""), (200, "not json at all")] {
+                let daemon = fake_daemon(&format!("delete-{status}"), status, body);
+                delete(&daemon.socket, "/v1/things/abc").await.unwrap();
+                let seen = daemon.seen.lock().unwrap().clone();
+                assert_eq!(seen.len(), 1);
+                assert_eq!(seen[0].0, "DELETE");
+                assert_eq!(seen[0].1, "/v1/things/abc");
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_carries_a_status_error_for_non_2xx() {
+            let daemon = fake_daemon("delete-404", 404, "no session abc");
+            let error = delete(&daemon.socket, "/v1/things/abc")
+                .await
+                .err()
+                .expect("a 404 is an error");
+            let status_error = error
+                .downcast_ref::<StatusError>()
+                .unwrap_or_else(|| panic!("no StatusError in {error:#}"));
+            assert_eq!(status_error.status, 404);
+            assert_eq!(status_error.body, "no session abc");
+        }
     }
 }

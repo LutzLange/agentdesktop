@@ -21,6 +21,9 @@ use agentdesktop_core::config::{GitHubTokenSource, LlmGatewayConfig};
 
 use crate::api::{self, AppState};
 
+pub(crate) mod sessions;
+use sessions::SessionRegistry;
+
 type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
@@ -255,6 +258,15 @@ pub(crate) enum Upstream {
     ProxyUrl,
 }
 
+/// Where a route takes the client id it presents to the gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteIdentity {
+    /// The id is fixed by the route (the file the daemon owns decides it).
+    Fixed(&'static str),
+    /// The id comes from the registered session whose pairing the request carries.
+    Session,
+}
+
 /// A fixed path prefix the proxy serves for one managed program.
 ///
 /// The prefix is what a reconciler writes into that program's client file, so
@@ -263,7 +275,7 @@ pub(crate) enum Upstream {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProxyRoute {
     pub prefix: &'static str,
-    pub client_id: &'static str,
+    pub identity: RouteIdentity,
     pub credential: RouteCredential,
     pub upstream: Upstream,
     /// The pairing is the first path segment after the prefix (the header is
@@ -288,7 +300,7 @@ pub(crate) const CAPI_ROUTE: &str = "/vscode-copilot-capi";
 pub(crate) const ROUTES: &[ProxyRoute] = &[
     ProxyRoute {
         prefix: "/vscode-copilot-passthrough",
-        client_id: "vscode-copilot",
+        identity: RouteIdentity::Fixed("vscode-copilot"),
         credential: RouteCredential::Passthrough,
         upstream: Upstream::ProxyUrl,
         pairing_in_path: false,
@@ -297,7 +309,7 @@ pub(crate) const ROUTES: &[ProxyRoute] = &[
     },
     ProxyRoute {
         prefix: CAPI_ROUTE,
-        client_id: "vscode-copilot",
+        identity: RouteIdentity::Fixed("vscode-copilot"),
         credential: RouteCredential::Passthrough,
         upstream: Upstream::ProxyUrl,
         pairing_in_path: true,
@@ -306,7 +318,7 @@ pub(crate) const ROUTES: &[ProxyRoute] = &[
     },
     ProxyRoute {
         prefix: "/vscode-copilot",
-        client_id: "vscode-copilot",
+        identity: RouteIdentity::Fixed("vscode-copilot"),
         credential: RouteCredential::Gateway,
         upstream: Upstream::Url,
         pairing_in_path: false,
@@ -315,7 +327,16 @@ pub(crate) const ROUTES: &[ProxyRoute] = &[
     },
     ProxyRoute {
         prefix: "/copilot-cli",
-        client_id: "copilot-cli",
+        identity: RouteIdentity::Fixed("copilot-cli"),
+        credential: RouteCredential::Gateway,
+        upstream: Upstream::Url,
+        pairing_in_path: false,
+        tunnels_upgrades: false,
+        credential_less_ping: false,
+    },
+    ProxyRoute {
+        prefix: "/sandbox",
+        identity: RouteIdentity::Session,
         credential: RouteCredential::Gateway,
         upstream: Upstream::Url,
         pairing_in_path: false,
@@ -416,6 +437,8 @@ pub(crate) struct ProxyConfig {
     pub default_client_id: String,
     /// Pairing value required on every route.
     pub pairing: Arc<str>,
+    /// Per-session pairings accepted on the `/sandbox` route.
+    pub sessions: SessionRegistry,
 }
 
 impl std::fmt::Debug for ProxyConfig {
@@ -423,6 +446,7 @@ impl std::fmt::Debug for ProxyConfig {
         f.debug_struct("ProxyConfig")
             .field("default_client_id", &self.default_client_id)
             .field("pairing", &"<redacted>")
+            .field("sessions", &self.sessions.len(now_unix()))
             .finish()
     }
 }
@@ -587,6 +611,28 @@ pub(crate) async fn serve_with_cache(
             }
         }
     }
+}
+
+/// What the request log (AC 3) records about one sandbox request. Stub: `forward`
+/// does not fill it yet.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub(crate) struct RequestLog {
+    pub session: Option<String>,
+    pub client_id: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub code: Option<&'static str>,
+    pub bytes_in: usize,
+}
+
+/// Response body wrapper that emits the request log when the body ends, errors
+/// or is dropped. Stub.
+#[allow(dead_code)]
+pub(crate) struct LoggedBody {
+    inner: ProxyBody,
+    log: RequestLog,
 }
 
 /// A refused or failed request, rendered as an OpenAI-style JSON error so the
@@ -838,6 +884,9 @@ async fn forward(
             }
             Some(remainder.to_owned())
         }
+        Some((route, _)) if route.identity == RouteIdentity::Session => {
+            todo!("session pairing check (PR 3)")
+        }
         _ => {
             let offered = request
                 .headers()
@@ -908,7 +957,10 @@ async fn forward(
                 ));
             }
             (
-                route.client_id.to_owned(),
+                match route.identity {
+                    RouteIdentity::Fixed(client_id) => client_id.to_owned(),
+                    RouteIdentity::Session => todo!("session client id (PR 3)"),
+                },
                 Some(route.credential),
                 upstream_base(gateway, route.upstream),
                 capi_rest.as_deref().unwrap_or(rest),
@@ -1548,6 +1600,7 @@ mod tests {
         ProxyConfig {
             default_client_id: "vscode".into(),
             pairing: Arc::from(PAIRING),
+            sessions: SessionRegistry::default(),
         }
     }
 
@@ -1821,7 +1874,7 @@ mod tests {
     #[test]
     fn route_matching_prefers_the_longer_prefix_and_strips_it() {
         let (route, rest) = match_route("/vscode-copilot-passthrough/chat/completions").unwrap();
-        assert_eq!(route.client_id, "vscode-copilot");
+        assert_eq!(route.identity, RouteIdentity::Fixed("vscode-copilot"));
         assert_eq!(route.credential, RouteCredential::Passthrough);
         assert_eq!(rest, "/chat/completions");
         let (route, rest) = match_route("/vscode-copilot/v1/chat/completions").unwrap();
@@ -1830,6 +1883,12 @@ mod tests {
         assert_eq!(match_route("/copilot-cli").unwrap().1, "/");
         assert!(match_route("/copilot-client/v1").is_none());
         assert!(match_route("/v1/chat/completions").is_none());
+        let (route, rest) = match_route("/sandbox/v1/messages").unwrap();
+        assert_eq!(route.identity, RouteIdentity::Session);
+        assert_eq!(rest, "/v1/messages");
+        assert_eq!(match_route("/sandbox").unwrap().1, "/");
+        assert!(match_route("/sandboxx/v1/messages").is_none());
+        assert!(match_route("/sandbox-x/v1/messages").is_none());
     }
 
     #[test]
@@ -1938,36 +1997,46 @@ mod tests {
         let expected = [
             (
                 "/copilot-cli/v1/x",
-                "copilot-cli",
+                RouteIdentity::Fixed("copilot-cli"),
                 RouteCredential::Gateway,
                 Upstream::Url,
             ),
             (
                 "/vscode-copilot/v1/x",
-                "vscode-copilot",
+                RouteIdentity::Fixed("vscode-copilot"),
                 RouteCredential::Gateway,
                 Upstream::Url,
             ),
             (
                 "/vscode-copilot-passthrough/chat/completions",
-                "vscode-copilot",
+                RouteIdentity::Fixed("vscode-copilot"),
                 RouteCredential::Passthrough,
                 Upstream::ProxyUrl,
             ),
             (
                 "/vscode-copilot-capi/PAIRING/responses",
-                "vscode-copilot",
+                RouteIdentity::Fixed("vscode-copilot"),
                 RouteCredential::Passthrough,
                 Upstream::ProxyUrl,
             ),
+            (
+                "/sandbox/v1/messages",
+                RouteIdentity::Session,
+                RouteCredential::Gateway,
+                Upstream::Url,
+            ),
         ];
-        for (path, client_id, credential, upstream) in expected {
+        for (path, identity, credential, upstream) in expected {
             let (route, _) = match_route(path).unwrap_or_else(|| panic!("{path}"));
-            assert_eq!(route.client_id, client_id, "{path}");
+            assert_eq!(route.identity, identity, "{path}");
             assert_eq!(route.credential, credential, "{path}");
             assert_eq!(route.upstream, upstream, "{path}");
         }
-        assert_eq!(ROUTES.len(), 4);
+        let (sandbox, _) = match_route("/sandbox/v1/messages").unwrap();
+        assert!(!sandbox.pairing_in_path);
+        assert!(!sandbox.tunnels_upgrades);
+        assert!(!sandbox.credential_less_ping);
+        assert_eq!(ROUTES.len(), 5);
         assert_eq!(CAPI_ROUTE, "/vscode-copilot-capi");
     }
 
@@ -3467,6 +3536,1034 @@ mod tests {
             let _ = proxy.await;
             upstream_task.abort();
             drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // --- /sandbox route and per-session pairing (PR 3, AC 2 and AC 3).
+
+    const SESSION_TTL: Duration = Duration::from_secs(3600);
+
+    fn new_session(sessions: &SessionRegistry, client_id: &str) -> sessions::Session {
+        sessions
+            .register(client_id, "test session", SESSION_TTL, now_unix())
+            .ok()
+            .expect("register a session")
+    }
+
+    fn http_client() -> Client<HttpConnector, Full<Bytes>> {
+        Client::builder(TokioExecutor::new()).build_http()
+    }
+
+    /// A POST to `path_and_query` on the proxy, carrying `pairing` in the pairing header.
+    fn post_with(
+        proxy: std::net::SocketAddr,
+        path_and_query: &str,
+        pairing: Option<&str>,
+        body: &'static [u8],
+    ) -> Request<Full<Bytes>> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{proxy}{path_and_query}"));
+        if let Some(pairing) = pairing {
+            builder = builder.header(PAIRING_HEADER, pairing);
+        }
+        builder.body(Full::new(Bytes::from_static(body))).unwrap()
+    }
+
+    /// Status, code and message of a refusal.
+    async fn refusal(response: Response<Incoming>) -> (StatusCode, String, String) {
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (
+            status,
+            json["error"]["code"].as_str().unwrap().to_owned(),
+            json["error"]["message"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    struct Upstreamed {
+        uri: String,
+        headers: HeaderMap,
+        body: Bytes,
+    }
+
+    type SeenRequests = Arc<std::sync::Mutex<Vec<Upstreamed>>>;
+
+    /// An upstream that answers every request with 200 "ok" and records it.
+    async fn recording_upstream() -> (
+        std::net::SocketAddr,
+        SeenRequests,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let seen: SeenRequests = Arc::default();
+        let record = seen.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = upstream.accept().await.unwrap();
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(socket),
+                            service_fn(move |request: Request<Incoming>| {
+                                let record = record.clone();
+                                async move {
+                                    let (parts, body) = request.into_parts();
+                                    let body = body.collect().await.unwrap().to_bytes();
+                                    record.lock().unwrap().push(Upstreamed {
+                                        uri: parts.uri.to_string(),
+                                        headers: parts.headers,
+                                        body,
+                                    });
+                                    Ok::<_, Infallible>(Response::new(Full::new(
+                                        Bytes::from_static(b"ok"),
+                                    )))
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (address, seen, task)
+    }
+
+    // The sandbox route is the copilot-cli shape with a session pairing: prefix
+    // stripped, every client credential and the pairing removed, the gateway
+    // identity added, other headers kept, and nothing forwarded when refused.
+    #[tokio::test]
+    async fn sandbox_route_accepts_a_session_pairing_and_forwards_with_the_gateway_identity() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (address, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            // Refusals first: nothing may reach the gateway.
+            let unpaired = post_with(proxy_address, "/sandbox/v1/messages", None, b"{}");
+            let (status, code, message) = refusal(client.request(unpaired).await.unwrap()).await;
+            assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "pairing_invalid"));
+            assert_eq!(
+                message,
+                "agentdesktop proxy: session pairing missing, expired or revoked; start a new session"
+            );
+            let wrong = format!("{}X", &session.pairing[..session.pairing.len() - 1]);
+            let wrong = post_with(proxy_address, "/sandbox/v1/messages", Some(&wrong), b"{}");
+            assert_eq!(
+                refusal(client.request(wrong).await.unwrap()).await.1,
+                "pairing_invalid"
+            );
+            // The pairing is only accepted in its own header, never as the bearer.
+            let as_bearer = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/sandbox/v1/messages"))
+                .header(AUTHORIZATION, format!("Bearer {}", session.pairing))
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            assert_eq!(
+                refusal(client.request(as_bearer).await.unwrap()).await.1,
+                "pairing_invalid"
+            );
+            let escape = post_with(
+                proxy_address,
+                "/sandbox/../admin",
+                Some(&session.pairing),
+                b"{}",
+            );
+            assert_eq!(
+                refusal(client.request(escape).await.unwrap()).await.1,
+                "path_invalid"
+            );
+            let browser = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/sandbox/v1/messages"))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .header(ORIGIN, "https://evil.example")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            assert_eq!(
+                refusal(client.request(browser).await.unwrap()).await.1,
+                "browser_not_allowed"
+            );
+            let options = Request::builder()
+                .method(Method::OPTIONS)
+                .uri(format!("http://{proxy_address}/sandbox/v1/messages"))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            assert_eq!(
+                refusal(client.request(options).await.unwrap()).await.1,
+                "method_not_allowed"
+            );
+            assert!(seen.lock().unwrap().is_empty(), "a refused request was forwarded");
+
+            // The device routes keep their message.
+            let device_unpaired = post_with(proxy_address, "/copilot-cli/v1/x", None, b"{}");
+            let (_, _, message) = refusal(client.request(device_unpaired).await.unwrap()).await;
+            assert!(message.contains("pairing value missing or wrong"), "{message}");
+
+            // The accepted request.
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/sandbox/v1/messages?beta=true"))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .header(AUTHORIZATION, "Bearer a-real-key-by-mistake")
+                .header("x-api-key", "placeholder")
+                .header("api-key", "placeholder")
+                .header("x-llm-token", "must-not-forward")
+                .header("anthropic-version", "2023-06-01")
+                .body(Full::new(Bytes::from_static(b"{\"n\":1}")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "ok"
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let forwarded = &seen[0];
+            assert_eq!(forwarded.uri, "/v1/messages?beta=true");
+            assert_eq!(forwarded.body, Bytes::from_static(b"{\"n\":1}"));
+            assert_eq!(forwarded.headers[AUTHORIZATION], "Bearer identity");
+            assert_eq!(forwarded.headers["anthropic-version"], "2023-06-01");
+            assert_eq!(forwarded.headers[HOST], address.to_string());
+            for removed in ["x-api-key", "api-key", "x-llm-token", PAIRING_HEADER] {
+                assert!(!forwarded.headers.contains_key(removed), "{removed}");
+            }
+            drop(seen);
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // The device pairing never opens the sandbox route (the box must not be able
+    // to turn a device-pairing file into a session).
+    #[tokio::test]
+    async fn sandbox_route_refuses_the_device_pairing() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (address, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let request = post_with(proxy_address, "/sandbox/v1/messages", Some(PAIRING), b"{}");
+            assert_eq!(
+                refusal(client.request(request).await.unwrap()).await.1,
+                "pairing_invalid"
+            );
+            assert!(seen.lock().unwrap().is_empty());
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // A session pairing is a bearer for /sandbox only: it never equals the
+    // device pairing, so every other route (and the prefix-less one) refuses it.
+    #[tokio::test]
+    async fn session_pairing_is_refused_on_every_other_route() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (address, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = capi_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let capi = format!("/vscode-copilot-capi/{}/responses", session.pairing);
+            for path in [
+                "/copilot-cli/v1/messages",
+                "/vscode-copilot/v1/messages",
+                "/vscode-copilot-passthrough/chat/completions",
+                "/v1/messages",
+                capi.as_str(),
+            ] {
+                let request = post_with(proxy_address, path, Some(&session.pairing), b"{}");
+                let (status, code, _) = refusal(client.request(request).await.unwrap()).await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (StatusCode::FORBIDDEN, "pairing_invalid"),
+                    "{path}"
+                );
+            }
+            assert!(seen.lock().unwrap().is_empty());
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_and_revoked_sessions_are_refused() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (address, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            // Registered an hour ago with a one-minute idle timeout.
+            let expired = sessions
+                .register(
+                    "claude-code",
+                    "old",
+                    Duration::from_secs(60),
+                    now_unix() - 3600,
+                )
+                .ok()
+                .unwrap();
+            let revoked = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let request = post_with(
+                proxy_address,
+                "/sandbox/v1/messages",
+                Some(&expired.pairing),
+                b"{}",
+            );
+            let (status, code, _) = refusal(client.request(request).await.unwrap()).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::FORBIDDEN, "pairing_invalid")
+            );
+
+            let request = post_with(
+                proxy_address,
+                "/sandbox/v1/messages",
+                Some(&revoked.pairing),
+                b"{}",
+            );
+            assert_eq!(
+                client.request(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+            assert!(sessions.revoke(&revoked.id));
+            let request = post_with(
+                proxy_address,
+                "/sandbox/v1/messages",
+                Some(&revoked.pairing),
+                b"{}",
+            );
+            let (status, code, _) = refusal(client.request(request).await.unwrap()).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::FORBIDDEN, "pairing_invalid")
+            );
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "only the live request is forwarded"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // A first segment that merely starts like the sandbox prefix is a mistyped
+    // client file, not the prefix-less route. The device pairing gets the route
+    // error; a session pairing is not the device pairing and gets the pairing error.
+    #[tokio::test]
+    async fn sandbox_lookalike_prefixes_are_unknown_routes_or_refused() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (address, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            for path in [
+                "/sandboxx/v1/messages",
+                "/sandbox2/v1/messages",
+                "/Sandbox/v1/messages",
+            ] {
+                let request = post_with(proxy_address, path, Some(PAIRING), b"{}");
+                let (status, code, message) = refusal(client.request(request).await.unwrap()).await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (StatusCode::NOT_FOUND, "route_unknown"),
+                    "{path}"
+                );
+                assert!(message.contains("/sandbox"), "{message}");
+                let request = post_with(proxy_address, path, Some(&session.pairing), b"{}");
+                let (status, code, _) = refusal(client.request(request).await.unwrap()).await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (StatusCode::FORBIDDEN, "pairing_invalid"),
+                    "{path}"
+                );
+            }
+            assert!(seen.lock().unwrap().is_empty());
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn sandbox_lookalikes_resemble_a_route() {
+        for path in ["/sandboxx/v1", "/sandbox2/v1", "/Sandbox/v1", "/sandbox-x"] {
+            assert!(resembles_route(path), "{path}");
+        }
+        assert!(match_route("/sandbox/v1/messages").is_some());
+    }
+
+    // The identity is the session's client id, so credentials are cached per
+    // client id and shared by every session of that id.
+    #[tokio::test]
+    async fn sandbox_sessions_use_their_client_id_and_share_the_cached_credential() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (address, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = controller_jwt_state(address, false).await;
+            let cache = Arc::new(CredentialCache::default());
+            let issued = |value: &str| agentdesktop_core::model::LlmGatewayCredential {
+                credential: value.to_owned(),
+                expires_at_unix_seconds: now_unix() + 600,
+            };
+            for (client_id, jwt) in [("claude-code", "jwt-claude"), ("my_tool", "jwt-tool")] {
+                cache.insert(
+                    &format!("{client_id}\u{0}http://{address}/\u{0}agentgateway"),
+                    "device-test",
+                    &issued(jwt),
+                );
+            }
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let first = new_session(&sessions, "claude-code");
+            let second = new_session(&sessions, "claude-code");
+            let other = new_session(&sessions, "my_tool");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve_with_cache(listener, state, config, cache));
+            let client = http_client();
+            for session in [&first, &second, &other] {
+                let request = post_with(
+                    proxy_address,
+                    "/sandbox/v1/messages",
+                    Some(&session.pairing),
+                    b"{}",
+                );
+                assert_eq!(
+                    client.request(request).await.unwrap().status(),
+                    StatusCode::OK
+                );
+            }
+            let authorizations: Vec<String> = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.headers[AUTHORIZATION].to_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                authorizations,
+                ["Bearer jwt-claude", "Bearer jwt-claude", "Bearer jwt-tool"]
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // Like `cached_credential_is_used_and_dropped_on_401`, on the sandbox route.
+    #[tokio::test]
+    async fn sandbox_route_retries_once_on_401_and_drops_the_rejected_cached_credential() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            type Seen = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+            let seen: Seen = Arc::default();
+            let record = seen.clone();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = upstream.accept().await.unwrap();
+                    let record = record.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(socket),
+                                service_fn(move |request: Request<Incoming>| {
+                                    let record = record.clone();
+                                    async move {
+                                        let authorization = request
+                                            .headers()
+                                            .get(AUTHORIZATION)
+                                            .and_then(|v| v.to_str().ok())
+                                            .unwrap_or("")
+                                            .to_owned();
+                                        let body = request
+                                            .into_body()
+                                            .collect()
+                                            .await
+                                            .unwrap()
+                                            .to_bytes()
+                                            .to_vec();
+                                        let status = if authorization == "Bearer good" {
+                                            StatusCode::OK
+                                        } else {
+                                            StatusCode::UNAUTHORIZED
+                                        };
+                                        record.lock().unwrap().push((authorization, body));
+                                        Ok::<_, Infallible>(
+                                            Response::builder()
+                                                .status(status)
+                                                .body(Full::new(Bytes::from_static(b"{}")))
+                                                .unwrap(),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+            let (dir, state) = controller_jwt_state(address, false).await;
+            let cache = Arc::new(CredentialCache::default());
+            let key = format!("claude-code\u{0}http://{address}/\u{0}agentgateway");
+            let issued = |value: &str| agentdesktop_core::model::LlmGatewayCredential {
+                credential: value.to_owned(),
+                expires_at_unix_seconds: now_unix() + 600,
+            };
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve_with_cache(listener, state, config, cache.clone()));
+            let client = http_client();
+            let request = |body: &'static [u8]| {
+                post_with(
+                    proxy_address,
+                    "/sandbox/v1/messages",
+                    Some(&session.pairing),
+                    body,
+                )
+            };
+            cache.insert(&key, "device-test", &issued("good"));
+            let response = client.request(request(b"{\"n\":1}")).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(cache.get(&key, "device-test").as_deref(), Some("good"));
+            // Rejected: entry dropped, one retry that needs a controller.
+            cache.insert(&key, "device-test", &issued("stale"));
+            let (status, code, _) =
+                refusal(client.request(request(b"{\"n\":2}")).await.unwrap()).await;
+            assert_eq!(code, "agentdesktop_credential", "{status}");
+            assert_eq!(cache.get(&key, "device-test"), None);
+            assert_eq!(
+                seen.lock().unwrap().clone(),
+                vec![
+                    ("Bearer good".to_owned(), b"{\"n\":1}".to_vec()),
+                    ("Bearer stale".to_owned(), b"{\"n\":2}".to_vec()),
+                ],
+                "each body reaches the gateway exactly once per attempt"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // AC 5: revoking a session leaves the response it is already receiving
+    // intact; the next request is refused.
+    #[tokio::test]
+    async fn revoking_a_session_does_not_cut_a_response_in_flight() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| {
+                            let release = release.clone();
+                            async move {
+                                let _ = request.into_body().collect().await;
+                                let gate = release.lock().await.take();
+                                let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
+                                tokio::spawn(async move {
+                                    tx.send(Ok(Frame::data(Bytes::from_static(b"first "))))
+                                        .await
+                                        .unwrap();
+                                    if let Some(gate) = gate {
+                                        gate.await.unwrap();
+                                    }
+                                    let _ =
+                                        tx.send(Ok(Frame::data(Bytes::from_static(b"last")))).await;
+                                });
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .header("content-type", "text/event-stream")
+                                        .body(StreamBody::new(ReceiverStream::new(rx)))
+                                        .unwrap(),
+                                )
+                            }
+                        }),
+                    )
+                    .await;
+            });
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let request = post_with(
+                proxy_address,
+                "/sandbox/v1/messages",
+                Some(&session.pairing),
+                b"{}",
+            );
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(first, "first ");
+            assert!(sessions.revoke(&session.id));
+            release_tx.send(()).unwrap();
+            let rest = body.collect().await.unwrap().to_bytes();
+            assert_eq!(rest, "last");
+            let request = post_with(
+                proxy_address,
+                "/sandbox/v1/messages",
+                Some(&session.pairing),
+                b"{}",
+            );
+            assert_eq!(
+                refusal(client.request(request).await.unwrap()).await.1,
+                "pairing_invalid"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // --- AC 3: the sandbox request log.
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> LogWriter {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    const SANDBOX_LOG_MESSAGE: &str = "LLM proxy sandbox request";
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
+        fn sandbox_lines(&self) -> Vec<String> {
+            self.text()
+                .lines()
+                .filter(|line| line.contains(SANDBOX_LOG_MESSAGE))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// Waits (up to 5 s) until at least `count` sandbox lines were emitted;
+        /// the line of a streamed response appears when its body ends.
+        async fn wait_for_lines(&self, count: usize) -> Vec<String> {
+            for _ in 0..100 {
+                let lines = self.sandbox_lines();
+                if lines.len() >= count {
+                    return lines;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let lines = self.sandbox_lines();
+            assert!(
+                lines.len() >= count,
+                "expected {count} sandbox log lines, got {lines:?}"
+            );
+            lines
+        }
+    }
+
+    fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// The value of `key=value` in a formatted event line, without quotes.
+    fn log_field(line: &str, key: &str) -> String {
+        let marker = format!(" {key}=");
+        let start = line
+            .find(&marker)
+            .unwrap_or_else(|| panic!("no field {key} in {line}"))
+            + marker.len();
+        line[start..]
+            .split(' ')
+            .next()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn sandbox_request_log_records_a_streamed_200_once_when_the_body_ends() {
+        let (logs, _guard) = capture_logs();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            let _ = request.into_body().collect().await;
+                            let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
+                            tokio::spawn(async move {
+                                tx.send(Ok(Frame::data(Bytes::from_static(b"hello"))))
+                                    .await
+                                    .unwrap();
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                let _ = tx
+                                    .send(Ok(Frame::data(Bytes::from_static(b"world!"))))
+                                    .await;
+                            });
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header("content-type", "text/event-stream")
+                                    .body(StreamBody::new(ReceiverStream::new(rx)))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await;
+            });
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}/sandbox/v1/messages?beta=true"
+                ))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .header(AUTHORIZATION, "Bearer real-key-by-mistake")
+                .header("x-api-key", "placeholder-key")
+                .body(Full::new(Bytes::from_static(b"{\"n\":1}")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "helloworld!"
+            );
+            let lines = logs.wait_for_lines(1).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let lines_later = logs.sandbox_lines();
+            assert_eq!(
+                lines_later.len(),
+                1,
+                "exactly one event per request: {lines_later:?}"
+            );
+            let line = &lines[0];
+            assert!(line.contains("INFO"), "{line}");
+            assert_eq!(log_field(line, "session"), session.id);
+            assert_eq!(log_field(line, "client_id"), "claude-code");
+            assert_eq!(log_field(line, "method"), "POST");
+            assert_eq!(log_field(line, "path"), "/v1/messages");
+            assert_eq!(log_field(line, "status"), "200");
+            assert_eq!(log_field(line, "code"), "-");
+            assert_eq!(log_field(line, "bytes_in"), "7");
+            assert_eq!(log_field(line, "bytes_out"), "11");
+            assert_eq!(log_field(line, "outcome"), "complete");
+            log_field(line, "duration_ms").parse::<u64>().unwrap();
+            // Never headers, bodies, queries or pairings.
+            let everything = logs.text();
+            for secret in [
+                &*session.pairing,
+                PAIRING,
+                "beta=true",
+                "real-key-by-mistake",
+                "placeholder-key",
+                "{\"n\":1}",
+            ] {
+                assert!(!everything.contains(secret), "log leaks {secret}");
+            }
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_request_log_records_refusals_and_fixed_routes_log_nothing() {
+        let (logs, _guard) = capture_logs();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (address, _seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            // No session matches: session and client_id are "-".
+            let wrong = post_with(
+                proxy_address,
+                "/sandbox/v1/messages?x=1",
+                Some(PAIRING),
+                b"{}",
+            );
+            assert_eq!(
+                client.request(wrong).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+            let lines = logs.wait_for_lines(1).await;
+            let line = &lines[0];
+            assert_eq!(log_field(line, "session"), "-");
+            assert_eq!(log_field(line, "client_id"), "-");
+            assert_eq!(log_field(line, "method"), "POST");
+            assert_eq!(log_field(line, "path"), "/v1/messages");
+            assert_eq!(log_field(line, "status"), "403");
+            assert_eq!(log_field(line, "code"), "pairing_invalid");
+            assert_eq!(log_field(line, "bytes_in"), "0");
+
+            // Refusals before the pairing check are logged too (the path split
+            // moved above the Host/Origin/OPTIONS checks).
+            let rebound = Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{proxy_address}/sandbox/v1/messages"))
+                .header(HOST, "attacker.example")
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            assert_eq!(
+                client.request(rebound).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+            let options = Request::builder()
+                .method(Method::OPTIONS)
+                .uri(format!("http://{proxy_address}/sandbox/v1/messages"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            assert_eq!(
+                client.request(options).await.unwrap().status(),
+                StatusCode::METHOD_NOT_ALLOWED
+            );
+            // A matched session is recorded on later refusals.
+            let escape = post_with(
+                proxy_address,
+                "/sandbox/../admin",
+                Some(&session.pairing),
+                b"{}",
+            );
+            assert_eq!(
+                client.request(escape).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+            // The fixed routes emit nothing new.
+            let fixed = post_with(proxy_address, "/copilot-cli/v1/messages", None, b"{}");
+            assert_eq!(
+                client.request(fixed).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+
+            let lines = logs.wait_for_lines(4).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let lines_later = logs.sandbox_lines();
+            assert_eq!(lines_later.len(), 4, "{lines_later:?}");
+            assert_eq!(log_field(&lines[1], "session"), "-");
+            assert_eq!(log_field(&lines[1], "status"), "403");
+            assert_eq!(log_field(&lines[1], "code"), "host_not_allowed");
+            assert_eq!(log_field(&lines[1], "path"), "/v1/messages");
+            assert_eq!(log_field(&lines[2], "session"), "-");
+            assert_eq!(log_field(&lines[2], "status"), "405");
+            assert_eq!(log_field(&lines[2], "code"), "method_not_allowed");
+            assert_eq!(log_field(&lines[2], "method"), "OPTIONS");
+            assert_eq!(log_field(&lines[3], "session"), session.id);
+            assert_eq!(log_field(&lines[3], "client_id"), "claude-code");
+            assert_eq!(log_field(&lines[3], "status"), "400");
+            assert_eq!(log_field(&lines[3], "code"), "path_invalid");
+            assert_eq!(log_field(&lines[3], "path"), "/../admin");
+            let everything = logs.text();
+            assert!(!everything.contains(&*session.pairing));
+            assert!(!everything.contains("x=1"));
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_request_log_marks_a_dropped_response_as_aborted() {
+        let (logs, _guard) = capture_logs();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            let _ = request.into_body().collect().await;
+                            let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
+                            tokio::spawn(async move {
+                                if tx
+                                    .send(Ok(Frame::data(Bytes::from_static(b"hello"))))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                // The stream goes on for seconds unless the proxy
+                                // drops it when the client is gone.
+                                for _ in 0..100 {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    if tx
+                                        .send(Ok(Frame::data(Bytes::from_static(b"."))))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            });
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header("content-type", "text/event-stream")
+                                    .body(StreamBody::new(ReceiverStream::new(rx)))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await;
+            });
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let request = post_with(
+                proxy_address,
+                "/sandbox/v1/messages",
+                Some(&session.pairing),
+                b"{}",
+            );
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+            assert_eq!(first, "hello");
+            // The client goes away after the first chunk.
+            drop(body);
+            drop(client);
+            let lines = logs.wait_for_lines(1).await;
+            let line = &lines[0];
+            assert_eq!(log_field(line, "session"), session.id);
+            assert_eq!(log_field(line, "status"), "200");
+            assert_eq!(log_field(line, "outcome"), "aborted");
+            assert!(
+                log_field(line, "bytes_out").parse::<u64>().unwrap() >= 5,
+                "{line}"
+            );
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
             drop(dir);
         })
         .await

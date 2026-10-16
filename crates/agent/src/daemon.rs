@@ -600,6 +600,7 @@ where
                 llm_proxy::ProxyConfig {
                     default_client_id: args.llm_proxy_client_id,
                     pairing: pairing.expect("pairing exists whenever the listener does"),
+                    sessions: llm_proxy::sessions::SessionRegistry::default(),
                 },
             )
             .await
@@ -1103,7 +1104,10 @@ fn validate_one_shot(config: &agentdesktop_core::config::DaemonConfig) -> anyhow
     Ok(())
 }
 
-async fn serve_local_connection<I>(stream: I, app: axum::Router) -> Result<(), hyper::Error>
+pub(crate) async fn serve_local_connection<I>(
+    stream: I,
+    app: axum::Router,
+) -> Result<(), hyper::Error>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {

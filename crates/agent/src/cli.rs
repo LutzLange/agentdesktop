@@ -37,6 +37,49 @@ pub enum ClientCommand {
         #[command(subcommand)]
         hook: HookCommand,
     },
+    /// Manage the local LLM proxy.
+    LlmProxy {
+        #[command(subcommand)]
+        command: LlmProxyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LlmProxyCommand {
+    /// Manage sandbox sessions on the proxy.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// Register a session and print its pairing as JSON.
+    Create {
+        /// Credential policy client ID the session presents to the gateway.
+        #[arg(long)]
+        client_id: String,
+        /// Human-readable name for the session.
+        #[arg(long)]
+        label: String,
+        /// Seconds without a request after which the session expires.
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
+    /// List registered sessions.
+    List,
+    /// Revoke a session.
+    Revoke {
+        /// Session ID from `session create` or `session list`.
+        id: String,
+    },
+}
+
+/// The message printed for a failed `llm-proxy session` command.
+#[allow(dead_code)]
+fn session_error_message(_error: &anyhow::Error) -> String {
+    todo!("session_error_message (PR 3)")
 }
 
 #[derive(Subcommand)]
@@ -129,6 +172,7 @@ pub async fn run(command: ClientCommand, socket: PathBuf) -> anyhow::Result<()> 
             .await?;
             println!("{}", response.credential);
         }
+        ClientCommand::LlmProxy { .. } => todo!("llm-proxy session commands (PR 3)"),
         ClientCommand::Hook {
             hook: HookCommand::ClaudePreToolUse { include_input },
         } => {
@@ -231,8 +275,138 @@ fn claude_client_id_for_entrypoint(entrypoint: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use agentdesktop_core::model::TelemetryEventKind;
+    use clap::Parser;
 
-    use super::parse_claude_pre_tool_use;
+    use super::{
+        ClientCommand, LlmProxyCommand, SessionCommand, parse_claude_pre_tool_use,
+        session_error_message,
+    };
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: ClientCommand,
+    }
+
+    fn session_command(args: &[&str]) -> Result<SessionCommand, clap::Error> {
+        let mut argv = vec!["agentdesktop", "llm-proxy", "session"];
+        argv.extend_from_slice(args);
+        match TestCli::try_parse_from(argv)?.command {
+            ClientCommand::LlmProxy {
+                command: LlmProxyCommand::Session { command },
+            } => Ok(command),
+            _ => panic!("expected an llm-proxy session command"),
+        }
+    }
+
+    #[test]
+    fn parses_session_create_with_and_without_a_ttl() {
+        let SessionCommand::Create {
+            client_id,
+            label,
+            ttl_seconds,
+        } = session_command(&[
+            "create",
+            "--client-id",
+            "claude-code",
+            "--label",
+            "lab session",
+            "--ttl-seconds",
+            "120",
+        ])
+        .unwrap()
+        else {
+            panic!("expected create");
+        };
+        assert_eq!(client_id, "claude-code");
+        assert_eq!(label, "lab session");
+        assert_eq!(ttl_seconds, Some(120));
+
+        let SessionCommand::Create { ttl_seconds, .. } =
+            session_command(&["create", "--client-id", "my_tool", "--label", "x"]).unwrap()
+        else {
+            panic!("expected create");
+        };
+        assert_eq!(ttl_seconds, None);
+    }
+
+    #[test]
+    fn session_create_requires_a_client_id_a_label_and_a_numeric_ttl() {
+        assert!(session_command(&["create", "--label", "x"]).is_err());
+        assert!(session_command(&["create", "--client-id", "claude-code"]).is_err());
+        assert!(
+            session_command(&[
+                "create",
+                "--client-id",
+                "claude-code",
+                "--label",
+                "x",
+                "--ttl-seconds",
+                "soon",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_session_list_and_revoke() {
+        assert!(matches!(
+            session_command(&["list"]).unwrap(),
+            SessionCommand::List
+        ));
+        let SessionCommand::Revoke { id } =
+            session_command(&["revoke", "0123456789abcdef"]).unwrap()
+        else {
+            panic!("expected revoke");
+        };
+        assert_eq!(id, "0123456789abcdef");
+        assert!(session_command(&["revoke"]).is_err());
+        assert!(session_command(&[]).is_err());
+        assert!(session_command(&["show"]).is_err());
+    }
+
+    fn status_error(status: u16, body: &str) -> anyhow::Error {
+        anyhow::Error::new(agentdesktop_client::StatusError {
+            status,
+            body: body.to_owned(),
+        })
+    }
+
+    #[test]
+    fn session_error_message_names_the_session_for_404() {
+        assert_eq!(
+            session_error_message(&status_error(404, "no session 0123456789abcdef")),
+            "no session 0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn session_error_message_explains_429() {
+        assert_eq!(
+            session_error_message(&status_error(
+                429,
+                "too many sessions (64); revoke unused ones"
+            )),
+            "too many sessions (64); revoke unused ones"
+        );
+        // The message is the CLI's own, whatever body the daemon sent.
+        assert_eq!(
+            session_error_message(&status_error(429, "")),
+            "too many sessions (64); revoke unused ones"
+        );
+    }
+
+    #[test]
+    fn session_error_message_reports_other_statuses_with_reason_and_body() {
+        assert_eq!(
+            session_error_message(&status_error(409, "the local LLM proxy is not running")),
+            "daemon returned 409 Conflict: the local LLM proxy is not running"
+        );
+        assert_eq!(
+            session_error_message(&status_error(500, "boom")),
+            "daemon returned 500 Internal Server Error: boom"
+        );
+    }
 
     #[test]
     fn parses_claude_pre_tool_use_input_without_unrelated_fields() {
