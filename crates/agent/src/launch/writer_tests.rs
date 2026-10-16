@@ -358,6 +358,11 @@ mod handler {
             "credential directory {credential_dir} must be granted; got {readonly:?}"
         );
         assert!(launch_dir.join("credential").join("token").is_file());
+        // `~\.claude` did not exist before the launch; its entries need it.
+        assert!(
+            home.join(".claude").is_dir(),
+            "~\\.claude is created before the request"
+        );
     }
 }
 

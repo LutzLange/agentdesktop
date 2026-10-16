@@ -472,6 +472,10 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         Some(client_exe_dir),
         program_files_claude,
         Some(credential_dir),
+        // git reads the user's configuration before anything else; unreadable
+        // means every git command fails in the box (lab L4e).
+        Some(join(&home, ".gitconfig")),
+        Some(join(&home, r".config\git\config")),
     ];
     for candidate in runtime.into_iter().flatten() {
         if exists(&candidate) && !readonly.contains(&candidate) {

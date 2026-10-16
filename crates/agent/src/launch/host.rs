@@ -238,6 +238,10 @@ impl Executor for ProcessExecutor {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
+            // The child gets its own stdio; the daemon's own standard handles
+            // (a log redirect under a scheduled task) must not travel with it
+            // into the box (lab F4: the box kept the daemon log open).
+            windows::stop_inheriting_standard_handles();
         }
         let mut child = command.spawn()?;
         let pid = child.id();
@@ -333,11 +337,15 @@ pub(crate) mod windows {
 
     use anyhow::{Context, bail};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, FILETIME, HANDLE, LocalFree, STILL_ACTIVE},
+        Foundation::{
+            CloseHandle, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
+            STILL_ACTIVE, SetHandleInformation,
+        },
         Security::{
             Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER,
             TokenIsAppContainer, TokenUser,
         },
+        System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
         System::Threading::{
             GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
             PROCESS_QUERY_LIMITED_INFORMATION,
@@ -345,6 +353,21 @@ pub(crate) mod windows {
     };
 
     use super::super::PipePeer;
+
+    /// Clears the inherit flag on the daemon's standard handles, so a child
+    /// started with explicit stdio cannot receive them.
+    pub(super) fn stop_inheriting_standard_handles() {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain system calls; a missing handle is skipped.
+            unsafe {
+                let handle = GetStdHandle(which);
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 
     /// A handle closed on drop.
     struct Handle(HANDLE);

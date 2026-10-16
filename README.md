@@ -660,13 +660,16 @@ the client ID has no effect.
 What the box can see: the workspace, `~\.claude` (skills, agents, commands,
 `CLAUDE.md` and `.claude.json` stay writable; `CLAUDE_CONFIG_DIR` points there),
 a private `tmp`. Read-only: the Claude Code and Git installations, the
-Agentdesktop client, `~\.claude\settings.json`, `~\.claude\hooks`,
+Agentdesktop client, `~\.gitconfig` and `~\.config\git\config` when they exist (git reads them
+before anything else), `~\.claude\settings.json`, `~\.claude\hooks`,
 `~\.claude\plugins`, the workspace's `.claude\settings*.json`, `.claude\hooks`,
 `.mcp.json`, a `HEAD` file at the workspace root, and `.git\config`,
 `.git\hooks` and `.git\commondir` of the workspace repository (`.git\HEAD`
 stays writable so branch switches work).
 Each of those is denied when it does not exist, so the box cannot create it
-either; a workspace without `.git` cannot `git init` one. Always denied:
+either (a workspace without a `.claude` folder gets the folder denied as a
+whole); a workspace without `.git` cannot `git init` one. The daemon creates
+`~\.claude` if it is missing. Always denied:
 `~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
 `~\.ssh`, `~\.aws`, `~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
 directory or one of its ancestors, or anything under `%SystemRoot%`,
