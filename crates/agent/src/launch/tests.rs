@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -1560,6 +1560,14 @@ struct StubExecutor {
     log_text: Mutex<String>,
     /// The children's exit status; `None` while running.
     exit: Arc<Mutex<Option<i32>>>,
+    /// Error kind returned by `try_wait` while set.
+    try_wait_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    /// Error kind returned by `kill` while set.
+    kill_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    /// Number of times `kill` was called.
+    kills: Arc<AtomicU32>,
+    /// When true, `spawn` creates the pid file as a directory.
+    pid_as_dir: AtomicBool,
 }
 
 impl StubExecutor {
@@ -1570,14 +1578,24 @@ impl StubExecutor {
     fn exit_with(&self, code: i32) {
         *self.exit.lock().unwrap() = Some(code);
     }
+
+    fn kills(&self) -> u32 {
+        self.kills.load(Ordering::SeqCst)
+    }
 }
 
 struct StubChild {
     exit: Arc<Mutex<Option<i32>>>,
+    try_wait_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    kill_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    kills: Arc<AtomicU32>,
 }
 
 impl LaunchChild for StubChild {
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        if let Some(kind) = *self.try_wait_error.lock().unwrap() {
+            return Err(io::Error::from(kind));
+        }
         Ok(*self.exit.lock().unwrap())
     }
 
@@ -1587,6 +1605,14 @@ impl LaunchChild for StubChild {
 
     fn start_time(&self) -> u64 {
         987_654_321
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.kills.fetch_add(1, Ordering::SeqCst);
+        if let Some(kind) = *self.kill_error.lock().unwrap() {
+            return Err(io::Error::from(kind));
+        }
+        Ok(())
     }
 }
 
@@ -1616,8 +1642,14 @@ impl Executor for StubExecutor {
         if !text.is_empty() {
             std::fs::write(log, text)?;
         }
+        if self.pid_as_dir.load(Ordering::SeqCst) {
+            std::fs::create_dir(launch_dir.join("pid"))?;
+        }
         Ok(Box::new(StubChild {
             exit: self.exit.clone(),
+            try_wait_error: self.try_wait_error.clone(),
+            kill_error: self.kill_error.clone(),
+            kills: self.kills.clone(),
         }))
     }
 }
@@ -1705,6 +1737,10 @@ impl Harness {
             error: Mutex::new(None),
             log_text: Mutex::new(String::new()),
             exit: Arc::new(Mutex::new(None)),
+            try_wait_error: Arc::new(Mutex::new(None)),
+            kill_error: Arc::new(Mutex::new(None)),
+            kills: Arc::new(AtomicU32::new(0)),
+            pid_as_dir: AtomicBool::new(false),
         });
         let executor_path = client_exe_dir.join("wxc-exec.exe");
         let availability = match setup.availability {
@@ -2516,6 +2552,116 @@ async fn body_errors_are_the_ones_axum_produces() {
         .unwrap();
     assert_eq!(missing_cwd.status().as_u16(), 422);
     h.assert_untouched();
+}
+
+// ---------------------------------------------------------------- kill (PR 2a)
+
+#[tokio::test(start_paused = true)]
+async fn kill_when_pid_file_write_fails() {
+    let h = Harness::start(Setup::default()).await;
+    h.executor.pid_as_dir.store(true, Ordering::SeqCst);
+
+    let (status, body) = h.launch(&h.body()).await;
+
+    assert_eq!(status, 500, "{body}");
+    assert!(body.starts_with("record the launch pid: "), "{body}");
+    assert_eq!(h.executor.kills(), 1);
+    assert!(
+        h.listed().await.is_empty(),
+        "a launch that never started is not listed"
+    );
+    let launches = h.state_dir.join("launches");
+    assert!(
+        !launches.exists() || std::fs::read_dir(&launches).unwrap().next().is_none(),
+        "no launch directory remains"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn kill_when_try_wait_fails_during_startup_watch() {
+    let h = Harness::start(Setup::default()).await;
+    *h.executor.try_wait_error.lock().unwrap() = Some(io::ErrorKind::Other);
+
+    let (status, body) = h.launch(&h.body()).await;
+
+    assert_eq!(status, 500, "{body}");
+    assert!(body.starts_with("watch wxc-exec: "), "{body}");
+    assert_eq!(h.executor.kills(), 1);
+    assert!(
+        h.listed().await.is_empty(),
+        "a launch that never started is not listed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn kill_error_does_not_replace_original_error() {
+    let h = Harness::start(Setup::default()).await;
+    *h.executor.try_wait_error.lock().unwrap() = Some(io::ErrorKind::Other);
+    *h.executor.kill_error.lock().unwrap() = Some(io::ErrorKind::Other);
+
+    let (status, body) = h.launch(&h.body()).await;
+
+    assert_eq!(status, 500, "{body}");
+    assert!(body.starts_with("watch wxc-exec: "), "{body}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn kill_when_poller_try_wait_fails() {
+    let h = Harness::start(Setup::default()).await;
+    let launched = h.launch_ok().await;
+
+    *h.executor.try_wait_error.lock().unwrap() = Some(io::ErrorKind::Other);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let listed = h.listed().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, LaunchStatus::Exited);
+    assert_eq!(listed[0].exit_code, None);
+    assert_eq!(h.executor.kills(), 1);
+    assert!(!h.launch_dir(&launched.launch_id).exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn kill_error_does_not_block_mark_exited() {
+    let h = Harness::start(Setup::default()).await;
+    let launched = h.launch_ok().await;
+
+    *h.executor.try_wait_error.lock().unwrap() = Some(io::ErrorKind::Other);
+    *h.executor.kill_error.lock().unwrap() = Some(io::ErrorKind::Other);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let listed = h.listed().await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].status, LaunchStatus::Exited);
+    assert_eq!(listed[0].exit_code, None);
+    assert!(!h.launch_dir(&launched.launch_id).exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_kill_on_spawn_failure_early_exit_or_normal_exit() {
+    let h = Harness::start(Setup::default()).await;
+
+    // Spawn failure
+    *h.executor.error.lock().unwrap() =
+        Some(io::Error::new(io::ErrorKind::NotFound, "no such file"));
+    h.launch(&h.body()).await;
+    assert_eq!(h.executor.kills(), 0, "no kill after spawn failure");
+
+    // Early exit
+    *h.executor.error.lock().unwrap() = None;
+    h.executor.exit_with(2);
+    h.launch(&h.body()).await;
+    assert_eq!(h.executor.kills(), 0, "no kill after early exit");
+
+    // Normal exit
+    let launched = h.launch_ok().await;
+    h.executor.exit_with(7);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let listed = h.listed().await;
+    assert_eq!(listed[0].status, LaunchStatus::Exited);
+    assert_eq!(listed[0].exit_code, Some(7));
+    assert!(!h.launch_dir(&launched.launch_id).exists());
+    assert_eq!(h.executor.kills(), 0, "no kill after normal exit");
 }
 
 // ----------------------------------------------------------------- Windows only

@@ -255,6 +255,9 @@ mod handler {
         fn start_time(&self) -> u64 {
             1
         }
+        fn kill(&mut self) -> io::Result<()> {
+            todo!()
+        }
     }
 
     impl Executor for Recorder {

@@ -675,6 +675,8 @@ pub trait LaunchChild: Send {
     fn pid(&self) -> u32;
     /// Creation time of the process (FILETIME on Windows).
     fn start_time(&self) -> u64;
+    /// Stops the process; `Ok` if it has already exited.
+    fn kill(&mut self) -> io::Result<()>;
 }
 
 pub trait Executor: Send + Sync {
