@@ -256,7 +256,7 @@ mod handler {
             1
         }
         fn kill(&mut self) -> io::Result<()> {
-            todo!()
+            Ok(())
         }
     }
 

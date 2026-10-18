@@ -2650,10 +2650,12 @@ async fn no_kill_on_spawn_failure_early_exit_or_normal_exit() {
     // Early exit
     *h.executor.error.lock().unwrap() = None;
     h.executor.exit_with(2);
-    h.launch(&h.body()).await;
+    let (status, _) = h.launch(&h.body()).await;
+    assert_eq!(status, 500, "early exit returns 500");
     assert_eq!(h.executor.kills(), 0, "no kill after early exit");
 
     // Normal exit
+    *h.executor.exit.lock().unwrap() = None;
     let launched = h.launch_ok().await;
     h.executor.exit_with(7);
     tokio::time::sleep(Duration::from_secs(3)).await;

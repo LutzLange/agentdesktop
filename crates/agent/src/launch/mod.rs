@@ -983,6 +983,9 @@ async fn start_launch(
         launch_dir.join("pid"),
         format!("{} {}", child.pid(), child.start_time()),
     ) {
+        if let Err(error) = child.kill() {
+            tracing::warn!(launch_id, %error, "failed to stop the executor process");
+        }
         return fail(&launch_dir, format!("record the launch pid: {error}"));
     }
 
@@ -1002,7 +1005,12 @@ async fn start_launch(
                     ),
                 );
             }
-            Err(error) => return fail(&launch_dir, format!("watch wxc-exec: {error}")),
+            Err(error) => {
+                if let Err(error) = child.kill() {
+                    tracing::warn!(launch_id, %error, "failed to stop the executor process");
+                }
+                return fail(&launch_dir, format!("watch wxc-exec: {error}"));
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -1081,6 +1089,9 @@ async fn poll_task(
             Ok(Some(code)) => Some(code),
             Err(error) => {
                 tracing::warn!(launch_id, %error, "lost track of the launch; treating it as exited");
+                if let Err(error) = child.kill() {
+                    tracing::warn!(launch_id, %error, "failed to stop the executor process");
+                }
                 None
             }
         };

@@ -211,7 +211,7 @@ impl LaunchChild for ProcessChild {
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        todo!()
+        self.child.kill()
     }
 }
 
