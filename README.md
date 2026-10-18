@@ -670,7 +670,7 @@ are not granted, so git fails closed in the box when a config uses them), `~\.cl
 `.git\hooks` and `.git\commondir` of the workspace repository (`.git\HEAD`
 stays writable so branch switches work).
 Each file or folder in that list is denied when it does not exist, so the box
-cannot create it either, except for the git configuration files (granted when
+cannot create it in place (renaming a file into such a path is not yet tested), except for the git configuration files (granted when
 present, not emitted otherwise); a workspace without a `.claude` folder gets
 the folder denied as a whole; a workspace without `.git` cannot `git init` one.
 The daemon creates `~\.claude` if it is missing. Always denied:
@@ -716,10 +716,13 @@ boxes alive but stops refreshing their credential: at startup the daemon removes
 the credential and request files of every earlier launch, and the directory of
 a launch whose box has exited. Residual risk: on Windows a read-only file inside
 a read-write folder can be replaced from the box (write a temp file, rename over
-it; Claude Code's own atomic save does this), so `~\.claude\settings.json`
-(hooks, `apiKeyHelper`), `<cwd>\.mcp.json`, `<cwd>\.git\config`, and the hook
-folders `~\.claude\hooks` and `<cwd>\.git\hooks` can be changed by the boxed
-agent and are then read by the next unboxed session (Claude Code outside the box;
+it; Claude Code's own atomic save does this). That covers every read-only entry
+above that sits inside a writable folder: `~\.claude\settings.json` (hooks,
+`apiKeyHelper`), `~\.claude\hooks`, `~\.claude\plugins`, the workspace's
+`.claude\settings*.json` and `.claude\hooks` (which can also be committed to the
+repository), `.mcp.json`, the workspace-root `HEAD`, and `.git\config`, `.git\hooks`
+and `.git\commondir`. The boxed agent can
+change them, and the next unboxed session reads them (Claude Code outside the box;
 git outside the box, where `core.fsmonitor` and `core.hooksPath` run code). The
 read-only grant stops in-place writes but not replacement. Files the agent creates
 in the workspace are not gated yet; nested repositories under the workspace, a
