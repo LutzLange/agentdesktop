@@ -661,15 +661,18 @@ What the box can see: the workspace, `~\.claude` (skills, agents, commands,
 `CLAUDE.md` and `.claude.json` stay writable; `CLAUDE_CONFIG_DIR` points there),
 a private `tmp`. Read-only: the Claude Code and Git installations, the
 Agentdesktop client, `~\.gitconfig` and `~\.config\git\config` when they exist (git reads them
-before anything else), `~\.claude\settings.json`, `~\.claude\hooks`,
+before anything else; open egress means a git config can carry secrets, for
+example `http.<url>.extraHeader` with a bearer PAT, or credentials in
+`url.*.insteadOf` URLs), `~\.claude\settings.json`, `~\.claude\hooks`,
 `~\.claude\plugins`, the workspace's `.claude\settings*.json`, `.claude\hooks`,
 `.mcp.json`, a `HEAD` file at the workspace root, and `.git\config`,
 `.git\hooks` and `.git\commondir` of the workspace repository (`.git\HEAD`
 stays writable so branch switches work).
-Each of those is denied when it does not exist, so the box cannot create it
-either (a workspace without a `.claude` folder gets the folder denied as a
-whole); a workspace without `.git` cannot `git init` one. The daemon creates
-`~\.claude` if it is missing. Always denied:
+Each file or folder in that list is denied when it does not exist, so the box
+cannot create it either, except for the git configuration files (granted when
+present, not emitted otherwise); a workspace without a `.claude` folder gets
+the folder denied as a whole; a workspace without `.git` cannot `git init` one.
+The daemon creates `~\.claude` if it is missing. Always denied:
 `~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
 `~\.ssh`, `~\.aws`, `~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
 directory or one of its ancestors, or anything under `%SystemRoot%`,
@@ -702,8 +705,10 @@ containing `" % ^ & | < > !` or control characters are rejected, because
 `run` answers `400` for a rejected program, workspace or argument, `403` when
 another user calls a user-mode daemon on Windows, `409` for the configuration
 rules above, `401`/`424`/`502` straight from the credential request, and `500`
-when the executor cannot be started or exits within three seconds (its last
-log lines are in the message). Launches are listed by `GET /v1/launches`
+when preparing the launch fails (creating `~\.claude`, the credential directory,
+or writing the request), when the executor cannot be started, or when it exits
+within three seconds (its last log lines are in the message). Launches are
+listed by `GET /v1/launches`
 (running ones plus the last 32 that exited). A daemon restart keeps running
 boxes alive but stops refreshing their credential: at startup the daemon removes
 the credential and request files of every earlier launch, and the directory of

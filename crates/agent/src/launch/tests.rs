@@ -682,6 +682,7 @@ fn base_env() -> BTreeMap<String, String> {
         ("USERPROFILE", HOME),
         ("HOMEDRIVE", "C:"),
         ("HOMEPATH", r"\Users\dev"),
+        ("HOME", HOME),
         ("APPDATA", r"C:\Users\dev\AppData\Roaming"),
         ("LOCALAPPDATA", r"C:\Users\dev\AppData\Local"),
         ("ProgramFiles", r"C:\Program Files"),

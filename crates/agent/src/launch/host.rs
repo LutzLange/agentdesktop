@@ -24,7 +24,7 @@ use super::{
 use crate::api;
 
 /// Environment variables copied from the daemon into the box.
-const BASE_ENV: [&str; 13] = [
+const BASE_ENV: [&str; 14] = [
     "SystemRoot",
     "windir",
     "SystemDrive",
@@ -33,6 +33,7 @@ const BASE_ENV: [&str; 13] = [
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
+    "HOME",
     "APPDATA",
     "LOCALAPPDATA",
     "ProgramFiles",
@@ -364,7 +365,9 @@ pub(crate) mod windows {
                 if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                     continue;
                 }
-                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) == 0 {
+                    tracing::debug!("SetHandleInformation failed for handle {which:?}");
+                }
             }
         }
     }

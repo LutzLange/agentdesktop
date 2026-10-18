@@ -20,6 +20,7 @@
       "CLAUDE_CONFIG_DIR=C:\\Users\\dev\\.claude",
       "ComSpec=C:\\Windows\\system32\\cmd.exe",
       "DISABLE_AUTOUPDATER=1",
+      "HOME=C:\\Users\\dev",
       "HOMEDRIVE=C:",
       "HOMEPATH=\\Users\\dev",
       "LOCALAPPDATA=C:\\Users\\dev\\AppData\\Local",
