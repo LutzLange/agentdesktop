@@ -24,7 +24,7 @@ use super::{
 use crate::api;
 
 /// Environment variables copied from the daemon into the box.
-const BASE_ENV: [&str; 14] = [
+const BASE_ENV: [&str; 13] = [
     "SystemRoot",
     "windir",
     "SystemDrive",
@@ -33,7 +33,6 @@ const BASE_ENV: [&str; 14] = [
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
-    "HOME",
     "APPDATA",
     "LOCALAPPDATA",
     "ProgramFiles",

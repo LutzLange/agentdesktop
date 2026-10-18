@@ -663,7 +663,8 @@ a private `tmp`. Read-only: the Claude Code and Git installations, the
 Agentdesktop client, `~\.gitconfig` and `~\.config\git\config` when they exist (git reads them
 before anything else; open egress means a git config can carry secrets, for
 example `http.<url>.extraHeader` with a bearer PAT, or credentials in
-`url.*.insteadOf` URLs), `~\.claude\settings.json`, `~\.claude\hooks`,
+`url.*.insteadOf` URLs; `[include]` and `[includeIf]` targets of the git configuration
+are not granted, so git fails closed in the box when a config uses them), `~\.claude\settings.json`, `~\.claude\hooks`,
 `~\.claude\plugins`, the workspace's `.claude\settings*.json`, `.claude\hooks`,
 `.mcp.json`, a `HEAD` file at the workspace root, and `.git\config`,
 `.git\hooks` and `.git\commondir` of the workspace repository (`.git\HEAD`
@@ -706,8 +707,9 @@ containing `" % ^ & | < > !` or control characters are rejected, because
 another user calls a user-mode daemon on Windows, `409` for the configuration
 rules above, `401`/`424`/`502` straight from the credential request, and `500`
 when preparing the launch fails (creating `~\.claude`, the credential directory,
-or writing the request), when the executor cannot be started, or when it exits
-within three seconds (its last log lines are in the message). Launches are
+or writing the request), when the executor cannot be started, when recording the
+launch pid fails, or when it exits within three seconds (its last log lines are
+in the message). Launches are
 listed by `GET /v1/launches`
 (running ones plus the last 32 that exited). A daemon restart keeps running
 boxes alive but stops refreshing their credential: at startup the daemon removes

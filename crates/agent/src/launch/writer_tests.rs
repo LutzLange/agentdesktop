@@ -240,6 +240,7 @@ mod handler {
     pub(super) struct Recorder {
         pub(super) request_json: Mutex<Option<String>>,
         pub(super) home_claude_existed: Mutex<bool>,
+        pub(super) home: PathBuf,
     }
 
     struct Running;
@@ -265,24 +266,7 @@ mod handler {
             _log: &Path,
         ) -> io::Result<Box<dyn LaunchChild>> {
             // Record whether ~/.claude existed at spawn time (n1: ordering).
-            let content = std::fs::read_to_string(request).unwrap_or_default();
-            if let Ok(host) = serde_json::from_str::<serde_json::Value>(&content) {
-                let home = host
-                    .get("filesystem")
-                    .and_then(|fs| fs.get("readonlyPaths"))
-                    .and_then(|paths| paths.as_array())
-                    .and_then(|arr| {
-                        arr.iter().find(|p| {
-                            p.as_str()
-                                .is_some_and(|s| s.ends_with(r"\.claude\settings.json"))
-                        })
-                    })
-                    .and_then(|p| p.as_str())
-                    .map(|s| s.trim_end_matches(r"\settings.json"));
-                if let Some(home) = home {
-                    *self.home_claude_existed.lock().unwrap() = std::path::Path::new(home).exists();
-                }
-            }
+            *self.home_claude_existed.lock().unwrap() = self.home.join(".claude").is_dir();
             *self.request_json.lock().unwrap() = std::fs::read_to_string(request).ok();
             Ok(Box::new(Running))
         }
@@ -344,7 +328,8 @@ mod handler {
         std::fs::create_dir_all(&state_dir).unwrap();
         let recorder = Arc::new(Recorder {
             request_json: Mutex::new(None),
-            home_claude_existed: Mutex::new(true),
+            home_claude_existed: Mutex::new(false),
+            home: home.clone(),
         });
         let state = state(home.clone(), state_dir.clone(), recorder.clone());
 
@@ -486,11 +471,12 @@ async fn a_resolved_program_path_with_a_percent_sign_is_rejected() {
     std::fs::write(home.join(".local").join("bin").join("claude.exe"), b"MZ").unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
     let state = handler::state(
-        home,
+        home.clone(),
         state_dir,
         Arc::new(handler::Recorder {
             request_json: Mutex::new(None),
-            home_claude_existed: Mutex::new(true),
+            home_claude_existed: Mutex::new(false),
+            home: home.clone(),
         }),
     );
 
@@ -556,4 +542,73 @@ fn the_environment_is_a_list_of_key_value_entries_and_a_missing_workspace_claude
     );
     // Entries whose parent is granted read-write stay individual.
     assert!(denied.contains(&r"C:\Users\dev\.claude\settings.json".to_owned()));
+}
+
+#[test]
+fn the_box_environment_has_home_set_to_the_daemon_home_when_daemon_env_has_no_home() {
+    use std::collections::BTreeMap;
+
+    let exists = |_: &Path| false;
+    let request = build_request(&LaunchInput {
+        launch_id: "0123456789abcdef".into(),
+        executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
+        client_exe_dir: PathBuf::from(r"C:\Program Files\Agentdesktop"),
+        cwd: PathBuf::from(r"C:\ws"),
+        args: vec![],
+        home: PathBuf::from(r"C:\Users\dev"),
+        state_dir: PathBuf::from(r"C:\Users\dev\.local\state\agentdesktop"),
+        launch_dir: PathBuf::from(
+            r"C:\Users\dev\.local\state\agentdesktop\launches\0123456789abcdef",
+        ),
+        git_dir: None,
+        program_files_claude: None,
+        gateway_url: "https://gateway.example.com/".into(),
+        base_env: BTreeMap::new(),
+        exists: &exists,
+    });
+    assert!(
+        request
+            .process
+            .env
+            .contains(&r"HOME=C:\Users\dev".to_owned()),
+        "HOME must be set in box env even when daemon env has no HOME; got {:?}",
+        request.process.env
+    );
+}
+
+#[test]
+fn the_box_environment_has_home_set_to_the_daemon_home_when_daemon_env_has_different_home() {
+    use std::collections::BTreeMap;
+
+    let exists = |_: &Path| false;
+    let request = build_request(&LaunchInput {
+        launch_id: "0123456789abcdef".into(),
+        executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
+        client_exe_dir: PathBuf::from(r"C:\Program Files\Agentdesktop"),
+        cwd: PathBuf::from(r"C:\ws"),
+        args: vec![],
+        home: PathBuf::from(r"C:\Users\dev"),
+        state_dir: PathBuf::from(r"C:\Users\dev\.local\state\agentdesktop"),
+        launch_dir: PathBuf::from(
+            r"C:\Users\dev\.local\state\agentdesktop\launches\0123456789abcdef",
+        ),
+        git_dir: None,
+        program_files_claude: None,
+        gateway_url: "https://gateway.example.com/".into(),
+        base_env: BTreeMap::from([("HOME".to_owned(), r"H:\".to_owned())]),
+        exists: &exists,
+    });
+    assert!(
+        request
+            .process
+            .env
+            .contains(&r"HOME=C:\Users\dev".to_owned()),
+        "HOME must be set to daemon home, not daemon env HOME; got {:?}",
+        request.process.env
+    );
+    assert!(
+        !request.process.env.contains(&r"HOME=H:\".to_owned()),
+        "daemon env HOME must not appear in box env; got {:?}",
+        request.process.env
+    );
 }
