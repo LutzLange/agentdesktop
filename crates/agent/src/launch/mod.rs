@@ -452,7 +452,7 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         "AGENTDESKTOP_CREDENTIAL_FILE".into(),
         join(&credential_dir, "token"),
     );
-    env.insert("HOME".into(), win(&input.home));
+    env.insert("HOME".into(), home.clone());
 
     let mut command_line = format!(
         "cmd.exe /d /v:off /c start \"agentdesktop: claude\" /WAIT /D \"{cwd}\" \"{executable}\""

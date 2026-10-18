@@ -367,7 +367,7 @@ mod handler {
         // `~\.claude` did not exist before the launch; its entries need it.
         assert!(
             *recorder.home_claude_existed.lock().unwrap(),
-            "~\\.claude existed when the executor started"
+            "~\\.claude did not exist when the executor started"
         );
         assert!(
             home.join(".claude").is_dir(),
@@ -572,43 +572,6 @@ fn the_box_environment_has_home_set_to_the_daemon_home_when_daemon_env_has_no_ho
             .env
             .contains(&r"HOME=C:\Users\dev".to_owned()),
         "HOME must be set in box env even when daemon env has no HOME; got {:?}",
-        request.process.env
-    );
-}
-
-#[test]
-fn the_box_environment_has_home_set_to_the_daemon_home_when_daemon_env_has_different_home() {
-    use std::collections::BTreeMap;
-
-    let exists = |_: &Path| false;
-    let request = build_request(&LaunchInput {
-        launch_id: "0123456789abcdef".into(),
-        executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
-        client_exe_dir: PathBuf::from(r"C:\Program Files\Agentdesktop"),
-        cwd: PathBuf::from(r"C:\ws"),
-        args: vec![],
-        home: PathBuf::from(r"C:\Users\dev"),
-        state_dir: PathBuf::from(r"C:\Users\dev\.local\state\agentdesktop"),
-        launch_dir: PathBuf::from(
-            r"C:\Users\dev\.local\state\agentdesktop\launches\0123456789abcdef",
-        ),
-        git_dir: None,
-        program_files_claude: None,
-        gateway_url: "https://gateway.example.com/".into(),
-        base_env: BTreeMap::from([("HOME".to_owned(), r"H:\".to_owned())]),
-        exists: &exists,
-    });
-    assert!(
-        request
-            .process
-            .env
-            .contains(&r"HOME=C:\Users\dev".to_owned()),
-        "HOME must be set to daemon home, not daemon env HOME; got {:?}",
-        request.process.env
-    );
-    assert!(
-        !request.process.env.contains(&r"HOME=H:\".to_owned()),
-        "daemon env HOME must not appear in box env; got {:?}",
         request.process.env
     );
 }

@@ -714,9 +714,16 @@ listed by `GET /v1/launches`
 (running ones plus the last 32 that exited). A daemon restart keeps running
 boxes alive but stops refreshing their credential: at startup the daemon removes
 the credential and request files of every earlier launch, and the directory of
-a launch whose box has exited. Residual risk: files the agent creates in the
-workspace are not gated yet; nested repositories under the workspace, a renamed
-or recreated `.git` or `.claude` directory, and editor task files such as
+a launch whose box has exited. Residual risk: on Windows a read-only file inside
+a read-write folder can be replaced from the box (write a temp file, rename over
+it; Claude Code's own atomic save does this), so `~\.claude\settings.json`
+(hooks, `apiKeyHelper`), `<cwd>\.mcp.json`, `<cwd>\.git\config`, and the hook
+folders `~\.claude\hooks` and `<cwd>\.git\hooks` can be changed by the boxed
+agent and are then read by the next unboxed session (Claude Code outside the box;
+git outside the box, where `core.fsmonitor` and `core.hooksPath` run code). The
+read-only grant stops in-place writes but not replacement. Files the agent creates
+in the workspace are not gated yet; nested repositories under the workspace, a
+renamed or recreated `.git` or `.claude` directory, and editor task files such as
 `.vscode\tasks.json` are not protected; `~\.claude\.claude.json` (user-scope
 MCP servers) and skills under `~\.claude` stay writable so the agent keeps its
 context; managed `allowManaged*Only` settings arrive with the policy profile.
