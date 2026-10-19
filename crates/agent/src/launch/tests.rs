@@ -1568,6 +1568,8 @@ struct StubExecutor {
     kills: Arc<AtomicU32>,
     /// When true, `spawn` creates the pid file as a directory.
     pid_as_dir: AtomicBool,
+    /// Records whether the launch directory existed when `kill` was called.
+    dir_existed_at_kill: Arc<Mutex<Option<bool>>>,
 }
 
 impl StubExecutor {
@@ -1589,6 +1591,8 @@ struct StubChild {
     try_wait_error: Arc<Mutex<Option<io::ErrorKind>>>,
     kill_error: Arc<Mutex<Option<io::ErrorKind>>>,
     kills: Arc<AtomicU32>,
+    launch_dir: PathBuf,
+    dir_existed_at_kill: Arc<Mutex<Option<bool>>>,
 }
 
 impl LaunchChild for StubChild {
@@ -1609,6 +1613,7 @@ impl LaunchChild for StubChild {
 
     fn kill(&mut self) -> io::Result<()> {
         self.kills.fetch_add(1, Ordering::SeqCst);
+        *self.dir_existed_at_kill.lock().unwrap() = Some(self.launch_dir.exists());
         if let Some(kind) = *self.kill_error.lock().unwrap() {
             return Err(io::Error::from(kind));
         }
@@ -1650,6 +1655,8 @@ impl Executor for StubExecutor {
             try_wait_error: self.try_wait_error.clone(),
             kill_error: self.kill_error.clone(),
             kills: self.kills.clone(),
+            launch_dir: launch_dir.to_owned(),
+            dir_existed_at_kill: self.dir_existed_at_kill.clone(),
         }))
     }
 }
@@ -1741,6 +1748,7 @@ impl Harness {
             kill_error: Arc::new(Mutex::new(None)),
             kills: Arc::new(AtomicU32::new(0)),
             pid_as_dir: AtomicBool::new(false),
+            dir_existed_at_kill: Arc::new(Mutex::new(None)),
         });
         let executor_path = client_exe_dir.join("wxc-exec.exe");
         let availability = match setup.availability {
@@ -2554,10 +2562,10 @@ async fn body_errors_are_the_ones_axum_produces() {
     h.assert_untouched();
 }
 
-// ---------------------------------------------------------------- kill (PR 2a)
+// -------------------------------------------------------- stopping the executor
 
 #[tokio::test(start_paused = true)]
-async fn kill_when_pid_file_write_fails() {
+async fn the_executor_is_stopped_when_the_pid_file_cannot_be_written() {
     let h = Harness::start(Setup::default()).await;
     h.executor.pid_as_dir.store(true, Ordering::SeqCst);
 
@@ -2578,7 +2586,7 @@ async fn kill_when_pid_file_write_fails() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn kill_when_try_wait_fails_during_startup_watch() {
+async fn the_executor_is_stopped_when_the_startup_watch_fails() {
     let h = Harness::start(Setup::default()).await;
     *h.executor.try_wait_error.lock().unwrap() = Some(io::ErrorKind::Other);
 
@@ -2591,22 +2599,29 @@ async fn kill_when_try_wait_fails_during_startup_watch() {
         h.listed().await.is_empty(),
         "a launch that never started is not listed"
     );
+    let launches = h.state_dir.join("launches");
+    assert!(
+        !launches.exists() || std::fs::read_dir(&launches).unwrap().next().is_none(),
+        "no launch directory remains"
+    );
 }
 
 #[tokio::test(start_paused = true)]
-async fn kill_error_does_not_replace_original_error() {
+async fn a_kill_error_does_not_replace_the_original_error() {
     let h = Harness::start(Setup::default()).await;
     *h.executor.try_wait_error.lock().unwrap() = Some(io::ErrorKind::Other);
-    *h.executor.kill_error.lock().unwrap() = Some(io::ErrorKind::Other);
+    *h.executor.kill_error.lock().unwrap() = Some(io::ErrorKind::PermissionDenied);
 
     let (status, body) = h.launch(&h.body()).await;
 
     assert_eq!(status, 500, "{body}");
     assert!(body.starts_with("watch wxc-exec: "), "{body}");
+    assert!(body.contains("other error"), "{body}");
+    assert!(!body.to_lowercase().contains("permission"), "{body}");
 }
 
 #[tokio::test(start_paused = true)]
-async fn kill_when_poller_try_wait_fails() {
+async fn the_executor_is_stopped_when_the_poller_loses_track_of_it() {
     let h = Harness::start(Setup::default()).await;
     let launched = h.launch_ok().await;
 
@@ -2618,27 +2633,35 @@ async fn kill_when_poller_try_wait_fails() {
     assert_eq!(listed[0].status, LaunchStatus::Exited);
     assert_eq!(listed[0].exit_code, None);
     assert_eq!(h.executor.kills(), 1);
+    assert!(
+        h.executor.dir_existed_at_kill.lock().unwrap().unwrap(),
+        "directory must exist when kill is called"
+    );
     assert!(!h.launch_dir(&launched.launch_id).exists());
 }
 
 #[tokio::test(start_paused = true)]
-async fn kill_error_does_not_block_mark_exited() {
+async fn a_kill_error_does_not_prevent_marking_the_launch_exited() {
     let h = Harness::start(Setup::default()).await;
     let launched = h.launch_ok().await;
 
     *h.executor.try_wait_error.lock().unwrap() = Some(io::ErrorKind::Other);
-    *h.executor.kill_error.lock().unwrap() = Some(io::ErrorKind::Other);
+    *h.executor.kill_error.lock().unwrap() = Some(io::ErrorKind::PermissionDenied);
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let listed = h.listed().await;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].status, LaunchStatus::Exited);
     assert_eq!(listed[0].exit_code, None);
+    assert!(
+        h.executor.dir_existed_at_kill.lock().unwrap().unwrap(),
+        "directory must exist when kill is called"
+    );
     assert!(!h.launch_dir(&launched.launch_id).exists());
 }
 
 #[tokio::test(start_paused = true)]
-async fn no_kill_on_spawn_failure_early_exit_or_normal_exit() {
+async fn the_executor_is_not_stopped_after_spawn_failure_early_exit_or_normal_exit() {
     let h = Harness::start(Setup::default()).await;
 
     // Spawn failure

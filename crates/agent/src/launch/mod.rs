@@ -679,6 +679,12 @@ pub trait LaunchChild: Send {
     fn kill(&mut self) -> io::Result<()>;
 }
 
+fn stop_executor(child: &mut dyn LaunchChild, launch_id: &str) {
+    if let Err(error) = child.kill() {
+        tracing::warn!(launch_id, %error, "failed to stop the executor process");
+    }
+}
+
 pub trait Executor: Send + Sync {
     fn spawn(
         &self,
@@ -983,9 +989,7 @@ async fn start_launch(
         launch_dir.join("pid"),
         format!("{} {}", child.pid(), child.start_time()),
     ) {
-        if let Err(error) = child.kill() {
-            tracing::warn!(launch_id, %error, "failed to stop the executor process");
-        }
+        stop_executor(child.as_mut(), &launch_id);
         return fail(&launch_dir, format!("record the launch pid: {error}"));
     }
 
@@ -1006,9 +1010,7 @@ async fn start_launch(
                 );
             }
             Err(error) => {
-                if let Err(error) = child.kill() {
-                    tracing::warn!(launch_id, %error, "failed to stop the executor process");
-                }
+                stop_executor(child.as_mut(), &launch_id);
                 return fail(&launch_dir, format!("watch wxc-exec: {error}"));
             }
         }
@@ -1070,7 +1072,8 @@ fn log_tail(log: &Path) -> String {
 }
 
 /// Watches the executor: copies new log lines to the daemon log, and on exit
-/// records it, stops the refresh and removes the launch directory.
+/// records it, stops the refresh and removes the launch directory, or stops it
+/// when it can no longer be watched.
 async fn poll_task(
     mut child: Box<dyn LaunchChild>,
     refresh: tokio::task::AbortHandle,
@@ -1088,10 +1091,8 @@ async fn poll_task(
             Ok(None) => continue,
             Ok(Some(code)) => Some(code),
             Err(error) => {
-                tracing::warn!(launch_id, %error, "lost track of the launch; treating it as exited");
-                if let Err(error) = child.kill() {
-                    tracing::warn!(launch_id, %error, "failed to stop the executor process");
-                }
+                tracing::warn!(launch_id, %error, "lost track of the launch; stopping it");
+                stop_executor(child.as_mut(), &launch_id);
                 None
             }
         };
