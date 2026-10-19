@@ -670,9 +670,12 @@ are not granted, so git fails closed in the box when a config uses them), `~\.cl
 `.git\hooks` and `.git\commondir` of the workspace repository (`.git\HEAD`
 stays writable so branch switches work).
 Each file or folder in that list is denied when it does not exist, so the box
-cannot create it in place (renaming a file into such a path is not yet tested), except for the git configuration files (granted when
+cannot create it in place, except for the git configuration files (granted when
 present, not emitted otherwise); a workspace without a `.claude` folder gets
 the folder denied as a whole; a workspace without `.git` cannot `git init` one.
+Residual risk: direct creation of those denied paths is blocked, but renaming a file
+into such a path succeeds; after that the file exists on disk (for example, an agent
+could rename a crafted git config into `<cwd>\HEAD` or `<cwd>\.git\commondir`).
 The daemon creates `~\.claude` if it is missing. Always denied:
 `~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
 `~\.ssh`, `~\.aws`, `~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
