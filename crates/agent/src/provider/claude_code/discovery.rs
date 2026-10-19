@@ -419,4 +419,25 @@ mod tests {
         assert!(managed_mcp_servers_from_value(&json!("\"nested\""), source).is_empty());
         assert!(managed_mcp_servers_from_value(&json!(42), source).is_empty());
     }
+
+    #[test]
+    fn hidden_dropin_managed_mcp_servers_are_not_inventoried() {
+        let root = tempfile::tempdir().unwrap();
+        let drop_in = root.path().join("managed-settings.d/50-agentdesktop.json");
+        let hidden_drop_in = root.path().join("managed-settings.d/.50-agentdesktop.json");
+
+        write_managed_servers(&drop_in, json!({ "visible": { "command": "npx" } }));
+        write_managed_servers(
+            &hidden_drop_in,
+            json!({ "hidden": { "command": "secret" } }),
+        );
+
+        let servers =
+            merged_managed_mcp_servers(&managed_settings_sources(Some(root.path()), &drop_in));
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "visible");
+        // Hidden drop-in servers should not be in the inventory
+        assert!(!servers.iter().any(|s| s.name == "hidden"));
+    }
 }

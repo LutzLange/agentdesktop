@@ -68,6 +68,10 @@ fn containment_info_is_available_for_a_user_mode_windows_daemon_with_the_executo
             executor: r"C:\mxc\x64\wxc-exec.exe".into(),
             available: true,
             error: None,
+            managed_settings_source: None,
+            managed_hooks_locked: false,
+            managed_mcp_locked: false,
+            managed_settings_error: None,
         }
     );
 }
@@ -1199,6 +1203,9 @@ fn launch(id: &str, started_at: u64) -> Launch {
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
         credential_expires_at_unix_seconds: None,
+        managed_settings_source: None,
+        managed_hooks_locked: false,
+        managed_mcp_locked: false,
     }
 }
 
@@ -1444,6 +1451,7 @@ struct FakeHost {
     state_dir: PathBuf,
     client_exe_dir: PathBuf,
     clock: Clock,
+    managed_file: Option<&'static str>,
 }
 
 impl LaunchHost for FakeHost {
@@ -1494,6 +1502,15 @@ impl LaunchHost for FakeHost {
 
     fn now(&self) -> u64 {
         self.clock.now()
+    }
+
+    fn managed_sources(&self) -> crate::provider::claude_code::managed::ManagedSources {
+        use crate::provider::claude_code::managed::ManagedSources;
+        ManagedSources {
+            hklm: None,
+            file: self.managed_file.map(|s| Ok(s.to_owned())),
+            drop_ins: Vec::new(),
+        }
     }
 }
 
@@ -1676,6 +1693,7 @@ struct Setup {
     peer: Option<PipePeer>,
     claude_installed: bool,
     credentials_must_not_be_reached: bool,
+    managed_file: Option<&'static str>,
 }
 
 impl Default for Setup {
@@ -1689,6 +1707,7 @@ impl Default for Setup {
             peer: None,
             claude_installed: true,
             credentials_must_not_be_reached: false,
+            managed_file: None,
         }
     }
 }
@@ -1756,11 +1775,19 @@ impl Harness {
                 executor: executor_path.display().to_string(),
                 available: true,
                 error: None,
+                managed_settings_source: None,
+                managed_hooks_locked: false,
+                managed_mcp_locked: false,
+                managed_settings_error: None,
             }),
             Availability::Unavailable(error) => Some(ContainmentInfo {
                 executor: executor_path.display().to_string(),
                 available: false,
                 error: Some(error.to_owned()),
+                managed_settings_source: None,
+                managed_hooks_locked: false,
+                managed_mcp_locked: false,
+                managed_settings_error: None,
             }),
             Availability::Missing => None,
         };
@@ -1802,6 +1829,7 @@ impl Harness {
                 state_dir: state_dir.clone(),
                 client_exe_dir,
                 clock: clock.clone(),
+                managed_file: setup.managed_file,
             }),
             registry: LaunchRegistry::new(),
             availability,
@@ -2687,6 +2715,52 @@ async fn the_executor_is_not_stopped_after_spawn_failure_early_exit_or_normal_ex
     assert_eq!(listed[0].exit_code, Some(7));
     assert!(!h.launch_dir(&launched.launch_id).exists());
     assert_eq!(h.executor.kills(), 0, "no kill after normal exit");
+}
+
+// PR 2c: per-launch managed-settings snapshot tests
+
+#[tokio::test(start_paused = true)]
+async fn launch_records_managed_settings_source_and_locks_when_present() {
+    let h = Harness::start(Setup {
+        managed_file: Some(r#"{"allowManagedHooksOnly":true}"#),
+        ..Setup::default()
+    })
+    .await;
+
+    let launched = h.launch_ok().await;
+    assert_eq!(
+        launched.managed_settings_source,
+        Some(agentdesktop_core::model::ManagedSettingsSource::File)
+    );
+    assert!(launched.managed_hooks_locked);
+    assert!(!launched.managed_mcp_locked);
+
+    let listed = h.listed().await;
+    assert_eq!(
+        listed[0].managed_settings_source,
+        Some(agentdesktop_core::model::ManagedSettingsSource::File)
+    );
+    assert!(listed[0].managed_hooks_locked);
+    assert!(!listed[0].managed_mcp_locked);
+}
+
+#[tokio::test(start_paused = true)]
+async fn launch_records_null_source_and_false_locks_when_managed_file_absent() {
+    let h = Harness::start(Setup {
+        managed_file: None,
+        ..Setup::default()
+    })
+    .await;
+
+    let launched = h.launch_ok().await;
+    assert_eq!(launched.managed_settings_source, None);
+    assert!(!launched.managed_hooks_locked);
+    assert!(!launched.managed_mcp_locked);
+
+    let listed = h.listed().await;
+    assert_eq!(listed[0].managed_settings_source, None);
+    assert!(!listed[0].managed_hooks_locked);
+    assert!(!listed[0].managed_mcp_locked);
 }
 
 // ----------------------------------------------------------------- Windows only

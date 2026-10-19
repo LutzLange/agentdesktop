@@ -84,6 +84,10 @@ pub fn containment_info(
         executor,
         available: error.is_none(),
         error,
+        managed_settings_source: None,
+        managed_hooks_locked: false,
+        managed_mcp_locked: false,
+        managed_settings_error: None,
     })
 }
 
@@ -707,6 +711,7 @@ pub trait LaunchHost: Send + Sync {
     fn program_files_claude(&self) -> Option<PathBuf>;
     fn client_exe_dir(&self) -> PathBuf;
     fn now(&self) -> u64;
+    fn managed_sources(&self) -> crate::provider::claude_code::managed::ManagedSources;
 }
 
 /// Running launches plus the last 32 exited ones. Clones share state.
@@ -1030,6 +1035,9 @@ async fn start_launch(
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
         credential_expires_at_unix_seconds: Some(input.credential.expires_at_unix_seconds),
+        managed_settings_source: None,
+        managed_hooks_locked: false,
+        managed_mcp_locked: false,
     };
     state.registry.insert(launch.clone());
     tracing::info!(launch_id, cwd = %launch.cwd.display(), "sandboxed launch started");
