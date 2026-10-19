@@ -36,6 +36,7 @@ use serde::Serialize;
 use crate::{api, secure_fs};
 
 pub mod host;
+pub mod integrity;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -707,6 +708,10 @@ pub trait LaunchHost: Send + Sync {
     fn program_files_claude(&self) -> Option<PathBuf>;
     fn client_exe_dir(&self) -> PathBuf;
     fn now(&self) -> u64;
+
+    fn integrity_fs(&self) -> Arc<dyn integrity::IntegrityFs> {
+        Arc::new(integrity::REAL_FS)
+    }
 }
 
 /// Running launches plus the last 32 exited ones. Clones share state.
@@ -772,6 +777,16 @@ impl LaunchRegistry {
             .find(|launch| launch.launch_id == launch_id)
         {
             launch.credential_expires_at_unix_seconds = Some(expires_at);
+        }
+    }
+
+    pub fn set_integrity_drift(&self, launch_id: &str) {
+        if let Some(launch) = self
+            .lock()
+            .iter_mut()
+            .find(|launch| launch.launch_id == launch_id)
+        {
+            launch.integrity_drift = true;
         }
     }
 
@@ -1030,6 +1045,7 @@ async fn start_launch(
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
         credential_expires_at_unix_seconds: Some(input.credential.expires_at_unix_seconds),
+        integrity_drift: false,
     };
     state.registry.insert(launch.clone());
     tracing::info!(launch_id, cwd = %launch.cwd.display(), "sandboxed launch started");

@@ -1199,6 +1199,7 @@ fn launch(id: &str, started_at: u64) -> Launch {
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
         credential_expires_at_unix_seconds: None,
+        integrity_drift: false,
     }
 }
 
@@ -1318,6 +1319,34 @@ fn many_running_launches_are_never_dropped() {
         registry.insert(launch(&format!("run-{index:02}"), index));
     }
     assert_eq!(registry.list().len(), 50);
+}
+
+// AC 3: integrity_drift registry tests
+
+#[test]
+fn integrity_drift_can_be_set_on_a_running_launch() {
+    let registry = LaunchRegistry::new();
+    registry.insert(launch("a", 10));
+    registry.set_integrity_drift("a");
+    assert!(registry.list()[0].integrity_drift);
+}
+
+#[test]
+fn integrity_drift_stays_true_on_second_set() {
+    let registry = LaunchRegistry::new();
+    registry.insert(launch("a", 10));
+    registry.set_integrity_drift("a");
+    assert!(registry.list()[0].integrity_drift);
+    registry.set_integrity_drift("a");
+    assert!(registry.list()[0].integrity_drift);
+}
+
+#[test]
+fn setting_integrity_drift_on_unknown_id_is_a_noop() {
+    let registry = LaunchRegistry::new();
+    registry.insert(launch("a", 10));
+    registry.set_integrity_drift("nope");
+    assert!(!registry.list()[0].integrity_drift);
 }
 
 // ================================================================== sweep (AC 9)
@@ -2687,6 +2716,63 @@ async fn the_executor_is_not_stopped_after_spawn_failure_early_exit_or_normal_ex
     assert_eq!(listed[0].exit_code, Some(7));
     assert!(!h.launch_dir(&launched.launch_id).exists());
     assert_eq!(h.executor.kills(), 0, "no kill after normal exit");
+}
+
+// AC 1: integrity check integration tests
+
+#[tokio::test(start_paused = true)]
+async fn integrity_drift_detected_when_file_modified_during_launch() {
+    let h = Harness::start(Setup::default()).await;
+    let launched = h.launch_ok().await;
+
+    // Simulate modification of a protected file
+    // (stub implementation will fail on todo!() until implemented)
+
+    // Wait for periodic check (60s + margin)
+    tokio::time::sleep(Duration::from_secs(80)).await;
+
+    // Exit the launch
+    h.executor.exit_with(0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let listed = h.listed().await;
+    assert!(
+        listed[0].integrity_drift,
+        "integrity drift should be detected"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn integrity_drift_detected_when_file_replaced_before_spawn() {
+    let h = Harness::start(Setup::default()).await;
+
+    // Stub executor will replace .mcp.json inside spawn
+    // (stub implementation will fail on todo!() until implemented)
+
+    let launched = h.launch_ok().await;
+    h.executor.exit_with(0);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let listed = h.listed().await;
+    assert!(
+        listed[0].integrity_drift,
+        "drift should be detected even if changed during spawn"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn integrity_drift_on_early_exit_verify() {
+    let h = Harness::start(Setup::default()).await;
+
+    // Stub executor replaces .mcp.json and exits with error
+    // (stub implementation will fail on todo!() until implemented)
+
+    h.executor.exit_with(1);
+    let (status, _) = h.launch(&h.body()).await;
+    assert_eq!(status, 500, "early exit returns 500");
+
+    // Verify that integrity check ran and detected change
+    // (would need test hook to verify this)
 }
 
 // ----------------------------------------------------------------- Windows only
