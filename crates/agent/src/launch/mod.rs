@@ -57,6 +57,7 @@ const LOG_TAIL: usize = 4096;
 /// Startup snapshot for `daemon-info`. `None` when `daemon.containment` is
 /// unconfigured; otherwise `available` only with
 /// `user && windows && exists(executor) && !claude_settings_overridden`.
+/// The managed-settings posture fields are filled per request by `api::daemon_info`.
 pub fn containment_info(
     cfg: Option<&ContainmentStartupConfig>,
     user: bool,
@@ -979,6 +980,25 @@ async fn start_launch(
         Ok(path) => path,
         Err(error) => return fail(&launch_dir, format!("prepare launch: {error:#}")),
     };
+
+    // Snapshot the managed-settings posture before spawning the executor
+    let managed_posture = {
+        let host_clone = host.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::provider::claude_code::managed::managed_settings_state(
+                &host_clone.managed_sources(),
+            )
+        })
+        .await
+        {
+            Ok(posture) => posture,
+            Err(error) => {
+                tracing::warn!(launch_id = %launch_id, "failed to join managed-settings posture task: {error:#}");
+                crate::provider::claude_code::managed::ManagedSettingsPosture::default()
+            }
+        }
+    };
+
     let mut child =
         match state
             .executor
@@ -1035,9 +1055,9 @@ async fn start_launch(
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
         credential_expires_at_unix_seconds: Some(input.credential.expires_at_unix_seconds),
-        managed_settings_source: None,
-        managed_hooks_locked: false,
-        managed_mcp_locked: false,
+        managed_settings_source: managed_posture.source,
+        managed_hooks_locked: managed_posture.hooks_locked,
+        managed_mcp_locked: managed_posture.mcp_locked,
     };
     state.registry.insert(launch.clone());
     tracing::info!(launch_id, cwd = %launch.cwd.display(), "sandboxed launch started");

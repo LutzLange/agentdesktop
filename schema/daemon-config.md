@@ -59,6 +59,12 @@
 |`llmGateway.whenProxyUnavailable`|enum|What the programs behind the local LLM proxy (`programs.copilot`,<br>`programs.vscode`) do while the daemon runs without that proxy:<br>`failClosed` (the default) leaves their managed entries in place, so<br>the tools stay pointed at the loopback port and fail instead<br>of falling back to GitHub past the gateway (with no entries in place<br>yet, the tools keep their own settings); `failOpen` removes them<br>until the proxy is back (VS Code on `githubModels` then talks to GitHub<br>directly, the Copilot CLI and VS Code on `ownModels` lose the gateway's<br>models).<br>Possible values: `failClosed`, `failOpen`.|
 |`programs`|object|Per-program settings reconciled on this device.|
 |`programs.claudeCode`|object|Claude Code managed-settings configuration. Arbitrary keys are passed through directly.|
+|`programs.claudeCode.allowManagedHooksOnly`|boolean|Allow only managed hooks. Claude Code reads this only from managed sources.<br>Unset: not written to Claude Code's settings.|
+|`programs.claudeCode.allowManagedMcpServersOnly`|boolean|Allow only managed MCP servers. Claude Code reads this only from managed sources.<br>Unset: not written to Claude Code's settings.|
+|`programs.claudeCode.allowedMcpServers`|[]object|Allowed MCP servers list. Unset: not written to Claude Code's settings.|
+|`programs.claudeCode.allowedMcpServers[].serverName`|string|User-assigned label; not a security control.|
+|`programs.claudeCode.allowedMcpServers[].serverCommand`|[]string|Command array, must be non-empty.|
+|`programs.claudeCode.allowedMcpServers[].serverUrl`|string|Server URL, must be non-empty.|
 |`programs.claudeCode.auth`|enum|Upstream authentication used by this agent.<br>Possible values: `subscription`.|
 |`programs.claudeCode.useLlmGateway`|boolean|Whether this program uses the top-level LLM gateway.|
 |`programs.claudeDesktop`|object|Claude Desktop managed configuration. Arbitrary keys are passed through directly.|

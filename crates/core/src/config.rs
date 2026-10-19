@@ -735,6 +735,7 @@ impl ProgramsConfig {
 
 /// MCP server allowlist entry for `allowedMcpServers`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum McpServerRule {
     /// User-assigned label; not a security control.
@@ -778,7 +779,38 @@ pub struct ClaudeCodeConfig {
 impl ClaudeCodeConfig {
     /// Called from daemon config validation, so the controller refuses the config before any device sees it.
     pub fn validate(&self) -> anyhow::Result<()> {
-        todo!("ClaudeCodeConfig::validate not yet implemented")
+        if let Some(servers) = &self.allowed_mcp_servers {
+            for (i, rule) in servers.iter().enumerate() {
+                match rule {
+                    McpServerRule::ServerName(name) => {
+                        if name.is_empty()
+                            || !name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        {
+                            anyhow::bail!(
+                                "programs.claudeCode.allowedMcpServers[{i}]: serverName must match [A-Za-z0-9_-]+"
+                            );
+                        }
+                    }
+                    McpServerRule::ServerCommand(cmd) => {
+                        if cmd.is_empty() {
+                            anyhow::bail!(
+                                "programs.claudeCode.allowedMcpServers[{i}]: serverCommand must be a non-empty array"
+                            );
+                        }
+                    }
+                    McpServerRule::ServerUrl(url) => {
+                        if url.trim().is_empty() {
+                            anyhow::bail!(
+                                "programs.claudeCode.allowedMcpServers[{i}]: serverUrl must be non-empty"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1610,6 +1642,9 @@ fn validate_daemon(
             }
         }
     }
+    if let Some(claude_code) = &programs.claude_code {
+        claude_code.validate()?;
+    }
     Ok(())
 }
 
@@ -2322,7 +2357,7 @@ programs:
         .expect("absolute executor");
     }
 
-    // Tests for PR 2c: managed-settings lock validation
+    // Managed-settings lock validation tests
 
     #[test]
     fn claudecode_config_accepts_both_boolean_locks() {
@@ -2439,6 +2474,24 @@ programs:
         assert!(
             msg.contains("programs.claudeCode.allowedMcpServers[0]"),
             "error should name the path: {msg}"
+        );
+
+        // serverName empty
+        let yaml_empty_name = r#"
+programs:
+  claudeCode:
+    allowedMcpServers:
+      - serverName: ""
+"#;
+        let error = parse_daemon(yaml_empty_name).expect_err("empty server name");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("programs.claudeCode.allowedMcpServers[0]"),
+            "error should name the path: {msg}"
+        );
+        assert!(
+            msg.contains("serverName must match"),
+            "error should explain the rule: {msg}"
         );
 
         // serverUrl empty

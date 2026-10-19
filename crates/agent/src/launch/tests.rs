@@ -2717,7 +2717,7 @@ async fn the_executor_is_not_stopped_after_spawn_failure_early_exit_or_normal_ex
     assert_eq!(h.executor.kills(), 0, "no kill after normal exit");
 }
 
-// PR 2c: per-launch managed-settings snapshot tests
+// Per-launch managed-settings snapshot tests
 
 #[tokio::test(start_paused = true)]
 async fn launch_records_managed_settings_source_and_locks_when_present() {

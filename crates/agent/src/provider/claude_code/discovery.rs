@@ -76,7 +76,7 @@ fn skill_roots() -> Vec<PathBuf> {
     roots.into_iter().collect()
 }
 
-fn managed_root() -> Option<PathBuf> {
+pub(super) fn managed_root() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     return Some(PathBuf::from("/etc/claude-code"));
     #[cfg(target_os = "macos")]
@@ -87,7 +87,7 @@ fn managed_root() -> Option<PathBuf> {
 
 /// `managed-settings.json` followed by the `managed-settings.d/*.json` drop-ins in the
 /// lexical order Claude Code merges them.
-fn managed_settings_files(root: &Path) -> Vec<PathBuf> {
+pub(super) fn managed_settings_files(root: &Path) -> Vec<PathBuf> {
     let mut files = vec![root.join("managed-settings.json")];
     if let Ok(entries) = fs::read_dir(root.join("managed-settings.d")) {
         let mut drop_ins: Vec<PathBuf> = entries
@@ -96,6 +96,10 @@ fn managed_settings_files(root: &Path) -> Vec<PathBuf> {
             .filter(|path| {
                 path.extension()
                     .is_some_and(|extension| extension == "json")
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| !name.starts_with('.'))
             })
             .collect();
         drop_ins.sort();
