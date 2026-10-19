@@ -1071,9 +1071,9 @@ fn log_tail(log: &Path) -> String {
     String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
-/// Watches the executor: copies new log lines to the daemon log, and on exit
-/// records it, stops the refresh and removes the launch directory, or stops it
-/// when it can no longer be watched.
+/// Watches the executor: copies new log lines to the daemon log. When it exits,
+/// or when it can no longer be watched (then it is stopped first), records the
+/// exit, stops the refresh and removes the launch directory.
 async fn poll_task(
     mut child: Box<dyn LaunchChild>,
     refresh: tokio::task::AbortHandle,
