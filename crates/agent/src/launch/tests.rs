@@ -26,8 +26,8 @@ use agentdesktop_core::{
 use async_trait::async_trait;
 use axum::http::StatusCode;
 
-use super::*;
 use super::engine::mxc::build_request;
+use super::*;
 
 // --- Log capture helper for session logging test (AC 2)
 
@@ -112,7 +112,10 @@ fn executor_cfg(path: &str) -> ContainmentStartupConfig {
 
 #[test]
 fn containment_info_is_absent_when_unconfigured() {
-    assert_eq!(containment_info(None, true, true, false, &|_| true, "mxc"), None);
+    assert_eq!(
+        containment_info(None, true, true, false, &|_| true, "mxc"),
+        None
+    );
 }
 
 #[test]
@@ -155,10 +158,17 @@ fn containment_info_is_windows_only() {
 fn containment_info_names_a_missing_executor() {
     let cfg = executor_cfg(r"C:\missing\wxc-exec.exe");
     let seen = RefCell::new(Vec::new());
-    let info = containment_info(Some(&cfg), true, true, false, &|path| {
-        seen.borrow_mut().push(path.to_owned());
-        false
-    }, "mxc")
+    let info = containment_info(
+        Some(&cfg),
+        true,
+        true,
+        false,
+        &|path| {
+            seen.borrow_mut().push(path.to_owned());
+            false
+        },
+        "mxc",
+    )
     .unwrap();
     assert!(!info.available);
     assert_eq!(
@@ -3513,8 +3523,8 @@ fn copy_log_lines_uses_raw_byte_offset_not_lossy_string_offset() {
 
 #[test]
 fn the_engine_reproduces_the_baseline_request_bytes() {
-    use engine::mxc::MxcEngine;
     use engine::Engine;
+    use engine::mxc::MxcEngine;
     use profile::CLAUDE_CODE;
 
     const LAUNCH_ID: &str = "0123456789abcdef";
@@ -3762,7 +3772,8 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
 
     // Fixture (a)
     let exists_a = |path: &Path| snapshot_existing().contains(path.to_str().expect("UTF-8 path"));
-    let is_dir_a = |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
+    let is_dir_a =
+        |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
     let input_a = launch_input(&exists_a, &is_dir_a);
     let plan_a = plan(&input_a, &CLAUDE_CODE);
     let bytes_a = MxcEngine.request(&plan_a, LAUNCH_ID).unwrap();
@@ -3770,7 +3781,8 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
 
     // Fixture (b)
     let exists_b = |path: &Path| snapshot_existing().contains(path.to_str().expect("UTF-8 path"));
-    let is_dir_b = |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
+    let is_dir_b =
+        |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
     let mut input_b = launch_input(&exists_b, &is_dir_b);
     input_b.egress = agentdesktop_core::config::ContainmentEgress::Deny;
     let plan_b = plan(&input_b, &CLAUDE_CODE);
@@ -3788,7 +3800,9 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
         args: vec![],
         home: PathBuf::from(r"C:\Users\dev"),
         state_dir: PathBuf::from(r"C:\Users\dev\.local/state\agentdesktop"),
-        launch_dir: PathBuf::from(r"C:\Users\dev\.local/state\agentdesktop\launches\0123456789abcdef"),
+        launch_dir: PathBuf::from(
+            r"C:\Users\dev\.local/state\agentdesktop\launches\0123456789abcdef",
+        ),
         git_dir: None,
         program_files_claude: None,
         egress: agentdesktop_core::config::ContainmentEgress::Allow,
@@ -3807,7 +3821,7 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
 fn engine_selection_absent_key_defaults_to_mxc() {
     use agentdesktop_core::config::ContainmentEngine;
     let json = r#"{"executor": "C:\\path\\to\\wxc-exec.exe"}"#;
-    let cfg: agentdesktop_core::config::ContainmentStartupConfig = 
+    let cfg: agentdesktop_core::config::ContainmentStartupConfig =
         serde_json::from_str(json).unwrap();
     assert_eq!(cfg.engine, ContainmentEngine::Mxc);
 }
@@ -3815,18 +3829,22 @@ fn engine_selection_absent_key_defaults_to_mxc() {
 #[test]
 fn engine_selection_unknown_value_fails() {
     let json = r#"{"executor": "C:\\path\\to\\wxc-exec.exe", "engine": "unknown"}"#;
-    let result: Result<agentdesktop_core::config::ContainmentStartupConfig, _> = 
+    let result: Result<agentdesktop_core::config::ContainmentStartupConfig, _> =
         serde_json::from_str(json);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("mxc"), "error should name accepted values: {}", err);
+    assert!(
+        err.contains("mxc"),
+        "error should name accepted values: {}",
+        err
+    );
 }
 
 #[test]
 fn posture_carries_engine_name() {
-    use engine::mxc::MxcEngine;
     use engine::Engine;
-    
+    use engine::mxc::MxcEngine;
+
     let info = containment_info(
         Some(&agentdesktop_core::config::ContainmentStartupConfig {
             executor: p("path/to/wxc-exec.exe"),
@@ -3844,9 +3862,9 @@ fn posture_carries_engine_name() {
 
 #[test]
 fn posture_carries_engine_when_containment_unavailable() {
-    use engine::mxc::MxcEngine;
     use engine::Engine;
-    
+    use engine::mxc::MxcEngine;
+
     let info = containment_info(
         Some(&agentdesktop_core::config::ContainmentStartupConfig {
             executor: p("path/to/missing.exe"),
@@ -3866,29 +3884,35 @@ fn posture_carries_engine_when_containment_unavailable() {
 
 #[test]
 fn mxc_engine_name_is_mxc() {
-    use engine::mxc::MxcEngine;
     use engine::Engine;
+    use engine::mxc::MxcEngine;
     assert_eq!(MxcEngine.name(), "mxc");
 }
 
 #[test]
 fn mxc_engine_container_id() {
-    use engine::mxc::MxcEngine;
     use engine::Engine;
-    assert_eq!(MxcEngine.container_id("0123456789abcdef"), "agentdesktop-0123456789abcdef");
+    use engine::mxc::MxcEngine;
+    assert_eq!(
+        MxcEngine.container_id("0123456789abcdef"),
+        "agentdesktop-0123456789abcdef"
+    );
 }
 
 #[test]
 fn plan_yields_expected_env_keys() {
     use profile::CLAUDE_CODE;
-    
+
     let exists = |path: &Path| snapshot_existing().contains(path.to_str().expect("UTF-8 path"));
     let is_dir = |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
     let input = launch_input(&exists, &is_dir);
     let plan_result = plan(&input, &CLAUDE_CODE);
-    
+
     // Check that plan has the relay URL and pairing in env
     assert!(plan_result.env.contains_key("ANTHROPIC_BASE_URL"));
     assert!(plan_result.env.contains_key("ANTHROPIC_CUSTOM_HEADERS"));
-    assert_eq!(plan_result.env.get("ANTHROPIC_BASE_URL").unwrap(), "http://127.0.0.1:4000/sandbox");
+    assert_eq!(
+        plan_result.env.get("ANTHROPIC_BASE_URL").unwrap(),
+        "http://127.0.0.1:4000/sandbox"
+    );
 }

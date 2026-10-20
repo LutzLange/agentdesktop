@@ -1,9 +1,6 @@
 //! Launch plan: the resolved launch inputs before engine-specific envelope.
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use agentdesktop_core::config::ContainmentEgress;
 

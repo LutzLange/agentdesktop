@@ -2,12 +2,12 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::launch::{LaunchInput, plan::LaunchPlan};
-use crate::launch::profile::CLAUDE_CODE;
 use super::Engine;
+use crate::launch::profile::CLAUDE_CODE;
+use crate::launch::{LaunchInput, plan::LaunchPlan};
 
 /// MXC sandbox engine.
 pub(crate) struct MxcEngine;
@@ -21,14 +21,62 @@ impl Engine for MxcEngine {
         format!("agentdesktop-{}", launch_id)
     }
 
-    fn request(&self, _plan: &LaunchPlan, _launch_id: &str) -> Result<Vec<u8>> {
-        todo!()
+    fn request(&self, plan: &LaunchPlan, launch_id: &str) -> Result<Vec<u8>> {
+        serde_json::to_vec_pretty(&self.to_request(plan, launch_id)).context("encode MXC request")
     }
 }
 
 impl MxcEngine {
-    fn to_request(&self, _plan: &LaunchPlan, _launch_id: &str) -> MxcRequest {
-        todo!()
+    /// Wraps a resolved plan in the MXC request envelope. Pure: the plan is
+    /// final, nothing is read from the host.
+    pub(crate) fn to_request(&self, plan: &LaunchPlan, launch_id: &str) -> MxcRequest {
+        let cwd = win(&plan.cwd);
+        let mut command_line = format!(
+            "cmd.exe /d /v:off /c start \"{}\" /WAIT /D \"{cwd}\" \"{}\"",
+            plan.window_title,
+            win(&plan.program)
+        );
+        for arg in &plan.args {
+            command_line.push(' ');
+            command_line.push_str(arg);
+        }
+        MxcRequest {
+            version: "1.0.0".into(),
+            containment: "processcontainer".into(),
+            container_id: self.container_id(launch_id),
+            ui: MxcUi {
+                disable: false,
+                clipboard: "none".into(),
+                injection: false,
+            },
+            process: MxcProcess {
+                command_line,
+                cwd,
+                inherit_default_env: false,
+                env: plan
+                    .env
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect(),
+            },
+            filesystem: MxcFilesystem {
+                readwrite_paths: plan.readwrite.iter().map(|path| win(path)).collect(),
+                readonly_paths: plan.readonly.iter().map(|path| win(path)).collect(),
+                denied_paths: plan.denied.iter().map(|path| win(path)).collect(),
+            },
+            network: MxcNetwork {
+                egress: MxcEgress {
+                    default: match plan.egress {
+                        agentdesktop_core::config::ContainmentEgress::Allow => "allow".into(),
+                        agentdesktop_core::config::ContainmentEgress::Deny => "deny".into(),
+                    },
+                },
+                ingress: MxcIngress {
+                    default: "allow".into(),
+                    host_loopback: "allow".into(),
+                },
+            },
+        }
     }
 }
 
@@ -96,194 +144,10 @@ fn win(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\")
 }
 
-fn join(base: &str, rest: &str) -> String {
-    format!("{}\\{rest}", base.trim_end_matches('\\'))
-}
-
-/// Builds the MXC request. Pure: no host environment or filesystem reads
-/// beyond `input.exists` and `input.is_dir`.
+/// Builds the MXC request from a launch input: the resolved plan through the
+/// MXC envelope as one call. Production goes through `plan` and the
+/// [`Engine`] stored in `LaunchState`; the tests call this shim.
+#[allow(dead_code)]
 pub(crate) fn build_request(input: &LaunchInput) -> MxcRequest {
-    let exists = |path: &str| (input.exists)(Path::new(path));
-    let is_dir = |path: &str| (input.is_dir)(Path::new(path));
-    let cwd = win(&input.cwd);
-    let home = win(&input.home);
-    let launch_dir = win(&input.launch_dir);
-    let executable = win(&input.executable);
-    let client_exe_dir = win(&input.client_exe_dir);
-    let exe_dir = executable
-        .rsplit_once('\\')
-        .map(|(dir, _)| dir.to_owned())
-        .unwrap_or_default();
-    let git_dir = input.git_dir.as_deref().map(win);
-    let program_files_claude = input.program_files_claude.as_deref().map(win);
-    let claude_dir = join(&home, ".claude");
-    let tmp = join(&launch_dir, "tmp");
-
-    let system_root = input
-        .base_env
-        .get("SystemRoot")
-        .cloned()
-        .unwrap_or_else(|| r"C:\Windows".to_owned());
-    let mut path = vec![
-        join(&system_root, "System32"),
-        system_root.clone(),
-        join(&system_root, r"System32\WindowsPowerShell\v1.0"),
-    ];
-    if let Some(git_dir) = &git_dir {
-        path.push(join(git_dir, "cmd"));
-    }
-    path.push(exe_dir.clone());
-    path.push(client_exe_dir.clone());
-
-    let mut env = input.base_env.clone();
-    env.insert("TERM".into(), "xterm-256color".into());
-    env.insert("PATH".into(), path.join(";"));
-    env.insert("TEMP".into(), tmp.clone());
-    env.insert("TMP".into(), tmp.clone());
-    env.insert("CLAUDE_CONFIG_DIR".into(), claude_dir.clone());
-    env.insert("CLAUDE_CODE_USE_POWERSHELL_TOOL".into(), "1".into());
-    env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
-    env.insert(
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
-        "1".into(),
-    );
-    env.insert("ANTHROPIC_BASE_URL".into(), input.relay_base_url.clone());
-    env.insert("ANTHROPIC_AUTH_TOKEN".into(), "placeholder".into());
-    env.insert(
-        "ANTHROPIC_CUSTOM_HEADERS".into(),
-        format!("{}: {}", crate::llm_proxy::PAIRING_HEADER, input.pairing),
-    );
-    env.insert("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".into(), "1".into());
-    env.insert("HOME".into(), home.clone());
-
-    let mut command_line = format!(
-        "cmd.exe /d /v:off /c start \"agentdesktop: claude\" /WAIT /D \"{cwd}\" \"{executable}\""
-    );
-    for arg in &input.args {
-        command_line.push(' ');
-        command_line.push_str(arg);
-    }
-
-    let mut readonly: Vec<String> = Vec::new();
-    let mut denied: Vec<String> = Vec::new();
-    // Runtime directories: granted read-only when they exist, simply absent
-    // otherwise (nothing the box could create there matters).
-    let runtime = [
-        Some(exe_dir),
-        Some(join(&home, r".local\share\claude")),
-        git_dir,
-        Some(client_exe_dir),
-        program_files_claude,
-        // git reads the user's configuration before anything else; unreadable
-        // means every git command fails in the box (lab L4e).
-        Some(join(&home, ".gitconfig")),
-        Some(join(&home, r".config\git\config")),
-    ];
-    for candidate in runtime.into_iter().flatten() {
-        if exists(&candidate) && !readonly.contains(&candidate) {
-            readonly.push(candidate);
-        }
-    }
-    // Executable configuration: read-only when present, denied when absent, so
-    // the box can neither change nor create it.
-    let mut executable_config = vec![
-        join(&claude_dir, "settings.json"),
-        join(&claude_dir, "hooks"),
-        join(&claude_dir, "plugins"),
-        join(&cwd, ".mcp.json"),
-        // A `HEAD` file at the workspace root would let git treat the
-        // workspace itself as a bare repository with box-written config.
-        join(&cwd, "HEAD"),
-    ];
-    // MXC refuses a denied path whose parent folder does not exist
-    // (lab-verified, 0x80070003), so a workspace without `.claude` gets the
-    // folder itself denied instead of its three executable-config entries.
-    let workspace_claude = join(&cwd, ".claude");
-    let workspace_claude_entries = [
-        join(&workspace_claude, "settings.json"),
-        join(&workspace_claude, "settings.local.json"),
-        join(&workspace_claude, "hooks"),
-    ];
-    if exists(&workspace_claude) || workspace_claude_entries.iter().any(|path| exists(path)) {
-        executable_config.extend(workspace_claude_entries);
-    } else {
-        denied.push(workspace_claude);
-    }
-    let git = join(&cwd, ".git");
-    if !exists(&git) {
-        // No repository: deny `.git` so the box cannot `git init` one that
-        // the user's tools later trust.
-        denied.push(git);
-    } else if is_dir(&git) {
-        // A `.git` directory: emit config, hooks and commondir guards whether
-        // or not they exist. An empty directory gets the same guards as a
-        // populated repository (prevents `git init` into an existing empty
-        // folder). `.git\HEAD` stays writable: git replaces it by rename on
-        // every branch switch, and the root `HEAD` rule already blocks a
-        // bare-repo fall-through.
-        executable_config.push(join(&git, "config"));
-        executable_config.push(join(&git, "hooks"));
-        executable_config.push(join(&git, "commondir"));
-    }
-    // A `.git` file (worktree, submodule) is left as it is.
-    for path in executable_config {
-        if exists(&path) {
-            readonly.push(path);
-        } else {
-            denied.push(path);
-        }
-    }
-    for secret in [
-        join(&claude_dir, ".credentials.json"),
-        join(&claude_dir, "history.jsonl"),
-        // IDE lock files carry auth tokens for the editor bridge.
-        join(&claude_dir, "ide"),
-        join(&home, ".ssh"),
-        join(&home, ".aws"),
-        join(&home, ".azure"),
-        join(&home, ".kube"),
-    ] {
-        denied.push(secret);
-    }
-
-    MxcRequest {
-        version: "1.0.0".into(),
-        containment: "processcontainer".into(),
-        container_id: format!("agentdesktop-{}", input.launch_id),
-        ui: MxcUi {
-            disable: false,
-            clipboard: "none".into(),
-            injection: false,
-        },
-        process: MxcProcess {
-            command_line,
-            cwd: cwd.clone(),
-            inherit_default_env: false,
-            env: env
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect(),
-        },
-        filesystem: MxcFilesystem {
-            readwrite_paths: vec![
-                cwd,
-                claude_dir,
-                tmp,
-            ],
-            readonly_paths: readonly,
-            denied_paths: denied,
-        },
-        network: MxcNetwork {
-            egress: MxcEgress {
-                default: match input.egress {
-                    agentdesktop_core::config::ContainmentEgress::Allow => "allow".into(),
-                    agentdesktop_core::config::ContainmentEgress::Deny => "deny".into(),
-                },
-            },
-            ingress: MxcIngress {
-                default: "allow".into(),
-                host_loopback: "allow".into(),
-            },
-        },
-    }
+    MxcEngine.to_request(&crate::launch::plan(input, &CLAUDE_CODE), &input.launch_id)
 }

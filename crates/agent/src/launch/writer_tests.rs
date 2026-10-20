@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::*;
 use super::engine::mxc::build_request;
+use super::*;
 
 #[test]
 fn the_user_mode_pipe_admits_system_and_the_daemon_user_only() {
@@ -146,6 +146,7 @@ mod handler {
     use async_trait::async_trait;
     use axum::{Json, extract::State, http::StatusCode};
 
+    use super::super::engine::mxc::build_request;
     use super::super::*;
 
     /// Maps a request path (`\`-joined, possibly mixed) back to the real

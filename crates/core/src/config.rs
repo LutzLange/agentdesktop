@@ -2275,6 +2275,7 @@ programs:
         super::ContainmentStartupConfig {
             executor: executor.into(),
             egress: super::ContainmentEgress::default(),
+            engine: super::ContainmentEngine::default(),
         }
     }
 
@@ -2674,6 +2675,7 @@ programs:
         let cfg = super::ContainmentStartupConfig {
             executor: std::path::PathBuf::from("/x/wxc-exec"),
             egress: super::ContainmentEgress::Allow,
+            engine: super::ContainmentEngine::default(),
         };
         let json = serde_json::to_value(&cfg).unwrap();
         assert!(
@@ -2684,6 +2686,7 @@ programs:
         let cfg_deny = super::ContainmentStartupConfig {
             executor: std::path::PathBuf::from("/x/wxc-exec"),
             egress: super::ContainmentEgress::Deny,
+            engine: super::ContainmentEngine::default(),
         };
         let json_deny = serde_json::to_value(&cfg_deny).unwrap();
         assert_eq!(
