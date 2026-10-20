@@ -2789,6 +2789,68 @@ async fn launch_records_null_source_and_false_locks_when_posture_has_error() {
     assert!(!listed[0].managed_mcp_locked);
 }
 
+#[tokio::test(start_paused = true)]
+async fn launch_logs_posture_error_as_warning() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Capture logs in a shared buffer
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let logs_writer = logs.clone();
+
+    let subscriber = tracing_subscriber::registry().with(
+        fmt::layer()
+            .with_writer(move || LogWriter(logs_writer.clone()))
+            .with_ansi(false),
+    );
+
+    // Set as global default for this test's duration
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let h = Harness::start(Setup {
+        managed_file_error: Some("access denied"),
+        ..Setup::default()
+    })
+    .await;
+
+    let _launched = h.launch_ok().await;
+
+    // Verify the posture-error warn was emitted
+    let log_bytes = logs.lock().unwrap();
+    let log_output = String::from_utf8_lossy(&log_bytes);
+    assert!(
+        log_output.contains("WARN"),
+        "Expected WARN level in logs, got:\n{}",
+        log_output
+    );
+    assert!(
+        log_output.contains("managed-settings posture could not be determined at launch"),
+        "Expected posture error message in logs"
+    );
+    assert!(
+        log_output.contains("error=file:"),
+        "Expected error field to name the failing source"
+    );
+    // The error message itself (like "cannot read: access denied") is fine;
+    // we're protecting against document-content leakage (e.g., raw JSON).
+    // This test uses a read-error scenario, so no document exists to leak.
+}
+
+/// Writer adapter for capturing tracing output
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
 // ----------------------------------------------------------------- Windows only
 
 #[cfg(windows)]

@@ -814,9 +814,10 @@ daemon-info request, so a system-daemon push shows up on the next GET) via
 `managedMcpLocked` (both boolean), and `managedSettingsError` (present when the posture
 cannot be determined); each launch records the same three fields reflecting the policy
 in force when it started, or source `null` and both lock fields `false` when the posture
-could not be determined at launch time (a read error or invalid JSON in an admin source);
-daemon-info is the surface that reports the error, and the daemon logs a warning when
-a posture error occurs during launch. Server-managed settings (from claude.ai or a Claude apps
+could not be determined at launch time (a read error, invalid JSON, or an empty HKLM value
+in an admin source); daemon-info is the surface that reports the error, and the daemon logs
+a warning when a posture error occurs during launch. Server-managed settings (from claude.ai
+or a Claude apps
 gateway) rank above HKLM and the file tier when a session authenticates to Anthropic's
 API directly or signs in to a gateway; outside the box they apply to unboxed sessions,
 not to launches inside the box. The posture model assumes Claude Code 2.1.273 or later.
