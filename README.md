@@ -729,7 +729,11 @@ repository), `.mcp.json`, the workspace-root `HEAD`, and `.git\config`, `.git\ho
 and `.git\commondir`. The boxed agent can
 change them, and the next unboxed session reads them (Claude Code outside the box;
 git outside the box, where `core.fsmonitor` and `core.hooksPath` run code). The
-read-only grant stops in-place writes but not replacement. Files the agent creates
+read-only grant stops in-place writes but not replacement. The daemon's own
+directory (and the launched program's directory) is granted read-only recursively,
+so running a portable `agentdesktop.exe` or `claude.exe` from inside the profile
+widens that grant to everything under it except the denied entries (install under
+Program Files, the MSI default, to keep the grant narrow). Files the agent creates
 in the workspace are not gated yet; nested repositories under the workspace, a
 renamed or recreated `.git` or `.claude` directory, and editor task files such as
 `.vscode\tasks.json` are not protected; `~\.claude\.claude.json` (user-scope

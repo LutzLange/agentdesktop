@@ -1116,11 +1116,13 @@ fn copy_log_lines(launch_id: &str, log_path: &Path, offset: u64) -> u64 {
     if file.read_to_end(&mut bytes).is_err() {
         return offset;
     }
-    let text = String::from_utf8_lossy(&bytes);
-    let Some(complete) = text.rfind('\n') else {
+    // Find the last newline in the raw bytes (not in the lossy string) so
+    // non-UTF-8 bytes don't shift the file offset.
+    let Some(complete) = bytes.iter().rposition(|&byte| byte == b'\n') else {
         return offset;
     };
-    for line in text[..complete].lines() {
+    let text = String::from_utf8_lossy(&bytes[..complete]);
+    for line in text.lines() {
         tracing::info!(launch_id, "wxc-exec: {line}");
     }
     offset + complete as u64 + 1

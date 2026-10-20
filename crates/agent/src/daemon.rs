@@ -472,21 +472,6 @@ where
     }
 
     secure_fs::ensure_private_dir(&args.state_dir)?;
-    // Launch directories a previous daemon left behind: secrets go now, the
-    // directory of a box that still runs stays until it exits.
-    #[cfg(windows)]
-    if args.user
-        && let Err(error) = launch::sweep(&args.state_dir, &launch::host::process_alive)
-    {
-        tracing::warn!(error = %format!("{error:#}"), "sweep of previous sandboxed launches failed");
-    }
-    let containment = launch::containment_info(
-        args.containment.as_ref(),
-        args.user,
-        cfg!(windows),
-        args.claude_settings_overridden,
-        &|path| path.exists(),
-    );
     #[cfg(windows)]
     let daemon_sid = if args.user {
         // The user-mode pipe admits this SID only; without it the daemon must
@@ -503,6 +488,35 @@ where
     };
     #[cfg(not(windows))]
     let daemon_sid: Option<String> = None;
+    // On Windows user mode, bind the first pipe instance now so a duplicate
+    // daemon fails here before mutating any state. The bound instance is
+    // handed to serve_named_pipe later.
+    #[cfg(windows)]
+    let first_pipe_server = if args.user {
+        let sddl = launch::user_mode_pipe_sddl(
+            daemon_sid
+                .as_ref()
+                .expect("user mode has a daemon SID above"),
+        );
+        // Launch directories a previous daemon left behind: secrets go now, the
+        // directory of a box that still runs stays until it exits. The sweep
+        // runs only after bind succeeds, so a duplicate daemon mutates nothing.
+        let state_dir = args.state_dir.clone();
+        Some(bind_then_sweep(&socket, &sddl, || {
+            if let Err(error) = launch::sweep(&state_dir, &launch::host::process_alive) {
+                tracing::warn!(error = %format!("{error:#}"), "sweep of previous sandboxed launches failed");
+            }
+        })?)
+    } else {
+        None
+    };
+    let containment = launch::containment_info(
+        args.containment.as_ref(),
+        args.user,
+        cfg!(windows),
+        args.claude_settings_overridden,
+        &|path| path.exists(),
+    );
     let (usage_store, usage_receiver) = match &args.usage {
         Some(usage) => {
             let (store, receiver) = start_usage(usage, &args.state_dir).await;
@@ -682,7 +696,7 @@ where
     #[cfg(unix)]
     let local_api = serve_unix(&socket, local_api_access()?, app, shutdown);
     #[cfg(windows)]
-    let local_api = serve_named_pipe(&socket, app, shutdown, daemon_sid);
+    let local_api = serve_named_pipe(&socket, app, shutdown, daemon_sid, first_pipe_server);
     tokio::select! {
         result = local_api => result?,
         result = proxy => result?,
@@ -1226,6 +1240,7 @@ async fn serve_named_pipe(
     app: axum::Router,
     shutdown: impl Future<Output = anyhow::Result<()>> + Send,
     peer_check: Option<String>,
+    first_instance: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
 ) -> anyhow::Result<()> {
     // Full access for SYSTEM and Administrators, read/write for interactive
     // users: the system daemon serves every user of the device. A user-mode
@@ -1235,7 +1250,10 @@ async fn serve_named_pipe(
         Some(sid) => launch::user_mode_pipe_sddl(sid),
         None => SYSTEM_PIPE_SDDL.to_owned(),
     };
-    let mut server = bind_named_pipe(socket, true, &sddl)?;
+    let mut server = match first_instance {
+        Some(s) => s,
+        None => bind_named_pipe(socket, true, &sddl)?,
+    };
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -1319,6 +1337,20 @@ fn bind_named_pipe(
         )
     }
     .with_context(|| format!("bind named pipe {}", path.display()))
+}
+
+/// Binds the first named pipe instance, then runs the sweep closure. A
+/// duplicate daemon's bind fails here before the sweep runs, leaving state
+/// untouched.
+#[cfg(windows)]
+fn bind_then_sweep(
+    socket: &Path,
+    sddl: &str,
+    sweep: impl FnOnce(),
+) -> anyhow::Result<NamedPipeServer> {
+    let server = bind_named_pipe(socket, true, sddl)?;
+    sweep();
+    Ok(server)
 }
 
 fn agentdesktop_client_executable() -> anyhow::Result<PathBuf> {
@@ -1449,6 +1481,10 @@ mod tests {
     };
 
     use super::{DaemonArgs, bind_llm_proxy};
+    #[cfg(windows)]
+    use super::{bind_named_pipe, bind_then_sweep};
+    #[cfg(windows)]
+    use crate::launch;
     use agentdesktop_core::DEFAULT_SOCKET_PATH;
     use agentdesktop_core::config::{self, parse_daemon};
     use agentdesktop_core::model::{Agent, Discovery, LlmProxyInfo};
@@ -2530,5 +2566,67 @@ programs:
                 .get("llmProxy")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn duplicate_user_daemon_fails_at_pipe_bind_before_mutating_state() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The user-mode startup path binds the first pipe instance, then runs
+        // the sweep closure. A duplicate daemon's bind fails before the sweep,
+        // leaving launch directories untouched. This test pins the ordering by
+        // pre-binding with the production descriptor, calling bind_then_sweep
+        // with a flag-setting closure, and asserting both error and flag=false.
+        let pipe_name = format!("\\\\.\\pipe\\agentdesktop-test-{}", std::process::id());
+        let pipe_path = std::path::Path::new(&pipe_name);
+
+        let identity = launch::peer_identity(std::process::id()).expect("read test process SID");
+        let user_sid = identity.user_sid.expect("test has a user SID");
+        let sddl = launch::user_mode_pipe_sddl(&user_sid);
+
+        // Pre-bind with the production user-mode descriptor.
+        let _first = bind_named_pipe(pipe_path, true, &sddl).expect("first instance binds");
+
+        // Attempt bind_then_sweep; the sweep should never run.
+        let sweep_ran = AtomicBool::new(false);
+        let duplicate = bind_then_sweep(pipe_path, &sddl, || {
+            sweep_ran.store(true, Ordering::Relaxed);
+        });
+
+        assert!(duplicate.is_err(), "second bind must fail");
+        assert!(
+            !sweep_ran.load(Ordering::Relaxed),
+            "sweep must not run when bind fails"
+        );
+        assert!(
+            duplicate
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("pipe"),
+            "error mentions pipe"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn second_pipe_instance_succeeds_with_first_false() {
+        // Control for the duplicate test: the first_pipe_instance=true flag is
+        // what rejects duplicates, not the SDDL access rights alone. A second
+        // bind with first=false succeeds.
+        let pipe_name = format!(
+            "\\\\.\\pipe\\agentdesktop-test-control-{}",
+            std::process::id()
+        );
+        let pipe_path = std::path::Path::new(&pipe_name);
+
+        let identity = launch::peer_identity(std::process::id()).expect("read test process SID");
+        let user_sid = identity.user_sid.expect("test has a user SID");
+        let sddl = launch::user_mode_pipe_sddl(&user_sid);
+
+        let _first = bind_named_pipe(pipe_path, true, &sddl).expect("first instance binds");
+        let _second = bind_named_pipe(pipe_path, false, &sddl)
+            .expect("second instance with first=false succeeds");
     }
 }

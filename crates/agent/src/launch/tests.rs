@@ -2593,3 +2593,29 @@ fn the_user_mode_pipe_security_descriptor_for_the_daemon_sid_is_valid() {
     crate::windows_security::SecurityDescriptor::from_sddl(&user_mode_pipe_sddl(&sid))
         .expect("the SDDL parses");
 }
+
+#[test]
+fn copy_log_lines_uses_raw_byte_offset_not_lossy_string_offset() {
+    use std::io::Write;
+
+    // A non-UTF-8 byte before a newline: the file is 5 bytes, but the lossy
+    // string is 7 bytes (U+FFFD is 3 bytes in UTF-8). The returned offset
+    // must be the raw byte position (5) so the next read starts at the
+    // correct position.
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("test.log");
+    let mut file = std::fs::File::create(&log).unwrap();
+    file.write_all(b"caf\xe9\n").unwrap();
+    drop(file);
+
+    let new_offset = super::copy_log_lines("test-launch", &log, 0);
+    assert_eq!(new_offset, 5, "offset should be raw byte count");
+
+    // Append another line and verify the second read starts at the correct position.
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    file.write_all(b"second\n").unwrap();
+    drop(file);
+
+    let final_offset = super::copy_log_lines("test-launch", &log, new_offset);
+    assert_eq!(final_offset, 12, "second read from correct offset");
+}
