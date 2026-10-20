@@ -129,6 +129,10 @@ impl LaunchHost for HostEnvironment {
                 .iter()
                 .map(|name| self.home.join(name))
                 .collect(),
+            app_data: ["APPDATA", "LOCALAPPDATA"]
+                .iter()
+                .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+                .collect(),
         }
     }
 
@@ -142,6 +146,10 @@ impl LaunchHost for HostEnvironment {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
     }
 
     /// The Git root above the first `git.exe` on the daemon's PATH, when that

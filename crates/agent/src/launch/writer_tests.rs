@@ -74,7 +74,9 @@ fn the_executable_configuration_rule_covers_git_commondir_and_the_ide_directory_
         .into_iter()
         .map(str::to_owned)
         .collect();
+    let directories: BTreeSet<String> = [r"C:\ws\.git"].into_iter().map(str::to_owned).collect();
     let exists = |path: &Path| existing.contains(path.to_str().unwrap());
+    let is_dir = |path: &Path| directories.contains(path.to_str().unwrap());
     let request = build_request(&LaunchInput {
         launch_id: "0123456789abcdef".into(),
         executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
@@ -91,6 +93,7 @@ fn the_executable_configuration_rule_covers_git_commondir_and_the_ide_directory_
         gateway_url: "https://gateway.example.com/".into(),
         base_env: BTreeMap::new(),
         exists: &exists,
+        is_dir: &is_dir,
     });
     let denied = request.filesystem.denied_paths;
     assert!(denied.contains(&r"C:\ws\.git\commondir".to_owned()));
@@ -196,6 +199,7 @@ mod handler {
                 state_dir: self.state_dir.clone(),
                 system_dirs: vec![],
                 denied: vec![],
+                app_data: vec![],
             }
         }
         fn cwd_fs(&self) -> &dyn CwdFs {
@@ -206,6 +210,9 @@ mod handler {
         }
         fn exists(&self, path: &Path) -> bool {
             real(path).exists()
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            real(path).is_dir()
         }
         fn git_dir(&self) -> Option<PathBuf> {
             None
@@ -385,6 +392,7 @@ mod handler {
             .map(str::to_owned)
             .collect();
         let exists = |path: &Path| existing.contains(path.to_str().unwrap());
+        let is_dir = |_: &Path| false;
         let request = build_request(&LaunchInput {
             launch_id: "0123456789abcdef".into(),
             executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
@@ -401,6 +409,7 @@ mod handler {
             gateway_url: "https://gateway.example.com/".into(),
             base_env: BTreeMap::new(),
             exists: &exists,
+            is_dir: &is_dir,
         });
         let readonly = &request.filesystem.readonly_paths;
         assert!(
@@ -439,6 +448,7 @@ fn a_canonical_workspace_with_a_percent_sign_is_rejected() {
         state_dir: PathBuf::from("/state"),
         system_dirs: vec![],
         denied: vec![],
+        app_data: vec![],
     };
     let fs = Mapped(
         [(
@@ -504,6 +514,7 @@ fn the_environment_is_a_list_of_key_value_entries_and_a_missing_workspace_claude
     use std::collections::BTreeMap;
 
     let exists = |_: &Path| false;
+    let is_dir = |_: &Path| false;
     let request = build_request(&LaunchInput {
         launch_id: "0123456789abcdef".into(),
         executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
@@ -520,6 +531,7 @@ fn the_environment_is_a_list_of_key_value_entries_and_a_missing_workspace_claude
         gateway_url: "https://gateway.example.com/".into(),
         base_env: BTreeMap::from([("SystemRoot".to_owned(), r"C:\Windows".to_owned())]),
         exists: &exists,
+        is_dir: &is_dir,
     });
     // MXC 1.0.0 takes `env` as `KEY=VALUE` strings, not an object (lab L2).
     assert!(request.process.env.iter().all(|entry| entry.contains('=')));
@@ -549,6 +561,7 @@ fn the_box_environment_has_home_set_to_the_daemon_home_when_daemon_env_has_no_ho
     use std::collections::BTreeMap;
 
     let exists = |_: &Path| false;
+    let is_dir = |_: &Path| false;
     let request = build_request(&LaunchInput {
         launch_id: "0123456789abcdef".into(),
         executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
@@ -565,6 +578,7 @@ fn the_box_environment_has_home_set_to_the_daemon_home_when_daemon_env_has_no_ho
         gateway_url: "https://gateway.example.com/".into(),
         base_env: BTreeMap::new(),
         exists: &exists,
+        is_dir: &is_dir,
     });
     assert!(
         request

@@ -673,6 +673,10 @@ Each file or folder in that list is denied when it does not exist, so the box
 cannot create it in place, except for the git configuration files (granted when
 present, not emitted otherwise); a workspace without a `.claude` folder gets
 the folder denied as a whole; a workspace without `.git` cannot `git init` one.
+When the `.git` entry is an empty directory (exists but has no children), the config,
+hooks and commondir guards are emitted, so the box cannot `git init` into the existing
+empty folder. A `.git` file (worktree or submodule) remains box-writable: a `gitdir:`
+rewrite is not prevented.
 Residual risk: direct creation of those denied paths is blocked, but renaming a file
 into such a path succeeds, and the file then exists on disk. For example, an agent
 could rename a file into `<cwd>\.git\commondir` to point git at a writable directory
@@ -682,9 +686,10 @@ The daemon creates `~\.claude` if it is missing. Always denied:
 `~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
 `~\.ssh`, `~\.aws`, `~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
 directory or one of its ancestors, or anything under `%SystemRoot%`,
-`%ProgramFiles%`, `%ProgramData%`, `AppData`, `~\.claude`, the daemon's state
-directory or a denied path (`%ProgramFiles(x86)%` counts as a system
-directory). Outbound network is open in this preview; whether the box can reach
+`%ProgramFiles%`, `%ProgramData%`, `AppData`, and the actual `%APPDATA%` and
+`%LOCALAPPDATA%` paths (Folder Redirection can place these outside `<home>\AppData`),
+`~\.claude`, the daemon's state directory or a denied path (`%ProgramFiles(x86)%`
+counts as a system directory). Outbound network is open in this preview; whether the box can reach
 loopback services on the host, and whether it accepts inbound loopback
 connections, follows the request's network block (`egress` open, host loopback
 ingress denied) and is not yet verified in the lab; the clipboard is off in the
@@ -726,8 +731,9 @@ above that sits inside a writable folder: `~\.claude\settings.json` (hooks,
 `apiKeyHelper`), `~\.claude\hooks`, `~\.claude\plugins`, the workspace's
 `.claude\settings*.json` and `.claude\hooks` (which can also be committed to the
 repository), `.mcp.json`, the workspace-root `HEAD`, and `.git\config`, `.git\hooks`
-and `.git\commondir`. The boxed agent can
-change them, and the next unboxed session reads them (Claude Code outside the box;
+and `.git\commondir`. A `.git` file (worktree or submodule) is box-writable (a rewrite
+is not prevented). The boxed agent can
+change these, and the next unboxed session reads them (Claude Code outside the box;
 git outside the box, where `core.fsmonitor` and `core.hooksPath` run code). The
 read-only grant stops in-place writes but not replacement. The daemon's own
 directory (and the launched program's directory) is granted read-only recursively,

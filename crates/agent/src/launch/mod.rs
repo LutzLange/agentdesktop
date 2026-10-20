@@ -134,6 +134,7 @@ pub struct CwdContext {
     pub state_dir: PathBuf,
     pub system_dirs: Vec<PathBuf>,
     pub denied: Vec<PathBuf>,
+    pub app_data: Vec<PathBuf>,
 }
 
 /// Characters `cmd.exe` interprets inside a quoted path.
@@ -227,6 +228,11 @@ pub fn validate_cwd(cwd: &Path, ctx: &CwdContext, fs: &dyn CwdFs) -> Result<Path
         ctx.denied
             .iter()
             .map(|dir| (canonical_dir(dir), "a denied directory")),
+    );
+    guarded.extend(
+        ctx.app_data
+            .iter()
+            .map(|dir| (canonical_dir(dir), "AppData")),
     );
     for (directory, what) in guarded {
         if is_under(&canonical, &directory) {
@@ -398,6 +404,7 @@ pub struct LaunchInput<'a> {
     pub gateway_url: String,
     pub base_env: BTreeMap<String, String>,
     pub exists: &'a dyn Fn(&Path) -> bool,
+    pub is_dir: &'a dyn Fn(&Path) -> bool,
 }
 
 /// A path as the request carries it: `\` separators only.
@@ -410,9 +417,10 @@ fn join(base: &str, rest: &str) -> String {
 }
 
 /// Builds the MXC request. Pure: no host environment or filesystem reads
-/// beyond `input.exists`.
+/// beyond `input.exists` and `input.is_dir`.
 pub fn build_request(input: &LaunchInput) -> MxcRequest {
     let exists = |path: &str| (input.exists)(Path::new(path));
+    let is_dir = |path: &str| (input.is_dir)(Path::new(path));
     let cwd = win(&input.cwd);
     let home = win(&input.home);
     let launch_dir = win(&input.launch_dir);
@@ -522,15 +530,13 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         // No repository: deny `.git` so the box cannot `git init` one that
         // the user's tools later trust.
         denied.push(git);
-    } else if ["HEAD", "config", "hooks"]
-        .iter()
-        .any(|name| exists(&join(&git, name)))
-    {
-        // A repository directory: git reads config and hooks unsandboxed
-        // later, and `commondir` would redirect it to a writable directory.
-        // `.git\HEAD` stays writable: git replaces it by rename on every
-        // branch switch, and the root `HEAD` rule already blocks a bare-repo
-        // fall-through.
+    } else if is_dir(&git) {
+        // A `.git` directory: emit config, hooks and commondir guards whether
+        // or not they exist. An empty directory gets the same guards as a
+        // populated repository (prevents `git init` into an existing empty
+        // folder). `.git\HEAD` stays writable: git replaces it by rename on
+        // every branch switch, and the root `HEAD` rule already blocks a
+        // bare-repo fall-through.
         executable_config.push(join(&git, "config"));
         executable_config.push(join(&git, "hooks"));
         executable_config.push(join(&git, "commondir"));
@@ -704,6 +710,7 @@ pub trait LaunchHost: Send + Sync {
     fn cwd_fs(&self) -> &dyn CwdFs;
     fn program_fs(&self) -> &dyn ProgramFs;
     fn exists(&self, path: &Path) -> bool;
+    fn is_dir(&self, path: &Path) -> bool;
     fn git_dir(&self) -> Option<PathBuf>;
     fn program_files_claude(&self) -> Option<PathBuf>;
     fn client_exe_dir(&self) -> PathBuf;
@@ -961,6 +968,7 @@ async fn start_launch(
         return fail(&launch_dir, format!("prepare launch: {error:#}"));
     }
     let exists = |path: &Path| host.exists(path);
+    let is_dir = |path: &Path| host.is_dir(path);
     let mxc = build_request(&LaunchInput {
         launch_id: launch_id.clone(),
         executable: input.executable,
@@ -975,6 +983,7 @@ async fn start_launch(
         gateway_url: input.gateway_url,
         base_env: host.base_env(),
         exists: &exists,
+        is_dir: &is_dir,
     });
     let request_path = match write_request(&launch_dir, &mxc) {
         Ok(path) => path,

@@ -237,6 +237,7 @@ fn cwd_context() -> CwdContext {
         system_dirs: vec![p("windows"), p("programfiles"), p("programdata")],
         denied: vec![home.join(".ssh"), home.join(".aws"), home.join(".kube")],
         home,
+        app_data: vec![],
     }
 }
 
@@ -301,6 +302,29 @@ fn cwd_may_not_be_under_a_denied_path() {
     rejected(&p("home/dev/.ssh"));
     rejected(&p("home/dev/.aws/sso"));
     rejected(&p("home/dev/.kube"));
+}
+
+#[test]
+fn cwd_may_not_be_under_a_redirected_appdata_path() {
+    // Windows Folder Redirection can point %APPDATA% and %LOCALAPPDATA% outside
+    // the home directory. The workspace must not be under them.
+    let mut ctx = cwd_context();
+    ctx.app_data.push(p("shares/users/dev/AppData/Roaming"));
+    ctx.app_data.push(p("shares/users/dev/AppData/Local"));
+    let rejected = |cwd: &Path| {
+        assert!(
+            validate_cwd(cwd, &ctx, &FakeFs::default()).is_err(),
+            "{} should be rejected",
+            cwd.display()
+        )
+    };
+    rejected(&p("shares/users/dev/AppData/Roaming"));
+    rejected(&p("shares/users/dev/AppData/Roaming/Microsoft/Windows"));
+    rejected(&p("shares/users/dev/AppData/Local"));
+    rejected(&p("shares/users/dev/AppData/Local/Temp"));
+    // Workspace above the redirected path is also rejected (bidirectional check).
+    rejected(&p("shares/users/dev"));
+    rejected(&p("shares/users"));
 }
 
 #[test]
@@ -378,6 +402,7 @@ fn cwd_with_dot_dot_is_judged_by_where_it_really_points() {
         state_dir: base.join("state"),
         system_dirs: vec![],
         denied: vec![],
+        app_data: vec![],
     };
     let sneaky = home.join("projects/app/../../.claude");
     assert!(validate_cwd(&sneaky, &ctx, &RealFs).is_err());
@@ -403,6 +428,7 @@ fn cwd_through_a_real_symlink_is_judged_by_its_target() {
         state_dir: base.join("state"),
         system_dirs: vec![],
         denied: vec![],
+        app_data: vec![],
     };
     assert!(validate_cwd(&home.join("projects/to-claude"), &ctx, &RealFs).is_err());
     assert_eq!(
@@ -484,6 +510,7 @@ fn appdata_symlink_target_is_rejected() {
         state_dir: base.join("state"),
         system_dirs: vec![],
         denied: vec![],
+        app_data: vec![],
     };
     assert!(
         validate_cwd(&appdata_target.join("local"), &ctx, &RealFs).is_err(),
@@ -785,7 +812,28 @@ fn snapshot_existing() -> BTreeSet<String> {
     .collect()
 }
 
-fn launch_input<'a>(exists: &'a dyn Fn(&Path) -> bool) -> LaunchInput<'a> {
+fn snapshot_directories() -> BTreeSet<String> {
+    [
+        r"C:\lab\ws pr1\.claude",
+        r"C:\Users\dev\.local\bin",
+        r"C:\Users\dev\.local\share\claude",
+        r"C:\Program Files\Git",
+        r"C:\lab\agentdesktop",
+        r"C:\Program Files\ClaudeCode",
+        r"C:\Users\dev\.local\state\agentdesktop\launches\0123456789abcdef\credential",
+        r"C:\Users\dev\.claude\plugins",
+        r"C:\lab\ws pr1\.git",
+        r"C:\lab\ws pr1\.git\hooks",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn launch_input<'a>(
+    exists: &'a dyn Fn(&Path) -> bool,
+    is_dir: &'a dyn Fn(&Path) -> bool,
+) -> LaunchInput<'a> {
     LaunchInput {
         launch_id: LAUNCH_ID.into(),
         executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
@@ -808,15 +856,18 @@ fn launch_input<'a>(exists: &'a dyn Fn(&Path) -> bool) -> LaunchInput<'a> {
         gateway_url: "https://alpha-dev.aks.solo.sademo.de".into(),
         base_env: base_env(),
         exists,
+        is_dir,
     }
 }
 
 fn request_json(
     existing: &BTreeSet<String>,
+    directories: &BTreeSet<String>,
     tweak: impl FnOnce(&mut LaunchInput),
 ) -> serde_json::Value {
     let exists = |path: &Path| existing.contains(path.to_str().expect("UTF-8 path"));
-    let mut input = launch_input(&exists);
+    let is_dir = |path: &Path| directories.contains(path.to_str().expect("UTF-8 path"));
+    let mut input = launch_input(&exists, &is_dir);
     tweak(&mut input);
     serde_json::to_value(build_request(&input)).expect("the request serializes")
 }
@@ -856,7 +907,7 @@ fn sorted_paths(mut value: serde_json::Value) -> serde_json::Value {
 
 #[test]
 fn the_request_matches_the_checked_in_snapshot() {
-    let actual = request_json(&snapshot_existing(), |_| {});
+    let actual = request_json(&snapshot_existing(), &snapshot_directories(), |_| {});
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("testdata/request-claude.json")).unwrap();
     assert_eq!(sorted_paths(actual), sorted_paths(expected));
@@ -864,7 +915,7 @@ fn the_request_matches_the_checked_in_snapshot() {
 
 #[test]
 fn the_request_has_the_fixed_shape_and_no_process_timeout() {
-    let request = request_json(&snapshot_existing(), |_| {});
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |_| {});
     assert_eq!(request["version"], "1.0.0");
     assert_eq!(request["containment"], "processcontainer");
     assert_eq!(request["containerId"], format!("agentdesktop-{LAUNCH_ID}"));
@@ -885,7 +936,7 @@ fn the_request_has_the_fixed_shape_and_no_process_timeout() {
 
 #[test]
 fn the_command_line_starts_the_program_through_cmd_without_autorun_or_delayed_expansion() {
-    let request = request_json(&snapshot_existing(), |_| {});
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |_| {});
     assert_eq!(
         request["process"]["commandLine"],
         concat!(
@@ -894,7 +945,9 @@ fn the_command_line_starts_the_program_through_cmd_without_autorun_or_delayed_ex
             r#"--debug-file "C:\lab\ws pr1\pr1-l2.log" --allowedTools PowerShell"#
         )
     );
-    let without_args = request_json(&snapshot_existing(), |input| input.args.clear());
+    let without_args = request_json(&snapshot_existing(), &snapshot_directories(), |input| {
+        input.args.clear()
+    });
     assert_eq!(
         without_args["process"]["commandLine"]
             .as_str()
@@ -906,7 +959,7 @@ fn the_command_line_starts_the_program_through_cmd_without_autorun_or_delayed_ex
 
 #[test]
 fn the_environment_is_closed_and_expands_the_path_from_system_root() {
-    let request = request_json(&snapshot_existing(), |_| {});
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |_| {});
     let env = env_map(&request);
     assert_eq!(
         env["PATH"],
@@ -937,7 +990,9 @@ fn the_environment_is_closed_and_expands_the_path_from_system_root() {
 
 #[test]
 fn the_path_has_no_git_entry_without_git() {
-    let request = request_json(&snapshot_existing(), |input| input.git_dir = None);
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |input| {
+        input.git_dir = None
+    });
     let env = env_map(&request);
     let path = env["PATH"].as_str();
     assert_eq!(
@@ -950,7 +1005,7 @@ fn the_path_has_no_git_entry_without_git() {
 #[test]
 fn the_request_contains_no_percent_sign_and_no_forward_slash_in_any_path() {
     // Inputs with `/` in every position a path can come from.
-    let request = request_json(&snapshot_existing(), |input| {
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |input| {
         input.cwd = PathBuf::from(r"C:\lab\ws pr1");
         input.client_exe_dir = PathBuf::from("C:/lab/agentdesktop");
     });
@@ -977,7 +1032,7 @@ fn the_request_contains_no_percent_sign_and_no_forward_slash_in_any_path() {
 
 #[test]
 fn a_url_in_the_request_keeps_its_slashes() {
-    let request = request_json(&snapshot_existing(), |input| {
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |input| {
         input.gateway_url = "https://gateway.example.com/anthropic".into();
     });
     assert_eq!(
@@ -988,7 +1043,7 @@ fn a_url_in_the_request_keeps_its_slashes() {
 
 #[test]
 fn read_write_paths_are_the_workspace_the_claude_directory_and_the_launch_tmp() {
-    let request = request_json(&snapshot_existing(), |_| {});
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |_| {});
     let mut actual = readwrite(&request);
     actual.sort();
     let mut expected = vec![
@@ -1002,7 +1057,7 @@ fn read_write_paths_are_the_workspace_the_claude_directory_and_the_launch_tmp() 
 
 #[test]
 fn read_only_runtime_directories_are_listed_only_when_they_exist() {
-    let all = request_json(&snapshot_existing(), |_| {});
+    let all = request_json(&snapshot_existing(), &snapshot_directories(), |_| {});
     let candidates = [
         r"C:\Users\dev\.local\bin",
         r"C:\Users\dev\.local\share\claude",
@@ -1018,7 +1073,8 @@ fn read_only_runtime_directories_are_listed_only_when_they_exist() {
         );
         let mut existing = snapshot_existing();
         existing.remove(candidate);
-        let request = request_json(&existing, |_| {});
+        let directories = snapshot_directories();
+        let request = request_json(&existing, &directories, |_| {});
         assert!(
             !readonly(&request).contains(&candidate.to_owned()),
             "{candidate} is absent from the host"
@@ -1047,7 +1103,8 @@ fn executable_configuration_is_read_only_when_present_and_denied_when_absent() {
     for path in rule {
         let mut with = snapshot_existing();
         with.insert(path.to_owned());
-        let present = request_json(&with, |_| {});
+        let directories = snapshot_directories();
+        let present = request_json(&with, &directories, |_| {});
         assert!(
             readonly(&present).contains(&path.to_owned()),
             "{path} exists"
@@ -1060,7 +1117,8 @@ fn executable_configuration_is_read_only_when_present_and_denied_when_absent() {
 
         let mut without = snapshot_existing();
         without.remove(path);
-        let absent = request_json(&without, |_| {});
+        let directories = snapshot_directories();
+        let absent = request_json(&without, &directories, |_| {});
         assert!(
             denied(&absent).contains(&path.to_owned()),
             "{path} is absent"
@@ -1075,6 +1133,7 @@ fn executable_configuration_is_read_only_when_present_and_denied_when_absent() {
 #[test]
 fn a_workspace_without_a_git_directory_denies_it_so_the_box_cannot_init_one() {
     let mut existing = snapshot_existing();
+    let mut directories = snapshot_directories();
     for gone in [
         r"C:\lab\ws pr1\.git",
         r"C:\lab\ws pr1\.git\HEAD",
@@ -1082,8 +1141,9 @@ fn a_workspace_without_a_git_directory_denies_it_so_the_box_cannot_init_one() {
         r"C:\lab\ws pr1\.git\hooks",
     ] {
         existing.remove(gone);
+        directories.remove(gone);
     }
-    let request = request_json(&existing, |_| {});
+    let request = request_json(&existing, &directories, |_| {});
     assert!(denied(&request).contains(&r"C:\lab\ws pr1\.git".to_owned()));
     assert!(!readonly(&request).contains(&r"C:\lab\ws pr1\.git".to_owned()));
     assert!(!readwrite(&request).contains(&r"C:\lab\ws pr1\.git".to_owned()));
@@ -1091,7 +1151,7 @@ fn a_workspace_without_a_git_directory_denies_it_so_the_box_cannot_init_one() {
 
 #[test]
 fn a_git_directory_is_left_writable_apart_from_its_config_and_hooks() {
-    let request = request_json(&snapshot_existing(), |_| {});
+    let request = request_json(&snapshot_existing(), &snapshot_directories(), |_| {});
     let git = r"C:\lab\ws pr1\.git".to_owned();
     assert!(!denied(&request).contains(&git));
     assert!(!readonly(&request).contains(&git));
@@ -1100,8 +1160,8 @@ fn a_git_directory_is_left_writable_apart_from_its_config_and_hooks() {
 }
 
 #[test]
-fn a_git_file_of_a_worktree_or_submodule_is_left_as_it_is() {
-    // `.git` exists but is a file: it has no `HEAD`, `config` or `hooks` below it.
+fn an_empty_git_directory_gets_config_and_hooks_guards() {
+    // An empty `.git` directory: exists as a directory but has no children.
     let mut existing = snapshot_existing();
     for gone in [
         r"C:\lab\ws pr1\.git\HEAD",
@@ -1110,7 +1170,30 @@ fn a_git_file_of_a_worktree_or_submodule_is_left_as_it_is() {
     ] {
         existing.remove(gone);
     }
-    let request = request_json(&existing, |_| {});
+    let directories = snapshot_directories();
+    let request = request_json(&existing, &directories, |_| {});
+    // The guards are emitted even though the children are absent.
+    assert!(denied(&request).contains(&r"C:\lab\ws pr1\.git\config".to_owned()));
+    assert!(denied(&request).contains(&r"C:\lab\ws pr1\.git\hooks".to_owned()));
+    assert!(denied(&request).contains(&r"C:\lab\ws pr1\.git\commondir".to_owned()));
+}
+
+#[test]
+fn a_git_file_of_a_worktree_or_submodule_is_left_as_it_is() {
+    // `.git` exists but is a file, not a directory: worktree or submodule.
+    let mut existing = snapshot_existing();
+    let mut directories = snapshot_directories();
+    // Remove .git from directories to make it a file.
+    directories.remove(r"C:\lab\ws pr1\.git");
+    // A .git file has no children in the filesystem.
+    for gone in [
+        r"C:\lab\ws pr1\.git\HEAD",
+        r"C:\lab\ws pr1\.git\config",
+        r"C:\lab\ws pr1\.git\hooks",
+    ] {
+        existing.remove(gone);
+    }
+    let request = request_json(&existing, &directories, |_| {});
     for path in readwrite(&request)
         .into_iter()
         .chain(readonly(&request))
@@ -1130,8 +1213,11 @@ fn credential_and_ssh_style_paths_are_denied_whether_or_not_they_exist() {
         r"C:\Users\dev\.azure",
         r"C:\Users\dev\.kube",
     ];
-    for existing in [BTreeSet::new(), snapshot_existing()] {
-        let request = request_json(&existing, |_| {});
+    for (existing, directories) in [
+        (BTreeSet::new(), BTreeSet::new()),
+        (snapshot_existing(), snapshot_directories()),
+    ] {
+        let request = request_json(&existing, &directories, |_| {});
         for path in always {
             assert!(denied(&request).contains(&path.to_owned()), "{path}");
             assert!(!readonly(&request).contains(&path.to_owned()), "{path}");
@@ -1144,8 +1230,10 @@ fn write_request_creates_the_private_launch_dir_and_writes_json_without_a_bom() 
     let temp = tempfile::tempdir().unwrap();
     let launch_dir = temp.path().join("launches").join(LAUNCH_ID);
     let existing = snapshot_existing();
+    let directories = snapshot_directories();
     let exists = |path: &Path| existing.contains(path.to_str().unwrap());
-    let request = build_request(&launch_input(&exists));
+    let is_dir = |path: &Path| directories.contains(path.to_str().unwrap());
+    let request = build_request(&launch_input(&exists, &is_dir));
 
     let path = write_request(&launch_dir, &request).unwrap();
 
@@ -1166,7 +1254,8 @@ fn write_request_uses_a_private_directory_and_a_0600_file() {
     let temp = tempfile::tempdir().unwrap();
     let launch_dir = temp.path().join("launches").join(LAUNCH_ID);
     let exists = |_: &Path| false;
-    let request = build_request(&launch_input(&exists));
+    let is_dir = |_: &Path| false;
+    let request = build_request(&launch_input(&exists, &is_dir));
 
     let path = write_request(&launch_dir, &request).unwrap();
 
@@ -1520,6 +1609,7 @@ impl LaunchHost for FakeHost {
             state_dir: self.state_dir.clone(),
             system_dirs: vec![self.home.parent().unwrap().join("windows")],
             denied: vec![self.home.join(".ssh")],
+            app_data: vec![],
         }
     }
 
@@ -1533,6 +1623,10 @@ impl LaunchHost for FakeHost {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
     }
 
     fn git_dir(&self) -> Option<PathBuf> {
