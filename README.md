@@ -730,11 +730,15 @@ git outside the box, where `core.fsmonitor` and `core.hooksPath` run code). The
 read-only grant stops in-place writes but not replacement. The daemon detects such
 changes but does not prevent them. At launch it records a SHA-256 and the
 file identity of each entry above (folders recursively, up to 1000 entries and 10 MiB
-per entry; a larger folder is recorded by identity and top-level names only and logged
-at launch), and the identity of the workspace `.claude` and `.git`. It compares them
-every 60 seconds while the box runs and at box exit. Each change is logged once as a
-warning (`executable config changed during launch` / `… while launch ran`, with
-path, change type and both hashes), and the launch shows `integrityDrift: true` in
+per entry; a larger folder, such as a well-filled `~\.claude\plugins`, is recorded by
+its structure instead: names, kinds, sizes and identities, recursively, without file
+contents, so a changed manifest or an atomically saved file still registers, while an
+in-place edit that keeps a file's size does not), and the identity of the workspace
+`.claude` and `.git`. It compares them every 60 seconds while the box runs and at box
+exit; a transition back to the original state and a repeated change each count again.
+Each change is logged once as a warning (`executable config changed while launch
+ran`, with path, change type and both content hashes, `N/A` where the entry is not a
+file), and the launch shows `integrityDrift: true` in
 `GET /v1/launches`. Changes are not undone. A change is not proof that the box made it:
 the daemon's own reconcile when its configuration changes, Claude Code saving settings
 (inside or outside the box), git writing `.git\config`, and other boxes in the same

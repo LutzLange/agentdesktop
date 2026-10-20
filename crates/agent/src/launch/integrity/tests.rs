@@ -300,8 +300,8 @@ fn snapshot_root_file_too_large_10mib_plus_1() {
 
     assert!(matches!(
         result.get(&path),
-        Some(FileSnapshot::TooLarge { top_level_names_sha256, .. })
-        if *top_level_names_sha256 == [0; 32]
+        Some(FileSnapshot::TooLarge { structure_sha256, .. })
+        if *structure_sha256 != [0; 32]
     ));
 }
 
@@ -526,7 +526,7 @@ fn verify_no_change() {
     }];
     let baseline = snapshot(&roots, &fs);
 
-    let result = verify(&baseline, &fs);
+    let result = verify(&roots, &baseline, &fs);
     assert!(result.changed.is_empty());
 }
 
@@ -549,7 +549,11 @@ fn verify_file_modified() {
         },
     );
 
-    let result = verify(&baseline, &fs);
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = verify(&roots, &baseline, &fs);
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Modified);
 }
@@ -577,7 +581,11 @@ fn verify_file_identity_changed() {
         },
     );
 
-    let result = verify(&baseline, &fs);
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = verify(&roots, &baseline, &fs);
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Replaced);
 }
@@ -595,7 +603,11 @@ fn verify_file_appeared() {
     let mut baseline = BTreeMap::new();
     baseline.insert(path.clone(), FileSnapshot::Absent);
 
-    let result = verify(&baseline, &fs);
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = verify(&roots, &baseline, &fs);
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Appeared);
 }
@@ -619,7 +631,11 @@ fn verify_file_removed() {
         },
     );
 
-    let result = verify(&baseline, &fs);
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = verify(&roots, &baseline, &fs);
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Disappeared);
 }
@@ -643,7 +659,11 @@ fn verify_folder_child_added() {
         },
     );
 
-    let result = verify(&baseline, &fs);
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = verify(&roots, &baseline, &fs);
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Modified);
 }
@@ -671,7 +691,11 @@ fn verify_folder_replaced() {
         },
     );
 
-    let result = verify(&baseline, &fs);
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = verify(&roots, &baseline, &fs);
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Replaced);
 }
@@ -696,7 +720,7 @@ fn verify_revert_to_baseline() {
     fs.set_file(path.clone(), b"changed".to_vec(), identity);
     fs.set_file(path.clone(), b"original".to_vec(), identity);
 
-    let result = verify(&baseline, &fs);
+    let result = verify(&roots, &baseline, &fs);
     assert!(
         result.changed.is_empty(),
         "content equal to the baseline is no drift: {:?}",
@@ -885,7 +909,7 @@ fn integrity_paths_identity_only_child_added_no_change() {
 
     // Add a child
     fs.set_folder(path.clone(), vec![OsString::from("new_file")], identity);
-    let result = verify(&baseline, &fs);
+    let result = verify(&roots, &baseline, &fs);
 
     // Should be no change because it's IdentityOnly mode
     assert!(result.changed.is_empty());
@@ -915,7 +939,7 @@ fn integrity_paths_folder_renamed_and_recreated_replaced() {
     };
     fs2.set_folder(path.clone(), vec![], identity2);
 
-    let result = verify(&baseline, &fs2);
+    let result = verify(&roots, &baseline, &fs2);
 
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Replaced);
@@ -1018,7 +1042,7 @@ fn git_file_content_changed_modified() {
     let fs2 = MockFs::new();
     fs2.set_file(path.clone(), b"gitdir: ../bar".to_vec(), identity);
 
-    let result = verify(&baseline, &fs2);
+    let result = verify(&roots, &baseline, &fs2);
 
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Modified);
@@ -1047,7 +1071,7 @@ fn git_folder_renamed_and_recreated_replaced() {
     };
     fs2.set_folder(path.clone(), vec![], identity2);
 
-    let result = verify(&baseline, &fs2);
+    let result = verify(&roots, &baseline, &fs2);
 
     assert_eq!(result.changed.len(), 1);
     assert_eq!(result.changed[0].1.kind, ChangeKind::Replaced);
@@ -1055,37 +1079,30 @@ fn git_folder_renamed_and_recreated_replaced() {
 
 // AC 1 Tests: Platform-specific file identity
 
-#[cfg(windows)]
 #[test]
-fn windows_file_renamed_over_another_changes_file_id() {
-    // Test that renaming a file over another changes the file_id on Windows
-    // This would use actual filesystem operations or a more sophisticated mock
-    let identity1 = FileIdentity {
-        volume: 1,
-        file_id: 0x1000,
-    };
-    let identity2 = FileIdentity {
-        volume: 1,
-        file_id: 0x2000,
-    };
+fn a_file_renamed_over_another_changes_its_identity_and_is_a_replacement() {
+    // The F5 case on the real filesystem: identical bytes, new file identity.
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("settings.json");
+    let other = temp.path().join("settings.json.tmp");
+    std::fs::write(&target, b"{}").unwrap();
 
-    assert_ne!(identity1.file_id, identity2.file_id);
-}
+    let roots = vec![IntegrityRoot {
+        path: target.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, &REAL_FS);
+    let before_identity = REAL_FS.file_identity(&target).unwrap();
 
-#[cfg(unix)]
-#[test]
-fn unix_file_renamed_over_another_changes_ino() {
-    // Test that renaming a file over another changes the inode on Unix
-    let identity1 = FileIdentity {
-        volume: 1,
-        file_id: 1000,
-    };
-    let identity2 = FileIdentity {
-        volume: 1,
-        file_id: 2000,
-    };
+    std::fs::write(&other, b"{}").unwrap();
+    std::fs::rename(&other, &target).unwrap();
 
-    assert_ne!(identity1.file_id, identity2.file_id);
+    let after_identity = REAL_FS.file_identity(&target).unwrap();
+    assert_ne!(before_identity, after_identity, "rename keeps the identity");
+
+    let result = verify(&roots, &baseline, &REAL_FS);
+    assert_eq!(result.changed.len(), 1, "{:?}", result.changed);
+    assert_eq!(result.changed[0].1.kind, ChangeKind::Replaced);
 }
 
 // AC 2 Tests: run_periodic
@@ -1113,7 +1130,12 @@ async fn run_periodic_scenario_a_no_call_at_59s_one_at_61s_two_at_121s() {
 
     // Check at 59s - no call
     tokio::time::pause();
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
     tokio::spawn(run_periodic(
+        roots,
         baseline.clone(),
         fs.clone(),
         Duration::from_secs(60),
@@ -1162,7 +1184,7 @@ async fn run_periodic_scenario_b_abort_at_90s_exactly_one_call() {
 
     let mut baseline = BTreeMap::new();
     baseline.insert(
-        path,
+        path.clone(),
         FileSnapshot::File {
             sha256: [1; 32],
             identity,
@@ -1172,7 +1194,12 @@ async fn run_periodic_scenario_b_abort_at_90s_exactly_one_call() {
     let on_drift = Arc::new(|_path: PathBuf, _change: Change| {});
 
     tokio::time::pause();
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
     let handle = tokio::spawn(run_periodic(
+        roots,
         baseline,
         fs.clone(),
         Duration::from_secs(60),
@@ -1229,7 +1256,12 @@ async fn run_periodic_scenario_c_change_revert_second_replacement() {
     });
 
     tokio::time::pause();
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
     tokio::spawn(run_periodic(
+        roots,
         baseline,
         fs.clone(),
         Duration::from_secs(60),

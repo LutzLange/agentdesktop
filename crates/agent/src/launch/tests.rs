@@ -787,6 +787,26 @@ fn readwrite(value: &serde_json::Value) -> Vec<String> {
     list(value, "/filesystem/readwritePaths")
 }
 
+/// The integrity roots and the request's protections must not drift apart:
+/// every recursively checked root is read-only or denied in the real request.
+#[test]
+fn the_integrity_roots_are_protected_in_the_request() {
+    let value = request_json(&snapshot_existing(), |_| {});
+    let mut protected: std::collections::BTreeSet<String> = readonly(&value).into_iter().collect();
+    protected.extend(denied(&value));
+    let roots = super::integrity::integrity_paths(&PathBuf::from(HOME), &PathBuf::from(CWD));
+    for root in roots {
+        if root.mode != super::integrity::RootMode::Recursive {
+            continue; // the identity-only folders are writable by design
+        }
+        let path = root.path.to_str().unwrap().replace('/', "\\");
+        assert!(
+            protected.contains(&path),
+            "integrity root {path} is neither read-only nor denied in the request: {protected:?}"
+        );
+    }
+}
+
 /// Path lists are sets to the sandbox; the snapshot compares them sorted.
 fn sorted_paths(mut value: serde_json::Value) -> serde_json::Value {
     for key in ["readwritePaths", "readonlyPaths", "deniedPaths"] {
@@ -2772,6 +2792,63 @@ async fn the_executor_is_not_stopped_after_spawn_failure_early_exit_or_normal_ex
 }
 
 // AC 1: integrity check integration tests
+
+#[tokio::test(start_paused = true)]
+async fn the_periodic_check_sets_the_drift_flag_while_the_box_runs() {
+    let h = Harness::start(Setup::default()).await;
+    std::fs::write(h.cwd.join(".mcp.json"), b"{}").unwrap();
+    let launched = h.launch_ok().await;
+
+    // No drift at launch.
+    assert!(!h.listed().await[0].integrity_drift);
+
+    std::fs::write(h.cwd.join(".mcp.json"), b"{\"changed\":true}").unwrap();
+
+    // Past the first 60 s tick; the periodic check must flag the running launch.
+    tokio::time::sleep(Duration::from_secs(70)).await;
+    let mut flagged = false;
+    for _ in 0..1000 {
+        let listed = h.listed().await;
+        if listed[0].integrity_drift {
+            flagged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(flagged, "the periodic check flags a running launch");
+    assert_eq!(h.listed().await[0].status, LaunchStatus::Running);
+
+    h.executor.exit_with(0);
+    let _ = launched;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_periodic_check_stops_when_the_box_exits() {
+    let h = Harness::start(Setup::default()).await;
+    std::fs::write(h.cwd.join(".mcp.json"), b"{}").unwrap();
+    let _launched = h.launch_ok().await;
+    h.executor.exit_with(0);
+
+    for _ in 0..1000 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if h.listed().await[0].status == LaunchStatus::Exited {
+            break;
+        }
+    }
+    assert_eq!(h.listed().await[0].status, LaunchStatus::Exited);
+    assert!(!h.listed().await[0].integrity_drift, "clean exit, no drift");
+
+    // A change after the exit must not be flagged: the periodic task is gone.
+    std::fs::write(h.cwd.join(".mcp.json"), b"{\"changed\":true}").unwrap();
+    tokio::time::sleep(Duration::from_secs(130)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !h.listed().await[0].integrity_drift,
+        "no drift after the launch exited"
+    );
+}
 
 #[tokio::test(start_paused = true)]
 async fn integrity_drift_detected_when_file_modified_during_launch() {

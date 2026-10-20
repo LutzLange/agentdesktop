@@ -1,3 +1,8 @@
+//! Executable-configuration integrity: snapshot the read-only granted files
+//! of a launch before its box spawns, verify them while the box runs and when
+//! it exits, and report every change. Alert-first: nothing is restored or
+//! blocked here.
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
@@ -42,9 +47,11 @@ pub enum FileSnapshot {
         target_sha256: [u8; 32],
         identity: FileIdentity,
     },
+    /// Over the content budget: names, kinds, sizes and identities are
+    /// hashed recursively, file contents are not read.
     TooLarge {
         identity: FileIdentity,
-        top_level_names_sha256: [u8; 32],
+        structure_sha256: [u8; 32],
     },
     Unreadable {
         kind: io::ErrorKind,
@@ -110,15 +117,23 @@ pub trait IntegrityFs: Send + Sync {
     fn read_link(&self, p: &Path) -> io::Result<OsString>;
 }
 
-/// Real filesystem implementation.
-pub struct RealFs;
+/// Platform encoding of a file name or link target, as the spec fixes it:
+/// `OsStr::as_encoded_bytes` (stable, deterministic per platform).
+fn os_bytes(s: &std::ffi::OsStr) -> &[u8] {
+    s.as_encoded_bytes()
+}
 
-pub const REAL_FS: RealFs = RealFs;
+/// Real filesystem implementation.
+pub struct RealIntegrityFs;
+
+pub const REAL_FS: RealIntegrityFs = RealIntegrityFs;
 
 const MAX_ENTRIES: usize = 1000;
 const MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
+/// Entry cap for the structure-only walk of an over-budget tree.
+const STRUCTURE_MAX_ENTRIES: usize = 10_000;
 
-impl IntegrityFs for RealFs {
+impl IntegrityFs for RealIntegrityFs {
     fn metadata(&self, p: &Path) -> io::Result<EntryKind> {
         let meta = std::fs::symlink_metadata(p)?;
         if meta.is_symlink() {
@@ -154,13 +169,20 @@ impl IntegrityFs for RealFs {
                 GetFileInformationByHandleEx,
             };
 
+            // Attribute-only access: it cannot hit a sharing violation on a
+            // file another process holds open exclusively.
+            const FILE_READ_ATTRIBUTES: u32 = 0x0080;
             let file = std::fs::OpenOptions::new()
-                .read(true)
+                .access_mode(FILE_READ_ATTRIBUTES)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .open(p)?;
 
+            // SAFETY: FILE_ID_INFO is a plain-old-data struct; all-zero bytes
+            // are a valid initial value for it.
             let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+            // SAFETY: the handle is open, the buffer is a FILE_ID_INFO and
+            // the size passed is exactly its size, as the API requires.
             let success = unsafe {
                 GetFileInformationByHandleEx(
                     file.as_raw_handle() as _,
@@ -206,20 +228,23 @@ pub fn snapshot(roots: &[IntegrityRoot], fs: &dyn IntegrityFs) -> BTreeMap<PathB
 }
 
 fn snapshot_one(path: &Path, mode: RootMode, fs: &dyn IntegrityFs) -> FileSnapshot {
+    // One retry after 100 ms covers transient locks on any read the attempt
+    // makes, not only the first metadata call.
+    match snapshot_one_attempt(path, mode, fs) {
+        FileSnapshot::Unreadable { .. } => {
+            std::thread::sleep(Duration::from_millis(100));
+            snapshot_one_attempt(path, mode, fs)
+        }
+        snap => snap,
+    }
+}
+
+fn snapshot_one_attempt(path: &Path, mode: RootMode, fs: &dyn IntegrityFs) -> FileSnapshot {
     let kind = match fs.metadata(path) {
         Ok(k) => k,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return FileSnapshot::Absent,
         Err(e) if e.kind() == io::ErrorKind::NotADirectory => return FileSnapshot::Absent,
-        Err(_e) => {
-            // Retry once after 100 ms
-            std::thread::sleep(Duration::from_millis(100));
-            match fs.metadata(path) {
-                Ok(k) => k,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return FileSnapshot::Absent,
-                Err(e) if e.kind() == io::ErrorKind::NotADirectory => return FileSnapshot::Absent,
-                Err(e) => return FileSnapshot::Unreadable { kind: e.kind() },
-            }
-        }
+        Err(e) => return FileSnapshot::Unreadable { kind: e.kind() },
     };
 
     match kind {
@@ -229,15 +254,23 @@ fn snapshot_one(path: &Path, mode: RootMode, fs: &dyn IntegrityFs) -> FileSnapsh
                 Err(e) => return FileSnapshot::Unreadable { kind: e.kind() },
             };
             if len > MAX_BYTES {
+                // A root file over the budget: its size stands in for content.
                 return FileSnapshot::TooLarge {
                     identity,
-                    top_level_names_sha256: [0; 32],
+                    structure_sha256: sha256_hash(&len.to_le_bytes()),
                 };
             }
             let bytes = match fs.read_bytes(path) {
                 Ok(b) => b,
                 Err(e) => return FileSnapshot::Unreadable { kind: e.kind() },
             };
+            if bytes.len() as u64 > MAX_BYTES {
+                // The file grew between the size check and the read.
+                return FileSnapshot::TooLarge {
+                    identity,
+                    structure_sha256: sha256_hash(&(bytes.len() as u64).to_le_bytes()),
+                };
+            }
             let sha256 = sha256_hash(&bytes);
             FileSnapshot::File { sha256, identity }
         }
@@ -255,19 +288,24 @@ fn snapshot_one(path: &Path, mode: RootMode, fs: &dyn IntegrityFs) -> FileSnapsh
             match snapshot_folder_recursive(path, fs, &mut entries_count, &mut cumulative_bytes) {
                 Ok(sha256) => FileSnapshot::Folder { sha256, identity },
                 Err(FolderError::TooLarge) => {
-                    let top_level_names = match fs.read_dir_names(path) {
-                        Ok(names) => names,
-                        Err(_) => {
-                            return FileSnapshot::TooLarge {
-                                identity,
-                                top_level_names_sha256: [0; 32],
-                            };
+                    // Over the content budget: hash the structure instead
+                    // (names, kinds, sizes, identities), so a changed manifest
+                    // or an atomic save still shows up. In-place edits that
+                    // keep a file's size do not.
+                    let mut entries = 0usize;
+                    let structure_sha256 = match structure_hash(path, fs, &mut entries) {
+                        Ok(hash) => hash,
+                        Err(FolderError::TooLarge) => match fs.read_dir_names(path) {
+                            Ok(names) => hash_dir_names(&names),
+                            Err(_) => [0; 32],
+                        },
+                        Err(FolderError::Unreadable(kind)) => {
+                            return FileSnapshot::Unreadable { kind };
                         }
                     };
-                    let top_level_names_sha256 = hash_dir_names(&top_level_names);
                     FileSnapshot::TooLarge {
                         identity,
-                        top_level_names_sha256,
+                        structure_sha256,
                     }
                 }
                 Err(FolderError::Unreadable(kind)) => FileSnapshot::Unreadable { kind },
@@ -279,22 +317,7 @@ fn snapshot_one(path: &Path, mode: RootMode, fs: &dyn IntegrityFs) -> FileSnapsh
                 Err(e) => return FileSnapshot::Unreadable { kind: e.kind() },
             };
             let target_sha256 = match fs.read_link(path) {
-                Ok(target) => {
-                    #[cfg(unix)]
-                    use std::os::unix::ffi::OsStrExt;
-                    #[cfg(windows)]
-                    use std::os::windows::ffi::OsStrExt;
-
-                    #[cfg(unix)]
-                    let bytes: &[u8] = target.as_bytes();
-                    #[cfg(windows)]
-                    let owned: Vec<u8> =
-                        target.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-                    #[cfg(windows)]
-                    let bytes: &[u8] = &owned;
-
-                    sha256_hash(bytes)
-                }
+                Ok(target) => sha256_hash(os_bytes(&target)),
                 Err(_) => [0; 32],
             };
             FileSnapshot::Link {
@@ -316,11 +339,6 @@ fn snapshot_folder_recursive(
     entries_count: &mut usize,
     cumulative_bytes: &mut u64,
 ) -> Result<[u8; 32], FolderError> {
-    *entries_count += 1;
-    if *entries_count > MAX_ENTRIES {
-        return Err(FolderError::TooLarge);
-    }
-
     let names = fs
         .read_dir_names(path)
         .map_err(|e| FolderError::Unreadable(e.kind()))?;
@@ -328,6 +346,7 @@ fn snapshot_folder_recursive(
     let mut children: Vec<(OsString, u8, [u8; 32])> = Vec::new();
 
     for name in names {
+        // Each entry counts once, whatever its kind.
         *entries_count += 1;
         if *entries_count > MAX_ENTRIES {
             return Err(FolderError::TooLarge);
@@ -336,7 +355,8 @@ fn snapshot_folder_recursive(
         let child_path = path.join(&name);
         let kind = match fs.metadata(&child_path) {
             Ok(k) => k,
-            Err(_) => continue, // Skip unreadable children
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue, // removed mid-walk
+            Err(e) => return Err(FolderError::Unreadable(e.kind())),
         };
 
         let (kind_byte, hash) = match kind {
@@ -346,8 +366,12 @@ fn snapshot_folder_recursive(
                 }
                 let bytes = fs
                     .read_bytes(&child_path)
-                    .map_err(|_| FolderError::TooLarge)?; // Treat read failure as too large
-                *cumulative_bytes += len;
+                    .map_err(|e| FolderError::Unreadable(e.kind()))?;
+                *cumulative_bytes += bytes.len() as u64;
+                if *cumulative_bytes > MAX_BYTES {
+                    // The file grew between the size check and the read.
+                    return Err(FolderError::TooLarge);
+                }
                 (0u8, sha256_hash(&bytes))
             }
             EntryKind::Folder => {
@@ -357,22 +381,7 @@ fn snapshot_folder_recursive(
             }
             EntryKind::Link => {
                 let target_hash = match fs.read_link(&child_path) {
-                    Ok(target) => {
-                        #[cfg(unix)]
-                        use std::os::unix::ffi::OsStrExt;
-                        #[cfg(windows)]
-                        use std::os::windows::ffi::OsStrExt;
-
-                        #[cfg(unix)]
-                        let bytes: &[u8] = target.as_bytes();
-                        #[cfg(windows)]
-                        let owned: Vec<u8> =
-                            target.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-                        #[cfg(windows)]
-                        let bytes: &[u8] = &owned;
-
-                        sha256_hash(bytes)
-                    }
+                    Ok(target) => sha256_hash(os_bytes(&target)),
                     Err(_) => [0; 32],
                 };
                 (2u8, target_hash)
@@ -382,50 +391,15 @@ fn snapshot_folder_recursive(
         children.push((name, kind_byte, hash));
     }
 
-    // Sort children by encoded name bytes
-    children.sort_by(|a, b| {
-        #[cfg(unix)]
-        use std::os::unix::ffi::OsStrExt;
-        #[cfg(windows)]
-        use std::os::windows::ffi::OsStrExt;
-
-        #[cfg(unix)]
-        let a_bytes = a.0.as_bytes();
-        #[cfg(unix)]
-        let b_bytes = b.0.as_bytes();
-
-        #[cfg(windows)]
-        let a_bytes: Vec<u8> = a.0.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-        #[cfg(windows)]
-        let b_bytes: Vec<u8> = b.0.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-
-        #[cfg(unix)]
-        {
-            a_bytes.cmp(b_bytes)
-        }
-        #[cfg(windows)]
-        {
-            a_bytes.cmp(&b_bytes)
-        }
-    });
+    children.sort_by(|a, b| os_bytes(&a.0).cmp(os_bytes(&b.0)));
 
     // Build the hash from sorted children
     let mut hasher = sha2::Sha256::new();
     use sha2::Digest;
 
     for (name, kind_byte, hash) in children {
-        #[cfg(unix)]
-        use std::os::unix::ffi::OsStrExt;
-        #[cfg(windows)]
-        use std::os::windows::ffi::OsStrExt;
-
-        #[cfg(unix)]
-        let name_bytes = name.as_bytes();
-        #[cfg(windows)]
-        let name_bytes: Vec<u8> = name.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-
-        let len = name_bytes.len() as u32;
-        hasher.update(len.to_le_bytes());
+        let name_bytes = os_bytes(&name);
+        hasher.update((name_bytes.len() as u32).to_le_bytes());
         hasher.update(name_bytes);
         hasher.update([kind_byte]);
         hasher.update(hash);
@@ -434,49 +408,67 @@ fn snapshot_folder_recursive(
     Ok(hasher.finalize().into())
 }
 
-fn hash_dir_names(names: &[OsString]) -> [u8; 32] {
+/// Hash of an over-budget tree's structure: sorted names with kind, size and
+/// identity per entry, recursing into subfolders, no file contents.
+fn structure_hash(
+    path: &Path,
+    fs: &dyn IntegrityFs,
+    entries_count: &mut usize,
+) -> Result<[u8; 32], FolderError> {
     use sha2::Digest;
-    let mut sorted = names.to_vec();
-    sorted.sort_by(|a, b| {
-        #[cfg(unix)]
-        use std::os::unix::ffi::OsStrExt;
-        #[cfg(windows)]
-        use std::os::windows::ffi::OsStrExt;
-
-        #[cfg(unix)]
-        let a_bytes = a.as_bytes();
-        #[cfg(unix)]
-        let b_bytes = b.as_bytes();
-
-        #[cfg(windows)]
-        let a_bytes: Vec<u8> = a.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-        #[cfg(windows)]
-        let b_bytes: Vec<u8> = b.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-
-        #[cfg(unix)]
-        {
-            a_bytes.cmp(b_bytes)
-        }
-        #[cfg(windows)]
-        {
-            a_bytes.cmp(&b_bytes)
-        }
-    });
+    let names = fs
+        .read_dir_names(path)
+        .map_err(|e| FolderError::Unreadable(e.kind()))?;
+    let mut sorted = names;
+    sorted.sort_by(|a, b| os_bytes(a).cmp(os_bytes(b)));
 
     let mut hasher = sha2::Sha256::new();
     for name in sorted {
-        #[cfg(unix)]
-        use std::os::unix::ffi::OsStrExt;
-        #[cfg(windows)]
-        use std::os::windows::ffi::OsStrExt;
+        *entries_count += 1;
+        if *entries_count > STRUCTURE_MAX_ENTRIES {
+            return Err(FolderError::TooLarge);
+        }
+        let child_path = path.join(&name);
+        let name_bytes = os_bytes(&name);
+        hasher.update((name_bytes.len() as u32).to_le_bytes());
+        hasher.update(name_bytes);
+        match fs.metadata(&child_path) {
+            Ok(EntryKind::File { len }) => {
+                hasher.update([0u8]);
+                hasher.update(len.to_le_bytes());
+                if let Ok(identity) = fs.file_identity(&child_path) {
+                    hasher.update(identity.volume.to_le_bytes());
+                    hasher.update(identity.file_id.to_le_bytes());
+                }
+            }
+            Ok(EntryKind::Folder) => {
+                hasher.update([1u8]);
+                let child_hash = structure_hash(&child_path, fs, entries_count)?;
+                hasher.update(child_hash);
+            }
+            Ok(EntryKind::Link) => {
+                hasher.update([2u8]);
+                if let Ok(target) = fs.read_link(&child_path) {
+                    hasher.update(sha256_hash(os_bytes(&target)));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                hasher.update([3u8]); // removed mid-walk
+            }
+            Err(e) => return Err(FolderError::Unreadable(e.kind())),
+        }
+    }
+    Ok(hasher.finalize().into())
+}
 
-        #[cfg(unix)]
-        let name_bytes = name.as_bytes();
-        #[cfg(windows)]
-        let name_bytes: Vec<u8> = name.encode_wide().flat_map(|w| w.to_le_bytes()).collect();
-
-        let len = name_bytes.len() as u32;
-        hasher.update(len.to_le_bytes());
+fn hash_dir_names(names: &[OsString]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut sorted = names.to_vec();
+    sorted.sort_by(|a, b| os_bytes(a).cmp(os_bytes(b)));
+    let mut hasher = sha2::Sha256::new();
+    for name in sorted {
+        let name_bytes = os_bytes(&name);
+        hasher.update((name_bytes.len() as u32).to_le_bytes());
         hasher.update(name_bytes);
     }
     hasher.finalize().into()
@@ -595,11 +587,11 @@ pub fn diff(before: &FileSnapshot, after: &FileSnapshot) -> Option<Change> {
         (
             TooLarge {
                 identity: id1,
-                top_level_names_sha256: h1,
+                structure_sha256: h1,
             },
             TooLarge {
                 identity: id2,
-                top_level_names_sha256: h2,
+                structure_sha256: h2,
             },
         ) => {
             if id1 != id2 {
@@ -637,18 +629,23 @@ pub fn diff(before: &FileSnapshot, after: &FileSnapshot) -> Option<Change> {
     }
 }
 
-/// Verify current state against baseline.
-pub fn verify(baseline: &BTreeMap<PathBuf, FileSnapshot>, fs: &dyn IntegrityFs) -> VerifyResult {
+/// Verify the current state of the roots against an expected snapshot map.
+/// Each root keeps its declared mode, so a root that was absent when the
+/// expectation was taken is still checked in that mode once it appears.
+pub fn verify(
+    roots: &[IntegrityRoot],
+    expected: &BTreeMap<PathBuf, FileSnapshot>,
+    fs: &dyn IntegrityFs,
+) -> VerifyResult {
     let mut changed = Vec::new();
-    for (path, before) in baseline {
-        // Determine the mode from the snapshot type
-        let mode = match before {
-            FileSnapshot::FolderIdentity { .. } => RootMode::IdentityOnly,
-            _ => RootMode::Recursive,
-        };
-        let after = snapshot_one(path, mode, fs);
-        if let Some(change) = diff(before, &after) {
-            changed.push((path.clone(), change));
+    for root in roots {
+        let before = expected
+            .get(&root.path)
+            .cloned()
+            .unwrap_or(FileSnapshot::Absent);
+        let after = snapshot_one(&root.path, root.mode, fs);
+        if let Some(change) = diff(&before, &after) {
+            changed.push((root.path.clone(), change));
         }
     }
     VerifyResult { changed }
@@ -713,14 +710,18 @@ pub fn integrity_paths(home: &Path, cwd: &Path) -> Vec<IntegrityRoot> {
     ]
 }
 
-/// Run periodic verification.
+/// Verifies the roots every `period` while the launch runs. Each pass is
+/// compared with the last observed state, so every transition is reported
+/// once: a change, the revert of that change, and the same change made again
+/// each produce one `on_drift` call.
 pub async fn run_periodic(
+    roots: Vec<IntegrityRoot>,
     baseline: BTreeMap<PathBuf, FileSnapshot>,
     fs: Arc<dyn IntegrityFs>,
     period: Duration,
     on_drift: Arc<dyn Fn(PathBuf, Change) + Send + Sync>,
 ) {
-    let mut last_observed: BTreeMap<PathBuf, FileSnapshot> = baseline.clone();
+    let mut last_observed = baseline;
 
     // A fixed schedule: the first check is one period after the task starts,
     // and later checks stay on that schedule regardless of how long a verify
@@ -731,40 +732,25 @@ pub async fn run_periodic(
     loop {
         ticker.tick().await;
 
-        let baseline_clone = baseline.clone();
+        let roots_clone = roots.clone();
         let fs_clone = fs.clone();
-        let result =
-            tokio::task::spawn_blocking(move || verify(&baseline_clone, fs_clone.as_ref()))
+        let current =
+            match tokio::task::spawn_blocking(move || snapshot(&roots_clone, fs_clone.as_ref()))
                 .await
-                .unwrap_or_else(|_| VerifyResult {
-                    changed: Vec::new(),
-                });
-
-        for (path, change) in result.changed {
-            // Check if this is different from the last observed state
-            let last = last_observed.get(&path);
-            let should_notify = match last {
-                Some(last_snap) => {
-                    if let Some(incremental_change) = diff(last_snap, &change.after) {
-                        // Update our tracking
-                        last_observed.insert(path.clone(), change.after.clone());
-                        // Notify with the incremental change
-                        on_drift(path.clone(), incremental_change);
-                        false // We already notified
-                    } else {
-                        false // No change from last observation
-                    }
-                }
-                None => {
-                    // First time seeing a change for this path
-                    last_observed.insert(path.clone(), change.after.clone());
-                    true
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::warn!(%error, "periodic integrity check failed; retrying next period");
+                    continue;
                 }
             };
 
-            if should_notify {
+        for (path, after) in &current {
+            let before = last_observed.get(path).unwrap_or(&FileSnapshot::Absent);
+            if let Some(change) = diff(before, after) {
                 on_drift(path.clone(), change);
             }
         }
+        last_observed = current;
     }
 }
