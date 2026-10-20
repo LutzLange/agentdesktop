@@ -28,6 +28,7 @@ file.
 | Sandbox configuration | ✅ | ◯ | ✅ | ◯ | ◯ | — | ◯ | ◯ | ◯ |
 | Tool-use telemetry | ✅ | ◯ | ◯ | ◯ | ◯ | — | ◯ | ◯ | ◯ |
 | Session-start telemetry | ✅ | ◯ | ◯ | ◯ | ◯ | — | ◯ | ◯ | ◯ |
+| Sandboxed launch (Windows) | ✅ | ◯ | ◯ | ◯ | ◯ | — | ◯ | ◯ | ◯ |
 
 - ◯ describes a gap in Agentdesktop; it does not mean the upstream provider
   cannot support the feature.
