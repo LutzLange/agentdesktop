@@ -1709,3 +1709,115 @@ fn structure_hash_detects_swapped_symlink_via_identity() {
         "link identity change should report as Modified"
     );
 }
+
+#[test]
+fn snapshot_folder_exceeds_depth_limit() {
+    // Regression test for external review finding: deeply nested folders can
+    // overflow the 2 MiB blocking-thread stack. With the depth limit, they
+    // degrade to TooLarge instead. This test creates a chain deeper than
+    // MAX_DEPTH and verifies the limit is enforced. Removing the depth check
+    // would cause this test to fail by allowing recursion to continue past
+    // the limit.
+    let fs = MockFs::new();
+
+    const TEST_DEPTH: usize = 100; // Well above MAX_DEPTH (64)
+    let mut path = PathBuf::from("/root");
+
+    // Build a deep chain of single-child folders
+    for i in 0..TEST_DEPTH {
+        let identity = FileIdentity {
+            volume: 1,
+            file_id: i as u128,
+        };
+
+        // Each folder has one child (the next level down)
+        if i < TEST_DEPTH - 1 {
+            let child_name = OsString::from(format!("level{}", i + 1));
+            fs.set_folder(path.clone(), vec![child_name], identity);
+            path = path.join(format!("level{}", i + 1));
+        } else {
+            // Leaf folder is empty
+            fs.set_folder(path.clone(), vec![], identity);
+        }
+    }
+
+    let root = PathBuf::from("/root");
+    let roots = vec![IntegrityRoot {
+        path: root.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = snapshot(&roots, &fs);
+
+    // The depth limit should trigger TooLarge, not a stack overflow
+    assert!(
+        matches!(result.get(&root), Some(FileSnapshot::TooLarge { .. })),
+        "deeply nested folder should degrade to TooLarge when depth exceeds MAX_DEPTH"
+    );
+}
+
+#[test]
+fn an_over_budget_root_with_a_deep_chain_degrades_to_top_level_names() {
+    // The structure fallback has its own depth check. When the under-budget
+    // walker stops on the ENTRY budget (not on depth), only that check keeps
+    // a >MAX_DEPTH chain from overflowing the stack; past it, the snapshot
+    // holds the hash of the top-level names only. Removing the depth check in
+    // structure_hash makes the fallback hash the full structure instead, and
+    // the equality below fails.
+    let fs = MockFs::new();
+    let root = PathBuf::from("/root");
+    let root_identity = FileIdentity {
+        volume: 1,
+        file_id: 1,
+    };
+
+    // Over the entry budget at the top level: 1001 files plus the chain head.
+    let mut names: Vec<OsString> = Vec::new();
+    for i in 0..1001 {
+        let name = OsString::from(format!("file{i}"));
+        fs.set_file(
+            root.join(&name),
+            vec![0u8; 4],
+            FileIdentity {
+                volume: 1,
+                file_id: 1000 + i as u128,
+            },
+        );
+        names.push(name);
+    }
+    names.push(OsString::from("deep0"));
+    fs.set_folder(root.clone(), names.clone(), root_identity);
+
+    // A chain deeper than MAX_DEPTH under the chain head.
+    let mut path = root.clone();
+    for i in 0..100usize {
+        path = path.join(format!("deep{i}"));
+        let identity = FileIdentity {
+            volume: 1,
+            file_id: 10_000 + i as u128,
+        };
+        if i < 99 {
+            fs.set_folder(
+                path.clone(),
+                vec![OsString::from(format!("deep{}", i + 1))],
+                identity,
+            );
+        } else {
+            fs.set_folder(path.clone(), vec![], identity);
+        }
+    }
+
+    let roots = vec![IntegrityRoot {
+        path: root.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = snapshot(&roots, &fs);
+
+    assert_eq!(
+        result.get(&root),
+        Some(&FileSnapshot::TooLarge {
+            identity: root_identity,
+            structure_sha256: super::hash_dir_names(&names),
+        }),
+        "an over-budget root with a too-deep chain records top-level names only"
+    );
+}

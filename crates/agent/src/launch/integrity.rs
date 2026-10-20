@@ -132,6 +132,9 @@ const MAX_ENTRIES: usize = 1000;
 const MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 /// Entry cap for the structure-only walk of an over-budget tree.
 const STRUCTURE_MAX_ENTRIES: usize = 10_000;
+/// Maximum nesting depth for recursive folder walks. This prevents stack
+/// overflow on the 2 MiB blocking-thread stack (found by external review).
+const MAX_DEPTH: usize = 64;
 
 impl IntegrityFs for RealIntegrityFs {
     fn metadata(&self, p: &Path) -> io::Result<EntryKind> {
@@ -290,7 +293,8 @@ fn snapshot_one_attempt(path: &Path, mode: RootMode, fs: &dyn IntegrityFs) -> Fi
             // Recursive mode
             let mut entries_count = 0;
             let mut cumulative_bytes = 0u64;
-            match snapshot_folder_recursive(path, fs, &mut entries_count, &mut cumulative_bytes) {
+            match snapshot_folder_recursive(path, fs, &mut entries_count, &mut cumulative_bytes, 0)
+            {
                 Ok(sha256) => FileSnapshot::Folder { sha256, identity },
                 Err(FolderError::TooLarge) => {
                     // Over the content budget: hash the structure instead
@@ -298,7 +302,7 @@ fn snapshot_one_attempt(path: &Path, mode: RootMode, fs: &dyn IntegrityFs) -> Fi
                     // or an atomic save still shows up. In-place edits that
                     // keep a file's size do not.
                     let mut entries = 0usize;
-                    let structure_sha256 = match structure_hash(path, fs, &mut entries) {
+                    let structure_sha256 = match structure_hash(path, fs, &mut entries, 0) {
                         Ok(hash) => hash,
                         Err(FolderError::TooLarge) => match fs.read_dir_names(path) {
                             Ok(names) => hash_dir_names(&names),
@@ -343,7 +347,12 @@ fn snapshot_folder_recursive(
     fs: &dyn IntegrityFs,
     entries_count: &mut usize,
     cumulative_bytes: &mut u64,
+    depth: usize,
 ) -> Result<[u8; 32], FolderError> {
+    if depth > MAX_DEPTH {
+        return Err(FolderError::TooLarge);
+    }
+
     let names = fs
         .read_dir_names(path)
         .map_err(|e| FolderError::Unreadable(e.kind()))?;
@@ -380,8 +389,13 @@ fn snapshot_folder_recursive(
                 (0u8, sha256_hash(&bytes))
             }
             EntryKind::Folder => {
-                let hash =
-                    snapshot_folder_recursive(&child_path, fs, entries_count, cumulative_bytes)?;
+                let hash = snapshot_folder_recursive(
+                    &child_path,
+                    fs,
+                    entries_count,
+                    cumulative_bytes,
+                    depth + 1,
+                )?;
                 (1u8, hash)
             }
             EntryKind::Link => {
@@ -427,7 +441,12 @@ fn structure_hash(
     path: &Path,
     fs: &dyn IntegrityFs,
     entries_count: &mut usize,
+    depth: usize,
 ) -> Result<[u8; 32], FolderError> {
+    if depth > MAX_DEPTH {
+        return Err(FolderError::TooLarge);
+    }
+
     use sha2::Digest;
     let names = fs
         .read_dir_names(path)
@@ -459,7 +478,7 @@ fn structure_hash(
             }
             Ok(EntryKind::Folder) => {
                 hasher.update([1u8]);
-                let child_hash = structure_hash(&child_path, fs, entries_count)?;
+                let child_hash = structure_hash(&child_path, fs, entries_count, depth + 1)?;
                 hasher.update(child_hash);
                 if let Ok(identity) = fs.file_identity(&child_path) {
                     hasher.update([1u8]); // presence marker
