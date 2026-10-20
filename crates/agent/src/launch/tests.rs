@@ -434,6 +434,63 @@ fn cwd_may_not_be_a_unc_share_root() {
     assert!(validate_cwd(Path::new(r"\\server\share\team\app"), &ctx, &fs).is_ok());
 }
 
+#[test]
+fn cwd_may_not_contain_the_state_directory() {
+    let mut ctx = cwd_context();
+    ctx.state_dir = p("home/dev/work/app/.state");
+    let fs = FakeFs::default();
+    assert!(validate_cwd(&p("home/dev/work/app"), &ctx, &fs).is_err());
+    assert!(validate_cwd(&p("home/dev/work"), &ctx, &fs).is_err());
+    assert!(validate_cwd(&p("home/dev"), &ctx, &fs).is_err());
+}
+
+#[test]
+fn cwd_may_not_contain_a_guarded_directory_two_levels_deep() {
+    let mut ctx = cwd_context();
+    ctx.state_dir = p("var/local/state/agentdesktop");
+    let fs = FakeFs::default();
+    assert!(validate_cwd(&p("var/local"), &ctx, &fs).is_err());
+    assert!(validate_cwd(&p("var"), &ctx, &fs).is_err());
+}
+
+#[test]
+fn appdata_and_claude_are_canonicalised_before_guarding() {
+    // The workspace is inside the real target of home/AppData, which is a
+    // junction to another directory.
+    let mut ctx = cwd_context();
+    ctx.home = p("home/dev");
+    let mut fs = FakeFs::default();
+    fs.mapping
+        .insert(p("home/dev/AppData"), p("users/dev/appdata-real"));
+    fs.mapping
+        .insert(p("home/dev/.claude"), p("users/dev/.claude-real"));
+    assert!(validate_cwd(&p("users/dev/appdata-real/local"), &ctx, &fs).is_err());
+    assert!(validate_cwd(&p("users/dev/.claude-real/skills"), &ctx, &fs).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn appdata_symlink_target_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let home = base.join("home");
+    let appdata_target = base.join("appdata-target");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&appdata_target).unwrap();
+    std::fs::create_dir_all(appdata_target.join("local")).unwrap();
+    std::os::unix::fs::symlink(&appdata_target, home.join("AppData")).unwrap();
+    let ctx = CwdContext {
+        home: home.clone(),
+        state_dir: base.join("state"),
+        system_dirs: vec![],
+        denied: vec![],
+    };
+    assert!(
+        validate_cwd(&appdata_target.join("local"), &ctx, &RealFs).is_err(),
+        "workspace inside AppData symlink target should be rejected"
+    );
+}
+
 // ======================================================== resolve_program (AC 6)
 
 #[derive(Default)]

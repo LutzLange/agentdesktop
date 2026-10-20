@@ -2231,7 +2231,7 @@ programs:
     #[test]
     fn daemon_containment_is_a_startup_setting_with_an_executor_path() {
         let config = super::parse_local_daemon(
-            "daemon:\n  user: true\n  containment:\n    executor: /opt/mxc/wxc-exec\n",
+            "daemon:\n  user: true\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n",
         )
         .expect("a containment block parses off Windows");
         let containment = config
@@ -2241,7 +2241,7 @@ programs:
             .expect("containment block");
         assert_eq!(
             containment.executor,
-            std::path::Path::new("/opt/mxc/wxc-exec")
+            std::path::Path::new(r"C:\mxc\wxc-exec.exe")
         );
     }
 
@@ -2258,7 +2258,7 @@ programs:
 
     #[test]
     fn daemon_containment_is_local_only_and_absent_by_default() {
-        let yaml = "daemon:\n  containment:\n    executor: /x/wxc-exec\n";
+        let yaml = "daemon:\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n";
         assert!(
             parse_daemon(yaml)
                 .unwrap_err()

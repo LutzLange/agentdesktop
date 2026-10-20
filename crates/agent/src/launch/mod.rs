@@ -212,8 +212,11 @@ pub fn validate_cwd(cwd: &Path, ctx: &CwdContext, fs: &dyn CwdFs) -> Result<Path
     }
     let mut guarded: Vec<(PathBuf, &str)> = vec![
         (canonical_dir(&ctx.state_dir), "the daemon state directory"),
-        (home.join("AppData"), "AppData"),
-        (home.join(".claude"), "the Claude Code directory"),
+        (canonical_dir(&home.join("AppData")), "AppData"),
+        (
+            canonical_dir(&home.join(".claude")),
+            "the Claude Code directory",
+        ),
     ];
     guarded.extend(
         ctx.system_dirs
@@ -229,6 +232,12 @@ pub fn validate_cwd(cwd: &Path, ctx: &CwdContext, fs: &dyn CwdFs) -> Result<Path
         if is_under(&canonical, &directory) {
             return Err(format!(
                 "workspace may not be under {what} ({})",
+                directory.display()
+            ));
+        }
+        if is_under(&directory, &canonical) {
+            return Err(format!(
+                "workspace may not contain {what} ({})",
                 directory.display()
             ));
         }

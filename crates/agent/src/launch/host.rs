@@ -303,7 +303,18 @@ impl CredentialSource for GatewayCredentialSource {
         };
         // `include_subscription` stays false whatever the configuration says:
         // no subscription token enters the box.
-        api::gateway_credential(&self.app, &effective, client_id, false).await
+        let app = self.app.clone();
+        let client_id = client_id.to_owned();
+        tokio::spawn(
+            async move { api::gateway_credential(&app, &effective, &client_id, false).await },
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("join gateway credential task: {error:#}"),
+            )
+        })?
     }
 }
 
