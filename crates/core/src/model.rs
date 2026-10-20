@@ -190,6 +190,8 @@ pub struct Launch {
     pub started_at_unix_seconds: u64,
     pub ended_at_unix_seconds: Option<u64>,
     pub credential_expires_at_unix_seconds: Option<u64>,
+    /// True once the executable configuration changed while this launch ran
+    /// (set by the periodic check or the exit check; never cleared).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub integrity_drift: bool,
 }

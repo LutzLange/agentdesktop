@@ -1108,6 +1108,151 @@ fn a_file_renamed_over_another_changes_its_identity_and_is_a_replacement() {
 // AC 2 Tests: run_periodic
 
 #[tokio::test]
+async fn run_periodic_reports_a_revert_and_a_repeated_change() {
+    let fs = Arc::new(MockFs::new());
+    let path = PathBuf::from("/test/settings.json");
+    let identity = FileIdentity {
+        volume: 1,
+        file_id: 4100,
+    };
+    fs.set_file(path.clone(), b"original".to_vec(), identity);
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, fs.as_ref() as &dyn IntegrityFs);
+
+    let drift_count = Arc::new(Mutex::new(0usize));
+    let drift_count_clone = drift_count.clone();
+    let on_drift = Arc::new(move |_path: PathBuf, _change: Change| {
+        *drift_count_clone.lock().unwrap() += 1;
+    });
+
+    tokio::time::pause();
+    tokio::spawn(run_periodic(
+        roots,
+        baseline,
+        fs.clone(),
+        Duration::from_secs(60),
+        on_drift,
+    ));
+    // Poll the task once so its timer starts at t=0.
+    tokio::task::yield_now().await;
+
+    for (content, expected) in [
+        (&b"EVIL"[..], 1usize), // change
+        (&b"original"[..], 2),  // revert to the launch state
+        (&b"EVIL"[..], 3),      // the same change again
+        (&b"EVIL"[..], 3),      // quiet period: no new alert
+    ] {
+        fs.set_file(path.clone(), content.to_vec(), identity);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..1000 {
+            if *drift_count.lock().unwrap() >= expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*drift_count.lock().unwrap(), expected, "{content:?}");
+    }
+}
+
+#[tokio::test]
+async fn run_periodic_reports_appear_disappear_and_reappear() {
+    let fs = Arc::new(MockFs::new());
+    let path = PathBuf::from("/test/settings.json");
+    let identity = FileIdentity {
+        volume: 1,
+        file_id: 4200,
+    };
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, fs.as_ref() as &dyn IntegrityFs); // absent
+
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    let kinds_clone = kinds.clone();
+    let on_drift = Arc::new(move |_path: PathBuf, change: Change| {
+        kinds_clone.lock().unwrap().push(change.kind);
+    });
+
+    tokio::time::pause();
+    tokio::spawn(run_periodic(
+        roots,
+        baseline,
+        fs.clone(),
+        Duration::from_secs(60),
+        on_drift,
+    ));
+    // Poll the task once so its timer starts at t=0.
+    tokio::task::yield_now().await;
+
+    for (step, expected) in [(0usize, 1usize), (1, 2), (2, 3)] {
+        match step {
+            0 => fs.set_file(path.clone(), b"planted".to_vec(), identity),
+            1 => fs.set_absent(path.clone()),
+            _ => fs.set_file(path.clone(), b"planted".to_vec(), identity),
+        }
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..1000 {
+            if kinds.lock().unwrap().len() >= expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(kinds.lock().unwrap().len(), expected);
+    }
+    assert_eq!(
+        *kinds.lock().unwrap(),
+        vec![
+            ChangeKind::Appeared,
+            ChangeKind::Disappeared,
+            ChangeKind::Appeared
+        ]
+    );
+}
+
+#[test]
+fn an_identity_only_root_that_appears_keeps_its_mode() {
+    let fs = MockFs::new();
+    let path = PathBuf::from("/workspace/.claude");
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::IdentityOnly,
+    }];
+    let baseline = snapshot(&roots, &fs); // absent at launch
+
+    let identity = FileIdentity {
+        volume: 1,
+        file_id: 4300,
+    };
+    fs.set_folder(path.clone(), vec!["settings.json".into()], identity);
+    fs.set_file(
+        path.join("settings.json"),
+        b"{}".to_vec(),
+        FileIdentity {
+            volume: 1,
+            file_id: 4301,
+        },
+    );
+
+    let result = verify(&roots, &baseline, &fs);
+    assert_eq!(result.changed.len(), 1);
+    assert_eq!(result.changed[0].1.kind, ChangeKind::Appeared);
+    assert!(
+        matches!(
+            result.changed[0].1.after,
+            FileSnapshot::FolderIdentity { .. }
+        ),
+        "the declared mode is kept once the root appears: {:?}",
+        result.changed[0].1.after
+    );
+}
+
+#[tokio::test]
 async fn run_periodic_scenario_a_no_call_at_59s_one_at_61s_two_at_121s() {
     let fs = Arc::new(MockFs::new());
     let path = PathBuf::from("/test/file.txt");

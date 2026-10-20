@@ -795,7 +795,11 @@ fn the_integrity_roots_are_protected_in_the_request() {
     let mut protected: std::collections::BTreeSet<String> = readonly(&value).into_iter().collect();
     protected.extend(denied(&value));
     let roots = super::integrity::integrity_paths(&PathBuf::from(HOME), &PathBuf::from(CWD));
-    for root in roots {
+    let root_paths: std::collections::BTreeSet<String> = roots
+        .iter()
+        .map(|root| root.path.to_str().unwrap().replace('/', "\\"))
+        .collect();
+    for root in &roots {
         if root.mode != super::integrity::RootMode::Recursive {
             continue; // the identity-only folders are writable by design
         }
@@ -803,6 +807,36 @@ fn the_integrity_roots_are_protected_in_the_request() {
         assert!(
             protected.contains(&path),
             "integrity root {path} is neither read-only nor denied in the request: {protected:?}"
+        );
+    }
+
+    // The reverse direction: every protected entry is either an integrity
+    // root or on this named list of entries that are not executable
+    // configuration. A new grant or denial must be classified here or in
+    // integrity_paths, never silently.
+    let not_executable_config: Vec<String> = [
+        r"C:\Users\dev\.local\bin".into(),
+        r"C:\Users\dev\.local\share\claude".into(),
+        r"C:\Program Files\Git".into(),
+        r"C:\lab\agentdesktop".into(),
+        r"C:\Program Files\ClaudeCode".into(),
+        r"C:\Users\dev\.gitconfig".into(),
+        r"C:\Users\dev\.config\git\config".into(),
+        format!(r"{LAUNCH_DIR}\credential"),
+        r"C:\Users\dev\.claude\.credentials.json".into(),
+        r"C:\Users\dev\.claude\history.jsonl".into(),
+        r"C:\Users\dev\.claude\ide".into(),
+        r"C:\Users\dev\.ssh".into(),
+        r"C:\Users\dev\.aws".into(),
+        r"C:\Users\dev\.azure".into(),
+        r"C:\Users\dev\.kube".into(),
+    ]
+    .into_iter()
+    .collect();
+    for entry in &protected {
+        assert!(
+            root_paths.contains(entry) || not_executable_config.contains(entry),
+            "unclassified protected entry {entry}: add it to integrity_paths or name it here"
         );
     }
 }

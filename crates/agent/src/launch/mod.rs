@@ -1057,13 +1057,22 @@ async fn start_launch(
         move || integrity::snapshot(&roots, fs.as_ref())
     })
     .await
-    .unwrap_or_else(|_| BTreeMap::new());
+    .unwrap_or_else(|error| {
+        tracing::warn!(launch_id, %error, "integrity snapshot failed; nothing is watched");
+        BTreeMap::new()
+    });
 
     // Over-budget roots are watched by structure (names, sizes, identities),
     // not content; that is expected on real machines (plugins), so debug.
     for (path, snap) in &baseline {
-        if matches!(snap, integrity::FileSnapshot::TooLarge { .. }) {
-            tracing::debug!(launch_id, path = %path.display(), "integrity check: over the content budget, structure only");
+        match snap {
+            integrity::FileSnapshot::TooLarge { .. } => {
+                tracing::debug!(launch_id, path = %path.display(), "integrity check: over the content budget, structure only");
+            }
+            integrity::FileSnapshot::Unreadable { kind } => {
+                tracing::warn!(launch_id, path = %path.display(), ?kind, "integrity check: root unreadable at launch, not watched");
+            }
+            _ => {}
         }
     }
     let integrity_check = IntegrityCheck {
@@ -1149,7 +1158,7 @@ async fn start_launch(
                 change = %change.kind,
                 before_sha256,
                 after_sha256,
-                "executable config changed while launch ran"
+                "executable config changed during launch"
             );
             registry.set_integrity_drift(&launch_id_clone);
         });

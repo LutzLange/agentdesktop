@@ -733,7 +733,8 @@ file identity of each entry above (folders recursively, up to 1000 entries and 1
 per entry; a larger folder, such as a well-filled `~\.claude\plugins`, is recorded by
 its structure instead: names, kinds, sizes and identities, recursively, without file
 contents, so a changed manifest or an atomically saved file still registers, while an
-in-place edit that keeps a file's size does not), and the identity of the workspace
+in-place edit that keeps a file's size does not; past 10,000 entries only the top-level
+names are recorded), and the identity of the workspace
 `.claude` and `.git`. It compares them every 60 seconds while the box runs and at box
 exit; a transition back to the original state and a repeated change each count again.
 Each change is logged once as a warning (`executable config changed while launch
