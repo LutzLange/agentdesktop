@@ -143,6 +143,16 @@ pub struct DaemonInfo {
     pub containment: Option<ContainmentInfo>,
 }
 
+/// The admin source Claude Code selects for managed settings.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedSettingsSource {
+    Hklm,
+    File,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Whether `agentdesktop run` can launch a sandboxed program on this daemon.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +164,18 @@ pub struct ContainmentInfo {
     /// Why launches are impossible, when `available` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The admin source Claude Code selects (hklm, file, or null when no admin source delivers a policy).
+    #[serde(default)]
+    pub managed_settings_source: Option<ManagedSettingsSource>,
+    /// Whether `allowManagedHooksOnly` is enforced.
+    #[serde(default)]
+    pub managed_hooks_locked: bool,
+    /// Whether `allowManagedMcpServersOnly` with `allowedMcpServers` is enforced.
+    #[serde(default)]
+    pub managed_mcp_locked: bool,
+    /// Error reading managed settings, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_settings_error: Option<String>,
 }
 
 /// Body of `POST /v1/launch`.
@@ -190,6 +212,15 @@ pub struct Launch {
     pub started_at_unix_seconds: u64,
     pub ended_at_unix_seconds: Option<u64>,
     pub credential_expires_at_unix_seconds: Option<u64>,
+    /// Managed-settings source when this launch started.
+    #[serde(default)]
+    pub managed_settings_source: Option<ManagedSettingsSource>,
+    /// Whether `allowManagedHooksOnly` was enforced when this launch started.
+    #[serde(default)]
+    pub managed_hooks_locked: bool,
+    /// Whether `allowManagedMcpServersOnly` was enforced when this launch started.
+    #[serde(default)]
+    pub managed_mcp_locked: bool,
 }
 
 /// State of the daemon's receiver for gateway usage.
@@ -401,10 +432,20 @@ mod tests {
             executor: r"C:\mxc\x64\wxc-exec.exe".into(),
             available: true,
             error: None,
+            managed_settings_source: None,
+            managed_hooks_locked: false,
+            managed_mcp_locked: false,
+            managed_settings_error: None,
         };
         assert_eq!(
             serde_json::to_value(&available).unwrap(),
-            serde_json::json!({"executor": r"C:\mxc\x64\wxc-exec.exe", "available": true})
+            serde_json::json!({
+                "executor": r"C:\mxc\x64\wxc-exec.exe",
+                "available": true,
+                "managedSettingsSource": null,
+                "managedHooksLocked": false,
+                "managedMcpLocked": false
+            })
         );
 
         let unavailable: ContainmentInfo = serde_json::from_str(
@@ -452,6 +493,9 @@ mod tests {
             started_at_unix_seconds: 1_700_000_000,
             ended_at_unix_seconds: None,
             credential_expires_at_unix_seconds: Some(1_700_003_600),
+            managed_settings_source: None,
+            managed_hooks_locked: false,
+            managed_mcp_locked: false,
         };
         let json = serde_json::to_value(&running).unwrap();
         assert_eq!(json["launchId"], "0123456789abcdef");
@@ -459,6 +503,9 @@ mod tests {
         assert_eq!(json["status"], "running");
         assert_eq!(json["startedAtUnixSeconds"], 1_700_000_000u64);
         assert_eq!(json["credentialExpiresAtUnixSeconds"], 1_700_003_600u64);
+        assert_eq!(json["managedSettingsSource"], serde_json::Value::Null);
+        assert_eq!(json["managedHooksLocked"], false);
+        assert_eq!(json["managedMcpLocked"], false);
         let again: Launch = serde_json::from_value(json).unwrap();
         assert_eq!(again, running);
 
@@ -473,5 +520,95 @@ mod tests {
         assert_eq!(json["exitCode"], 3);
         assert_eq!(json["endedAtUnixSeconds"], 1_700_000_100u64);
         assert_eq!(serde_json::from_value::<Launch>(json).unwrap(), exited);
+    }
+
+    #[test]
+    fn launch_and_containment_info_round_trip_with_managed_settings_fields() {
+        use super::ManagedSettingsSource;
+
+        // Launch with managed-settings fields
+        let launch_with_fields = Launch {
+            launch_id: "0123456789abcdef".into(),
+            program: "claude-code".into(),
+            cwd: "/work/app".into(),
+            container_id: "agentdesktop-0123456789abcdef".into(),
+            status: LaunchStatus::Running,
+            exit_code: None,
+            started_at_unix_seconds: 1_700_000_000,
+            ended_at_unix_seconds: None,
+            credential_expires_at_unix_seconds: Some(1_700_003_600),
+            managed_settings_source: Some(ManagedSettingsSource::File),
+            managed_hooks_locked: true,
+            managed_mcp_locked: false,
+        };
+        let json = serde_json::to_value(&launch_with_fields).unwrap();
+        assert_eq!(json["managedSettingsSource"], "file");
+        assert_eq!(json["managedHooksLocked"], true);
+        assert_eq!(json["managedMcpLocked"], false);
+        let again: Launch = serde_json::from_value(json).unwrap();
+        assert_eq!(again, launch_with_fields);
+
+        // Launch without managed-settings fields (defaults)
+        let launch_without_fields = Launch {
+            launch_id: "fedcba9876543210".into(),
+            program: "claude-code".into(),
+            cwd: "/work/app".into(),
+            container_id: "agentdesktop-fedcba9876543210".into(),
+            status: LaunchStatus::Running,
+            exit_code: None,
+            started_at_unix_seconds: 1_700_000_000,
+            ended_at_unix_seconds: None,
+            credential_expires_at_unix_seconds: None,
+            managed_settings_source: None,
+            managed_hooks_locked: false,
+            managed_mcp_locked: false,
+        };
+        let json = serde_json::to_value(&launch_without_fields).unwrap();
+        assert_eq!(json["managedSettingsSource"], serde_json::Value::Null);
+        assert_eq!(json["managedHooksLocked"], false);
+        assert_eq!(json["managedMcpLocked"], false);
+        let again: Launch = serde_json::from_value(json).unwrap();
+        assert_eq!(again, launch_without_fields);
+
+        // ContainmentInfo with managed-settings fields
+        let info_with_fields = ContainmentInfo {
+            executor: r"C:\mxc\x64\wxc-exec.exe".into(),
+            available: true,
+            error: None,
+            managed_settings_source: Some(ManagedSettingsSource::Hklm),
+            managed_hooks_locked: false,
+            managed_mcp_locked: true,
+            managed_settings_error: Some("cannot read file".into()),
+        };
+        let json = serde_json::to_value(&info_with_fields).unwrap();
+        assert_eq!(json["managedSettingsSource"], "hklm");
+        assert_eq!(json["managedHooksLocked"], false);
+        assert_eq!(json["managedMcpLocked"], true);
+        assert_eq!(json["managedSettingsError"], "cannot read file");
+        let again: ContainmentInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(again, info_with_fields);
+
+        // ContainmentInfo without managed-settings fields
+        let info_without_fields = ContainmentInfo {
+            executor: "x".into(),
+            available: false,
+            error: Some("requires user mode".into()),
+            managed_settings_source: None,
+            managed_hooks_locked: false,
+            managed_mcp_locked: false,
+            managed_settings_error: None,
+        };
+        let json = serde_json::to_value(&info_without_fields).unwrap();
+        assert_eq!(json["managedSettingsSource"], serde_json::Value::Null);
+        assert_eq!(json["managedHooksLocked"], false);
+        assert_eq!(json["managedMcpLocked"], false);
+        assert!(
+            !json
+                .as_object()
+                .unwrap()
+                .contains_key("managedSettingsError")
+        );
+        let again: ContainmentInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(again, info_without_fields);
     }
 }
