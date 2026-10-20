@@ -1058,7 +1058,7 @@ async fn start_launch(
     })
     .await
     .unwrap_or_else(|error| {
-        tracing::warn!(launch_id, %error, "integrity snapshot failed; nothing is watched");
+        tracing::warn!(launch_id, %error, "integrity snapshot failed; every root will be reported as appeared");
         BTreeMap::new()
     });
 
@@ -1070,7 +1070,7 @@ async fn start_launch(
                 tracing::debug!(launch_id, path = %path.display(), "integrity check: over the content budget, structure only");
             }
             integrity::FileSnapshot::Unreadable { kind } => {
-                tracing::warn!(launch_id, path = %path.display(), ?kind, "integrity check: root unreadable at launch, not watched");
+                tracing::warn!(launch_id, path = %path.display(), ?kind, "integrity check: root unreadable at launch; content unwatched while it stays so");
             }
             _ => {}
         }

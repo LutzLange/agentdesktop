@@ -811,10 +811,11 @@ fn the_integrity_roots_are_protected_in_the_request() {
     }
 
     // The reverse direction: every protected entry is either an integrity
-    // root or on this named list of entries that are not executable
-    // configuration. A new grant or denial must be classified here or in
-    // integrity_paths, never silently.
-    let not_executable_config: Vec<String> = [
+    // root or on this named list of protected entries outside the roots
+    // (installations, secret denials, and the git configuration files, which
+    // have their own grant). A new grant or denial must be classified here or
+    // in integrity_paths, never silently.
+    let outside_the_roots: Vec<String> = [
         r"C:\Users\dev\.local\bin".into(),
         r"C:\Users\dev\.local\share\claude".into(),
         r"C:\Program Files\Git".into(),
@@ -835,7 +836,7 @@ fn the_integrity_roots_are_protected_in_the_request() {
     .collect();
     for entry in &protected {
         assert!(
-            root_paths.contains(entry) || not_executable_config.contains(entry),
+            root_paths.contains(entry) || outside_the_roots.contains(entry),
             "unclassified protected entry {entry}: add it to integrity_paths or name it here"
         );
     }
