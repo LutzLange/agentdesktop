@@ -107,6 +107,8 @@ fn executor_cfg(path: &str) -> ContainmentStartupConfig {
         executor: PathBuf::from(path),
         egress: agentdesktop_core::config::ContainmentEgress::default(),
         engine: agentdesktop_core::config::ContainmentEngine::default(),
+        egress_upstream: None,
+        git: None,
     }
 }
 
@@ -3863,6 +3865,8 @@ fn posture_carries_engine_name() {
             executor: p("path/to/wxc-exec.exe"),
             egress: agentdesktop_core::config::ContainmentEgress::Allow,
             engine: agentdesktop_core::config::ContainmentEngine::Mxc,
+            egress_upstream: None,
+            git: None,
         }),
         true,
         true,
@@ -3883,6 +3887,8 @@ fn posture_carries_engine_when_containment_unavailable() {
             executor: p("path/to/missing.exe"),
             egress: agentdesktop_core::config::ContainmentEgress::Allow,
             engine: agentdesktop_core::config::ContainmentEngine::Mxc,
+            egress_upstream: None,
+            git: None,
         }),
         true,
         true,

@@ -1308,3 +1308,13 @@ fn parse_pid_file(text: &str) -> Option<(u32, u64)> {
     let start_time = parts.next()?.parse().ok()?;
     Some((pid, start_time))
 }
+
+// PR 4 stub: gitconfig generation
+fn generate_gitconfig(
+    _launch_dir: &Path,
+    _pairing: &str,
+    _proxy_port: u16,
+    _git_allow: &[String],
+) -> anyhow::Result<PathBuf> {
+    todo!("PR 4: gitconfig generation")
+}

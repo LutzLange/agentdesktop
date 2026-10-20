@@ -2301,6 +2301,8 @@ programs:
                 executor: PathBuf::from(r"C:\mxc\x64\wxc-exec.exe"),
                 egress: config::ContainmentEgress::default(),
                 engine: config::ContainmentEngine::default(),
+                egress_upstream: None,
+                git: None,
             }),
             ..Default::default()
         }
@@ -2385,7 +2387,8 @@ programs:
     }
 
     #[test]
-    fn containment_egress_defaults_to_allow_when_absent() {
+    fn containment_egress_defaults_to_deny_when_absent() {
+        // PR 4: default flipped from Allow to Deny
         let resolved = daemon_args(true)
             .resolve(
                 config::DaemonStartupConfig::default(),
@@ -2395,7 +2398,7 @@ programs:
             .unwrap();
         assert_eq!(
             resolved.containment_egress,
-            config::ContainmentEgress::Allow
+            config::ContainmentEgress::Deny
         );
     }
 

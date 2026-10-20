@@ -302,6 +302,9 @@ pub(crate) const CAPI_ROUTE: &str = "/vscode-copilot-capi";
 /// it holds no credential and needs nothing but loopback.
 pub(crate) const SANDBOX_ROUTE: &str = "/sandbox";
 
+/// Git relay route for allowed git hosts.
+pub(crate) const GIT_ROUTE: &str = "/git";
+
 /// The prefixed routes: the Copilot programs and the sandbox route. A prefix
 /// matches only at a `/` boundary, so
 /// `/vscode-copilot-passthrough/...` never matches `/vscode-copilot`.
@@ -5027,4 +5030,549 @@ mod tests {
         .await
         .unwrap();
     }
+    // PR 4 tests: forward proxy, git relay, deny default
+
+    #[test]
+    fn git_endpoint_classification_fetch_discovery() {
+        let result = classify_git_endpoint("/repo.git/info/refs", Some("service=git-upload-pack"));
+        assert_eq!(result, Some(GitEndpoint::FetchDiscovery));
+    }
+
+    #[test]
+    fn git_endpoint_classification_push_discovery() {
+        let result = classify_git_endpoint("/repo.git/info/refs", Some("service=git-receive-pack"));
+        assert_eq!(result, Some(GitEndpoint::PushDiscovery));
+    }
+
+    #[test]
+    fn git_endpoint_classification_fetch_rpc() {
+        let result = classify_git_endpoint("/repo.git/git-upload-pack", None);
+        assert_eq!(result, Some(GitEndpoint::FetchRpc));
+    }
+
+    #[test]
+    fn git_endpoint_classification_push_rpc() {
+        let result = classify_git_endpoint("/repo.git/git-receive-pack", None);
+        assert_eq!(result, Some(GitEndpoint::PushRpc));
+    }
+
+    #[test]
+    fn git_endpoint_classification_dumb_protocol_refused() {
+        let result = classify_git_endpoint("/repo.git/info/refs", None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn git_endpoint_classification_objects_refused() {
+        let result = classify_git_endpoint("/repo.git/objects/ab/cd1234", None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn pkt_line_err_discovery_format() {
+        let response = pkt_line_err("push not allowed", false);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/x-git-upload-pack-advertisement"
+        );
+    }
+
+    #[test]
+    fn pkt_line_err_rpc_format() {
+        let response = pkt_line_err("host not allowed", true);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/x-git-upload-pack-result"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_route_requires_pairing() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (dir, state) = request_source_state(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "test-client");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            // Request without pairing header should fail
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{}/git/github.com/org/repo.git/info/refs?service=git-upload-pack", proxy_address))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let (_, code, _) = refusal(response).await;
+            assert_eq!(code, "pairing_invalid");
+
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_route_host_not_allowed() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (dir, state) = request_source_state(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "test-client");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{}/git/evil.com/repo.git/info/refs?service=git-upload-pack", proxy_address))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            request.headers_mut().insert(PAIRING_HEADER, HeaderValue::from_str(&session.pairing).unwrap());
+            
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let (_, code, _) = refusal(response).await;
+            assert_eq!(code, "git_host_not_allowed");
+
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_leg_chains_to_the_egress_upstream() {
+        // TODO: stub L7 upstream; assert path case preserved, Host = egress host,
+        // Authorization carries only the git credential (no gateway-hop auth header in v1)
+        todo!("PR 4: git-leg chaining to L7 upstream");
+    }
+
+    #[tokio::test]
+    async fn git_leg_retries_503_exactly_once() {
+        // TODO: first 503 from egress upstream → one retry; second 503 surfaces to the box
+        todo!("PR 4: git-leg 503 retry-exactly-once");
+    }
+
+    #[tokio::test]
+    async fn connect_requires_pairing_in_proxy_authorization() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (dir, state) = request_source_state(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+            let config = default_config();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            // CONNECT without Proxy-Authorization should fail
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri("github.com:443")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_always_refused_egress_not_supported() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (dir, state) = request_source_state(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "test-client");
+
+            // Encode pairing as Basic auth (pairing:)
+            let pairing_auth = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:", session.pairing));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            // Paired CONNECT request gets 403 egress_not_supported via ProxyError envelope
+            let mut request = Request::builder()
+                .method(Method::CONNECT)
+                .uri("github.com:443")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            request.headers_mut().insert(
+                "proxy-authorization",
+                HeaderValue::from_str(&format!("Basic {}", pairing_auth)).unwrap()
+            );
+
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+            let body_bytes = response.collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(body["error"]["code"], "egress_not_supported");
+
+            proxy.abort();
+            let _ = proxy.await;
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn egress_default_is_deny() {
+        use agentdesktop_core::config::ContainmentEgress;
+        assert_eq!(ContainmentEgress::default(), ContainmentEgress::Deny);
+    }
+
+    #[test]
+    fn validate_containment_egress_upstream_url() {
+        use agentdesktop_core::config::{ContainmentStartupConfig, EgressUpstreamConfig, validate_containment_startup};
+        use std::path::PathBuf;
+        use std::str::FromStr;
+        use url::Url;
+
+        let mut cfg = ContainmentStartupConfig {
+            executor: PathBuf::from("C:\\wxc\\wxc-exec.exe"),
+            egress: Default::default(),
+            engine: Default::default(),
+            egress_upstream: Some(EgressUpstreamConfig {
+                url: Url::from_str("https://gateway.example.com/forward").unwrap(),
+                authentication: None,
+            }),
+            git: None,
+        };
+
+        // Valid URL should pass
+        assert!(validate_containment_startup(&cfg, true).is_ok());
+
+        // URL with credentials should fail
+        cfg.egress_upstream = Some(EgressUpstreamConfig {
+            url: Url::from_str("https://user:pass@gateway.example.com/forward").unwrap(),
+            authentication: None,
+        });
+        assert!(validate_containment_startup(&cfg, true).is_err());
+
+        // URL with query should fail
+        cfg.egress_upstream = Some(EgressUpstreamConfig {
+            url: Url::from_str("https://gateway.example.com/forward?key=value").unwrap(),
+            authentication: None,
+        });
+        assert!(validate_containment_startup(&cfg, true).is_err());
+
+        // URL without host should fail
+        cfg.egress_upstream = Some(EgressUpstreamConfig {
+            url: Url::from_str("file:///path").unwrap(),
+            authentication: None,
+        });
+        assert!(validate_containment_startup(&cfg, true).is_err());
+    }
+
+    #[test]
+    fn validate_containment_git_urls_must_be_https() {
+        use agentdesktop_core::config::{ContainmentStartupConfig, GitConfig, validate_containment_startup};
+        use std::path::PathBuf;
+
+        let mut cfg = ContainmentStartupConfig {
+            executor: PathBuf::from("C:\\wxc\\wxc-exec.exe"),
+            egress: Default::default(),
+            engine: Default::default(),
+            egress_upstream: None,
+            git: Some(GitConfig {
+                allow: vec!["https://github.com/org/".to_string()],
+                push_allow: vec!["https://github.com/org/".to_string()],
+                credentials: vec![],
+            }),
+        };
+
+        // HTTPS URLs should pass
+        assert!(validate_containment_startup(&cfg, true).is_ok());
+
+        // HTTP URLs in allow should fail
+        cfg.git = Some(GitConfig {
+            allow: vec!["http://github.com/org/".to_string()],
+            push_allow: vec![],
+            credentials: vec![],
+        });
+        assert!(validate_containment_startup(&cfg, true).is_err());
+
+        // SSH URLs in allow should fail
+        cfg.git = Some(GitConfig {
+            allow: vec!["git@github.com:org/repo.git".to_string()],
+            push_allow: vec![],
+            credentials: vec![],
+        });
+        assert!(validate_containment_startup(&cfg, true).is_err());
+
+        // HTTP URLs in pushAllow should fail
+        cfg.git = Some(GitConfig {
+            allow: vec!["https://github.com/org/".to_string()],
+            push_allow: vec!["http://github.com/org/".to_string()],
+            credentials: vec![],
+        });
+        assert!(validate_containment_startup(&cfg, true).is_err());
+    }
 }
+// PR 4 stubs: Git relay and CONNECT proxy (production stubs with todo!())
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitEndpoint {
+    FetchDiscovery,
+    FetchRpc,
+    PushDiscovery,
+    PushRpc,
+}
+
+fn classify_git_endpoint(_path: &str, _query: Option<&str>) -> Option<GitEndpoint> {
+    todo!("PR 4: git endpoint classification")
+}
+
+fn pkt_line_err(_message: &str, _is_rpc: bool) -> Response<ProxyBody> {
+    todo!("PR 4: pkt-line ERR response")
+}
+
+async fn handle_git_request(
+    _request: Request<Incoming>,
+    _client: &ProxyClient,
+    _host_and_path: &str,
+    _session: &sessions::SessionRef,
+) -> Result<Response<ProxyBody>, ProxyError> {
+    todo!("PR 4: git relay logic")
+}
+
+async fn handle_connect_request(
+    _request: Request<Incoming>,
+    _pairing: &str,
+) -> Result<Response<ProxyBody>, ProxyError> {
+    todo!("PR 4: CONNECT proxy logic")
+}
+
+
+    // Credential injection tests
+    #[test]
+    fn credential_injection_longest_prefix_match() {
+        use agentdesktop_core::config::GitCredentialEntry;
+        
+        let credentials = vec![
+            GitCredentialEntry {
+                url_prefix: "https://github.com/".to_string(),
+                username: "user1".to_string(),
+                secret: "secret1".to_string(),
+            },
+            GitCredentialEntry {
+                url_prefix: "https://github.com/org/".to_string(),
+                username: "user2".to_string(),
+                secret: "secret2".to_string(),
+            },
+        ];
+        
+        // TODO: implement longest-prefix matching logic
+        let _ = credentials;
+        todo!("PR 4: credential longest-prefix selection");
+    }
+
+    #[test]
+    fn credential_injection_only_for_allowed_hosts() {
+        use agentdesktop_core::config::{GitConfig, GitCredentialEntry};
+        
+        let git_config = GitConfig {
+            allow: vec!["https://github.com/org/".to_string()],
+            push_allow: vec![],
+            credentials: vec![GitCredentialEntry {
+                url_prefix: "https://github.com/".to_string(),
+                username: "user".to_string(),
+                secret: "secret".to_string(),
+            }],
+        };
+        
+        // TODO: verify credential injected only when host in allow list
+        let _ = git_config;
+        todo!("PR 4: credential injection gating");
+    }
+
+    #[test]
+    fn credential_never_injected_for_non_allowed_host() {
+        use agentdesktop_core::config::{GitConfig, GitCredentialEntry};
+        
+        let git_config = GitConfig {
+            allow: vec!["https://allowed.example.com/".to_string()],
+            push_allow: vec![],
+            credentials: vec![GitCredentialEntry {
+                url_prefix: "https://evil.example.com/".to_string(),
+                username: "user".to_string(),
+                secret: "secret".to_string(),
+            }],
+        };
+        
+        // TODO: verify no credential injection when host not in allow list
+        let _ = git_config;
+        todo!("PR 4: credential non-injection for disallowed hosts");
+    }
+
+    #[test]
+    fn git_credential_secret_never_serialized() {
+        use agentdesktop_core::config::GitCredentialEntry;
+        
+        let entry = GitCredentialEntry {
+            url_prefix: "https://github.com/".to_string(),
+            username: "user".to_string(),
+            secret: "supersecret".to_string(),
+        };
+        
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(json.get("secret").is_none(), "secret field must not be serialized");
+        assert_eq!(json.get("username").and_then(|v| v.as_str()), Some("user"));
+    }
+
+    // Gitconfig generation tests
+    #[test]
+    fn gitconfig_insteadof_rewrites_to_git_route() {
+        // TODO: verify url.<loopback-git-route>.insteadOf = <allowed-prefix>
+        todo!("PR 4: gitconfig insteadOf generation");
+    }
+
+    #[test]
+    fn gitconfig_pairing_scoped_to_loopback() {
+        // F1 security property: pairing must only appear under http.<loopback-url>.extraHeader
+        // TODO: verify http.<http://127.0.0.1:PORT/>.extraHeader contains pairing
+        todo!("PR 4: gitconfig pairing scoping");
+    }
+
+    #[test]
+    fn gitconfig_proxy_bypass() {
+        // TODO: verify http.<http://127.0.0.1:PORT/>.proxy = (empty)
+        todo!("PR 4: gitconfig proxy bypass");
+    }
+
+    #[test]
+    fn gitconfig_credential_helper_emptied() {
+        // TODO: verify credential.helper= (empty first entry)
+        todo!("PR 4: gitconfig credential.helper reset");
+    }
+
+    #[test]
+    fn gitconfig_identity_allowlist() {
+        // TODO: verify user.name, user.email, user.signingkey, commit.gpgsign, 
+        // core.longpaths, safe.directory (with --get-all) copied
+        todo!("PR 4: gitconfig identity allowlist");
+    }
+
+    #[test]
+    fn gitconfig_file_lifecycle() {
+        // TODO: verify file written to launch dir, added to sweep list
+        todo!("PR 4: gitconfig lifecycle");
+    }
+
+    #[test]
+    fn gitconfig_env_injection() {
+        // TODO: verify GIT_CONFIG_GLOBAL=<path> and GIT_TERMINAL_PROMPT=0
+        todo!("PR 4: gitconfig env vars");
+    }
+
+    #[test]
+    fn gitconfig_real_paths_denied() {
+        // TODO: verify ~/.gitconfig and ~/.config/git/config in denied list
+        todo!("PR 4: gitconfig real paths denied");
+    }
+
+    // Redirect policy tests
+    #[test]
+    fn redirect_follows_in_prefix_to_3_hops() {
+        // TODO: verify redirect following up to 3 hops when target matches same allow entry
+        todo!("PR 4: redirect 3-hop limit");
+    }
+
+    #[test]
+    fn redirect_refuses_4th_hop() {
+        // TODO: verify 4th redirect refused
+        todo!("PR 4: redirect 4th hop refusal");
+    }
+
+    #[test]
+    fn redirect_refuses_out_of_prefix() {
+        // TODO: verify redirect to URL not matching same allow entry is refused
+        todo!("PR 4: redirect out-of-prefix refusal");
+    }
+
+    #[test]
+    fn redirect_never_relayed_to_box() {
+        // TODO: verify 3xx responses never sent to box, daemon follows itself
+        todo!("PR 4: redirect handling daemon-side");
+    }
+
+    // Revocation tests
+    #[tokio::test]
+    async fn revocation_aborts_inflight_git_request() {
+        // TODO: verify in-flight git request aborted with outcome="canceled" line
+        todo!("PR 4: revocation abort with canceled outcome");
+    }
+
+    // Log shape tests
+    #[tokio::test]
+    async fn git_request_log_has_host_and_decision() {
+        // TODO: verify git request logs include host and decision fields
+        todo!("PR 4: git log shape");
+    }
+
+    #[tokio::test]
+    async fn connect_request_log_has_host_and_decision() {
+        // TODO: verify CONNECT refusal logs include host and decision (refuse) fields
+        todo!("PR 4: CONNECT refusal log shape");
+    }
+
+    #[tokio::test]
+    async fn log_outcome_values_unchanged() {
+        // TODO: verify outcome field uses existing values only: complete/aborted/canceled
+        todo!("PR 4: log outcome values");
+    }
+
+    // Default flip warn test
+    #[tokio::test]
+    async fn explicit_egress_allow_warns_at_launch() {
+        // TODO: verify explicit egress: allow logs warn at launch
+        todo!("PR 4: egress allow warn");
+    }
+
+    // Prefix edge cases from AC 5
+    #[test]
+    fn prefix_matching_exact_on_configured() {
+        // TODO: verify prefix match on configured prefix, not repo path segment
+        todo!("PR 4: prefix matching configured");
+    }
+
+    #[test]
+    fn prefix_matching_case_insensitive_host() {
+        // TODO: verify case-insensitive host matching
+        todo!("PR 4: prefix case-insensitive host");
+    }
+
+    #[test]
+    fn prefix_matching_default_port_handled() {
+        // TODO: verify explicit vs default port handling
+        todo!("PR 4: prefix default port");
+    }
+
+    #[test]
+    fn prefix_matching_trailing_slash_normalized() {
+        // TODO: verify trailing slash normalization
+        todo!("PR 4: prefix trailing slash");
+    }
