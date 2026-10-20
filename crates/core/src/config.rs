@@ -2319,7 +2319,7 @@ programs:
     #[test]
     fn containment_egress_allow_parses() {
         let config = super::parse_local_daemon(
-            "daemon:\n  containment:\n    executor: /x/wxc-exec\n    egress: allow\n",
+            "daemon:\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n    egress: allow\n",
         )
         .expect("allow parses");
         let egress = config.daemon.unwrap().containment.unwrap().egress;
@@ -2329,7 +2329,7 @@ programs:
     #[test]
     fn containment_egress_deny_parses() {
         let config = super::parse_local_daemon(
-            "daemon:\n  containment:\n    executor: /x/wxc-exec\n    egress: deny\n",
+            "daemon:\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n    egress: deny\n",
         )
         .expect("deny parses");
         let egress = config.daemon.unwrap().containment.unwrap().egress;
@@ -2338,9 +2338,10 @@ programs:
 
     #[test]
     fn containment_egress_absent_defaults_to_allow() {
-        let config =
-            super::parse_local_daemon("daemon:\n  containment:\n    executor: /x/wxc-exec\n")
-                .expect("absent defaults");
+        let config = super::parse_local_daemon(
+            "daemon:\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n",
+        )
+        .expect("absent defaults");
         let egress = config.daemon.unwrap().containment.unwrap().egress;
         assert_eq!(egress, super::ContainmentEgress::Allow);
     }
