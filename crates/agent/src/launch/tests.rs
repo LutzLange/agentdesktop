@@ -369,7 +369,7 @@ fn a_context_directory_that_does_not_exist_is_used_raw() {
 #[test]
 fn cwd_with_dot_dot_is_judged_by_where_it_really_points() {
     let temp = tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let base = strip_verbatim(std::fs::canonicalize(temp.path()).unwrap());
     let home = base.join("home");
     std::fs::create_dir_all(home.join(".claude")).unwrap();
     std::fs::create_dir_all(home.join("projects/app")).unwrap();
