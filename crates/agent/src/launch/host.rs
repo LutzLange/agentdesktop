@@ -277,7 +277,7 @@ fn process_start_time(_child: &Child) -> anyhow::Result<u64> {
 }
 
 /// The gateway credential for a launch: the local API's own path, with the
-/// subscription never included and no browser sign-in for a refresh.
+/// subscription never included. The pre-flight is interactive by design.
 pub struct GatewayCredentialSource {
     pub app: api::AppState,
 }
