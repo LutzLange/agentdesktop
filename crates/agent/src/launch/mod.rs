@@ -999,6 +999,14 @@ async fn start_launch(
         }
     };
 
+    if let Some(error) = &managed_posture.error {
+        tracing::warn!(
+            launch_id = %launch_id,
+            error = %error,
+            "managed-settings posture could not be determined at launch"
+        );
+    }
+
     let mut child =
         match state
             .executor

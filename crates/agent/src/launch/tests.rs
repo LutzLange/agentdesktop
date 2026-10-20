@@ -1452,6 +1452,7 @@ struct FakeHost {
     client_exe_dir: PathBuf,
     clock: Clock,
     managed_file: Option<&'static str>,
+    managed_file_error: Option<&'static str>,
 }
 
 impl LaunchHost for FakeHost {
@@ -1508,7 +1509,10 @@ impl LaunchHost for FakeHost {
         use crate::provider::claude_code::managed::ManagedSources;
         ManagedSources {
             hklm: None,
-            file: self.managed_file.map(|s| Ok(s.to_owned())),
+            file: self
+                .managed_file_error
+                .map(|msg| Err(io::Error::other(msg)))
+                .or_else(|| self.managed_file.map(|s| Ok(s.to_owned()))),
             drop_ins: Vec::new(),
         }
     }
@@ -1694,6 +1698,7 @@ struct Setup {
     claude_installed: bool,
     credentials_must_not_be_reached: bool,
     managed_file: Option<&'static str>,
+    managed_file_error: Option<&'static str>,
 }
 
 impl Default for Setup {
@@ -1708,6 +1713,7 @@ impl Default for Setup {
             claude_installed: true,
             credentials_must_not_be_reached: false,
             managed_file: None,
+            managed_file_error: None,
         }
     }
 }
@@ -1830,6 +1836,7 @@ impl Harness {
                 client_exe_dir,
                 clock: clock.clone(),
                 managed_file: setup.managed_file,
+                managed_file_error: setup.managed_file_error,
             }),
             registry: LaunchRegistry::new(),
             availability,
@@ -2748,6 +2755,25 @@ async fn launch_records_managed_settings_source_and_locks_when_present() {
 async fn launch_records_null_source_and_false_locks_when_managed_file_absent() {
     let h = Harness::start(Setup {
         managed_file: None,
+        ..Setup::default()
+    })
+    .await;
+
+    let launched = h.launch_ok().await;
+    assert_eq!(launched.managed_settings_source, None);
+    assert!(!launched.managed_hooks_locked);
+    assert!(!launched.managed_mcp_locked);
+
+    let listed = h.listed().await;
+    assert_eq!(listed[0].managed_settings_source, None);
+    assert!(!listed[0].managed_hooks_locked);
+    assert!(!listed[0].managed_mcp_locked);
+}
+
+#[tokio::test(start_paused = true)]
+async fn launch_records_null_source_and_false_locks_when_posture_has_error() {
+    let h = Harness::start(Setup {
+        managed_file_error: Some("access denied"),
         ..Setup::default()
     })
     .await;
