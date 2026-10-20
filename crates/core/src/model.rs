@@ -159,6 +159,8 @@ pub enum ManagedSettingsSource {
 pub struct ContainmentInfo {
     /// Configured `daemon.containment.executor` (lossy display string).
     pub executor: String,
+    /// The sandbox engine name.
+    pub engine: String,
     /// Whether launches are possible. `false` carries the reason in `error`.
     pub available: bool,
     /// Why launches are impossible, when `available` is `false`.

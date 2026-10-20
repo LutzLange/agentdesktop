@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
+use super::engine::mxc::build_request;
 
 #[test]
 fn the_user_mode_pipe_admits_system_and_the_daemon_user_only() {
@@ -323,6 +324,7 @@ mod handler {
             registry: LaunchRegistry::new(),
             availability: Some(ContainmentInfo {
                 executor: "wxc-exec.exe".into(),
+                engine: "mxc".to_owned(),
                 available: true,
                 error: None,
                 managed_settings_source: None,
@@ -341,6 +343,7 @@ mod handler {
                 state_dir: std::env::temp_dir(),
             }),
             egress: agentdesktop_core::config::ContainmentEgress::default(),
+            engine: Arc::new(engine::mxc::MxcEngine),
         }
     }
 

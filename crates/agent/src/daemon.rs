@@ -524,6 +524,7 @@ where
         cfg!(windows),
         args.claude_settings_overridden,
         &|path| path.exists(),
+        "mxc",
     );
     let (usage_store, usage_receiver) = match &args.usage {
         Some(usage) => {
@@ -695,6 +696,7 @@ where
             .and_then(|listener| listener.local_addr().ok()),
         session_policy,
         egress: args.containment_egress,
+        engine: Arc::new(launch::engine::mxc::MxcEngine),
     };
     let app = api::router(state.clone())
         .merge(llm_proxy::sessions::session_router(session_api))
@@ -2273,6 +2275,7 @@ programs:
             containment: Some(config::ContainmentStartupConfig {
                 executor: PathBuf::from(r"C:\mxc\x64\wxc-exec.exe"),
                 egress: config::ContainmentEgress::default(),
+                engine: config::ContainmentEngine::default(),
             }),
             ..Default::default()
         }

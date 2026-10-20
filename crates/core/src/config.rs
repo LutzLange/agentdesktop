@@ -135,6 +135,10 @@ pub struct ContainmentStartupConfig {
     /// Outbound network for the sandboxed program: `allow` (default) or `deny`. With `deny` the box reaches only loopback: model requests go through the local LLM proxy, and git over HTTPS and package downloads fail. Read at startup only (restart the daemon after changing it); ignored with `--once` and `--dry-run`.
     #[serde(default, skip_serializing_if = "ContainmentEgress::is_default")]
     pub egress: ContainmentEgress,
+    /// Sandbox engine: `mxc` (default, the only engine). Read at startup only
+    /// (restart the daemon after changing it); ignored with `--once` and `--dry-run`.
+    #[serde(default, skip_serializing_if = "ContainmentEngine::is_default")]
+    pub engine: ContainmentEngine,
 }
 
 /// Checks `daemon.containment`. With `windows == true` the executor must be an
@@ -361,6 +365,23 @@ pub enum ContainmentEgress {
 }
 
 impl ContainmentEgress {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Sandbox engine: `mxc` (default, the only engine). Read at startup only
+/// (restart the daemon after changing it); ignored with `--once` and `--dry-run`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum ContainmentEngine {
+    /// MXC (Windows AppContainer).
+    #[default]
+    Mxc,
+}
+
+impl ContainmentEngine {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }

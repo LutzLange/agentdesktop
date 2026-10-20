@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 
 use super::*;
+use super::engine::mxc::build_request;
 
 // --- Log capture helper for session logging test (AC 2)
 
@@ -105,22 +106,24 @@ fn executor_cfg(path: &str) -> ContainmentStartupConfig {
     ContainmentStartupConfig {
         executor: PathBuf::from(path),
         egress: agentdesktop_core::config::ContainmentEgress::default(),
+        engine: agentdesktop_core::config::ContainmentEngine::default(),
     }
 }
 
 #[test]
 fn containment_info_is_absent_when_unconfigured() {
-    assert_eq!(containment_info(None, true, true, false, &|_| true), None);
+    assert_eq!(containment_info(None, true, true, false, &|_| true, "mxc"), None);
 }
 
 #[test]
 fn containment_info_is_available_for_a_user_mode_windows_daemon_with_the_executor() {
     let cfg = executor_cfg(r"C:\mxc\x64\wxc-exec.exe");
-    let info = containment_info(Some(&cfg), true, true, false, &|_| true).unwrap();
+    let info = containment_info(Some(&cfg), true, true, false, &|_| true, "mxc").unwrap();
     assert_eq!(
         info,
         ContainmentInfo {
             executor: r"C:\mxc\x64\wxc-exec.exe".into(),
+            engine: "mxc".to_owned(),
             available: true,
             error: None,
             managed_settings_source: None,
@@ -134,7 +137,7 @@ fn containment_info_is_available_for_a_user_mode_windows_daemon_with_the_executo
 #[test]
 fn containment_info_needs_user_mode() {
     let cfg = executor_cfg(r"C:\mxc\wxc-exec.exe");
-    let info = containment_info(Some(&cfg), false, true, false, &|_| true).unwrap();
+    let info = containment_info(Some(&cfg), false, true, false, &|_| true, "mxc").unwrap();
     assert!(!info.available);
     assert_eq!(info.error.as_deref(), Some("requires user mode"));
     assert_eq!(info.executor, r"C:\mxc\wxc-exec.exe");
@@ -143,7 +146,7 @@ fn containment_info_needs_user_mode() {
 #[test]
 fn containment_info_is_windows_only() {
     let cfg = executor_cfg("/opt/mxc/wxc-exec.exe");
-    let info = containment_info(Some(&cfg), true, false, false, &|_| true).unwrap();
+    let info = containment_info(Some(&cfg), true, false, false, &|_| true, "mxc").unwrap();
     assert!(!info.available);
     assert_eq!(info.error.as_deref(), Some("Windows only"));
 }
@@ -155,7 +158,7 @@ fn containment_info_names_a_missing_executor() {
     let info = containment_info(Some(&cfg), true, true, false, &|path| {
         seen.borrow_mut().push(path.to_owned());
         false
-    })
+    }, "mxc")
     .unwrap();
     assert!(!info.available);
     assert_eq!(
@@ -171,7 +174,7 @@ fn containment_info_names_a_missing_executor() {
 #[test]
 fn containment_info_is_unavailable_when_the_claude_settings_path_is_overridden() {
     let cfg = executor_cfg(r"C:\mxc\wxc-exec.exe");
-    let info = containment_info(Some(&cfg), true, true, true, &|_| true).unwrap();
+    let info = containment_info(Some(&cfg), true, true, true, &|_| true, "mxc").unwrap();
     assert!(!info.available);
     let error = info.error.expect("a reason");
     assert!(
@@ -1360,7 +1363,7 @@ fn write_request_creates_the_private_launch_dir_and_writes_json_without_a_bom() 
     let is_dir = |path: &Path| directories.contains(path.to_str().unwrap());
     let request = build_request(&launch_input(&exists, &is_dir));
 
-    let path = write_request(&launch_dir, &request).unwrap();
+    let path = write_request(&launch_dir, &serde_json::to_vec_pretty(&request).unwrap()).unwrap();
 
     assert_eq!(path, launch_dir.join("request.json"));
     let bytes = std::fs::read(&path).unwrap();
@@ -1382,7 +1385,7 @@ fn write_request_uses_a_private_directory_and_a_0600_file() {
     let is_dir = |_: &Path| false;
     let request = build_request(&launch_input(&exists, &is_dir));
 
-    let path = write_request(&launch_dir, &request).unwrap();
+    let path = write_request(&launch_dir, &serde_json::to_vec_pretty(&request).unwrap()).unwrap();
 
     let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&launch_dir), 0o700);
@@ -2050,6 +2053,7 @@ impl Harness {
         let availability = match setup.availability {
             Availability::Available => Some(ContainmentInfo {
                 executor: executor_path.display().to_string(),
+                engine: "mxc".to_owned(),
                 available: true,
                 error: None,
                 managed_settings_source: None,
@@ -2059,6 +2063,7 @@ impl Harness {
             }),
             Availability::Unavailable(error) => Some(ContainmentInfo {
                 executor: executor_path.display().to_string(),
+                engine: "mxc".to_owned(),
                 available: false,
                 error: Some(error.to_owned()),
                 managed_settings_source: None,
@@ -2118,6 +2123,7 @@ impl Harness {
             proxy_address: setup.proxy_address,
             session_policy: setup.session_policy.clone(),
             egress: setup.egress,
+            engine: Arc::new(engine::mxc::MxcEngine),
         };
 
         let mut router = router(state);
@@ -3501,4 +3507,388 @@ fn copy_log_lines_uses_raw_byte_offset_not_lossy_string_offset() {
 
     let final_offset = super::copy_log_lines("test-launch", &log, new_offset);
     assert_eq!(final_offset, 12, "second read from correct offset");
+}
+
+// --- PR 2d spec-derived tests (AC 7, engine interface)
+
+#[test]
+fn the_engine_reproduces_the_baseline_request_bytes() {
+    use engine::mxc::MxcEngine;
+    use engine::Engine;
+    use profile::CLAUDE_CODE;
+
+    const LAUNCH_ID: &str = "0123456789abcdef";
+
+    // Oracle (a): launch_input + snapshot_existing, egress: Allow
+    const ORACLE_A: &str = r#"{
+  "version": "1.0.0",
+  "containment": "processcontainer",
+  "containerId": "agentdesktop-0123456789abcdef",
+  "ui": {
+    "disable": false,
+    "clipboard": "none",
+    "injection": false
+  },
+  "process": {
+    "commandLine": "cmd.exe /d /v:off /c start \"agentdesktop: claude\" /WAIT /D \"C:\\lab\\ws pr1\" \"C:\\Users\\dev\\.local\\bin\\claude.exe\" --debug-file \"C:\\lab\\ws pr1\\pr1-l2.log\" --allowedTools PowerShell",
+    "cwd": "C:\\lab\\ws pr1",
+    "inheritDefaultEnv": false,
+    "env": [
+      "ANTHROPIC_AUTH_TOKEN=placeholder",
+      "ANTHROPIC_BASE_URL=http://127.0.0.1:4000/sandbox",
+      "ANTHROPIC_CUSTOM_HEADERS=x-agentdesktop-pairing: test-pairing-value",
+      "APPDATA=C:\\Users\\dev\\AppData\\Roaming",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+      "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
+      "CLAUDE_CODE_USE_POWERSHELL_TOOL=1",
+      "CLAUDE_CONFIG_DIR=C:\\Users\\dev\\.claude",
+      "ComSpec=C:\\Windows\\system32\\cmd.exe",
+      "DISABLE_AUTOUPDATER=1",
+      "HOME=C:\\Users\\dev",
+      "HOMEDRIVE=C:",
+      "HOMEPATH=\\Users\\dev",
+      "LOCALAPPDATA=C:\\Users\\dev\\AppData\\Local",
+      "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Program Files\\Git\\cmd;C:\\Users\\dev\\.local\\bin;C:\\lab\\agentdesktop",
+      "PATHEXT=.COM;.EXE;.BAT;.CMD",
+      "ProgramData=C:\\ProgramData",
+      "ProgramFiles=C:\\Program Files",
+      "SystemDrive=C:",
+      "SystemRoot=C:\\Windows",
+      "TEMP=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp",
+      "TERM=xterm-256color",
+      "TMP=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp",
+      "USERNAME=dev",
+      "USERPROFILE=C:\\Users\\dev",
+      "windir=C:\\Windows"
+    ]
+  },
+  "filesystem": {
+    "readwritePaths": [
+      "C:\\lab\\ws pr1",
+      "C:\\Users\\dev\\.claude",
+      "C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp"
+    ],
+    "readonlyPaths": [
+      "C:\\Users\\dev\\.local\\bin",
+      "C:\\Users\\dev\\.local\\share\\claude",
+      "C:\\Program Files\\Git",
+      "C:\\lab\\agentdesktop",
+      "C:\\Program Files\\ClaudeCode",
+      "C:\\Users\\dev\\.claude\\settings.json",
+      "C:\\Users\\dev\\.claude\\plugins",
+      "C:\\lab\\ws pr1\\.mcp.json",
+      "C:\\lab\\ws pr1\\.claude\\settings.local.json",
+      "C:\\lab\\ws pr1\\.git\\config",
+      "C:\\lab\\ws pr1\\.git\\hooks"
+    ],
+    "deniedPaths": [
+      "C:\\Users\\dev\\.claude\\hooks",
+      "C:\\lab\\ws pr1\\HEAD",
+      "C:\\lab\\ws pr1\\.claude\\settings.json",
+      "C:\\lab\\ws pr1\\.claude\\hooks",
+      "C:\\lab\\ws pr1\\.git\\commondir",
+      "C:\\Users\\dev\\.claude\\.credentials.json",
+      "C:\\Users\\dev\\.claude\\history.jsonl",
+      "C:\\Users\\dev\\.claude\\ide",
+      "C:\\Users\\dev\\.ssh",
+      "C:\\Users\\dev\\.aws",
+      "C:\\Users\\dev\\.azure",
+      "C:\\Users\\dev\\.kube"
+    ]
+  },
+  "network": {
+    "egress": {
+      "default": "allow"
+    },
+    "ingress": {
+      "default": "allow",
+      "hostLoopback": "allow"
+    }
+  }
+}"#;
+
+    // Oracle (b): same with egress: Deny
+    const ORACLE_B: &str = r#"{
+  "version": "1.0.0",
+  "containment": "processcontainer",
+  "containerId": "agentdesktop-0123456789abcdef",
+  "ui": {
+    "disable": false,
+    "clipboard": "none",
+    "injection": false
+  },
+  "process": {
+    "commandLine": "cmd.exe /d /v:off /c start \"agentdesktop: claude\" /WAIT /D \"C:\\lab\\ws pr1\" \"C:\\Users\\dev\\.local\\bin\\claude.exe\" --debug-file \"C:\\lab\\ws pr1\\pr1-l2.log\" --allowedTools PowerShell",
+    "cwd": "C:\\lab\\ws pr1",
+    "inheritDefaultEnv": false,
+    "env": [
+      "ANTHROPIC_AUTH_TOKEN=placeholder",
+      "ANTHROPIC_BASE_URL=http://127.0.0.1:4000/sandbox",
+      "ANTHROPIC_CUSTOM_HEADERS=x-agentdesktop-pairing: test-pairing-value",
+      "APPDATA=C:\\Users\\dev\\AppData\\Roaming",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+      "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
+      "CLAUDE_CODE_USE_POWERSHELL_TOOL=1",
+      "CLAUDE_CONFIG_DIR=C:\\Users\\dev\\.claude",
+      "ComSpec=C:\\Windows\\system32\\cmd.exe",
+      "DISABLE_AUTOUPDATER=1",
+      "HOME=C:\\Users\\dev",
+      "HOMEDRIVE=C:",
+      "HOMEPATH=\\Users\\dev",
+      "LOCALAPPDATA=C:\\Users\\dev\\AppData\\Local",
+      "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Program Files\\Git\\cmd;C:\\Users\\dev\\.local\\bin;C:\\lab\\agentdesktop",
+      "PATHEXT=.COM;.EXE;.BAT;.CMD",
+      "ProgramData=C:\\ProgramData",
+      "ProgramFiles=C:\\Program Files",
+      "SystemDrive=C:",
+      "SystemRoot=C:\\Windows",
+      "TEMP=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp",
+      "TERM=xterm-256color",
+      "TMP=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp",
+      "USERNAME=dev",
+      "USERPROFILE=C:\\Users\\dev",
+      "windir=C:\\Windows"
+    ]
+  },
+  "filesystem": {
+    "readwritePaths": [
+      "C:\\lab\\ws pr1",
+      "C:\\Users\\dev\\.claude",
+      "C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp"
+    ],
+    "readonlyPaths": [
+      "C:\\Users\\dev\\.local\\bin",
+      "C:\\Users\\dev\\.local\\share\\claude",
+      "C:\\Program Files\\Git",
+      "C:\\lab\\agentdesktop",
+      "C:\\Program Files\\ClaudeCode",
+      "C:\\Users\\dev\\.claude\\settings.json",
+      "C:\\Users\\dev\\.claude\\plugins",
+      "C:\\lab\\ws pr1\\.mcp.json",
+      "C:\\lab\\ws pr1\\.claude\\settings.local.json",
+      "C:\\lab\\ws pr1\\.git\\config",
+      "C:\\lab\\ws pr1\\.git\\hooks"
+    ],
+    "deniedPaths": [
+      "C:\\Users\\dev\\.claude\\hooks",
+      "C:\\lab\\ws pr1\\HEAD",
+      "C:\\lab\\ws pr1\\.claude\\settings.json",
+      "C:\\lab\\ws pr1\\.claude\\hooks",
+      "C:\\lab\\ws pr1\\.git\\commondir",
+      "C:\\Users\\dev\\.claude\\.credentials.json",
+      "C:\\Users\\dev\\.claude\\history.jsonl",
+      "C:\\Users\\dev\\.claude\\ide",
+      "C:\\Users\\dev\\.ssh",
+      "C:\\Users\\dev\\.aws",
+      "C:\\Users\\dev\\.azure",
+      "C:\\Users\\dev\\.kube"
+    ]
+  },
+  "network": {
+    "egress": {
+      "default": "deny"
+    },
+    "ingress": {
+      "default": "allow",
+      "hostLoopback": "allow"
+    }
+  }
+}"#;
+
+    // Oracle (c): minimal input
+    const ORACLE_C: &str = r#"{
+  "version": "1.0.0",
+  "containment": "processcontainer",
+  "containerId": "agentdesktop-0123456789abcdef",
+  "ui": {
+    "disable": false,
+    "clipboard": "none",
+    "injection": false
+  },
+  "process": {
+    "commandLine": "cmd.exe /d /v:off /c start \"agentdesktop: claude\" /WAIT /D \"C:\\ws\" \"C:\\Users\\dev\\.local\\bin\\claude.exe\"",
+    "cwd": "C:\\ws",
+    "inheritDefaultEnv": false,
+    "env": [
+      "ANTHROPIC_AUTH_TOKEN=placeholder",
+      "ANTHROPIC_BASE_URL=http://127.0.0.1:4000/sandbox",
+      "ANTHROPIC_CUSTOM_HEADERS=x-agentdesktop-pairing: test-pairing-value",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+      "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1",
+      "CLAUDE_CODE_USE_POWERSHELL_TOOL=1",
+      "CLAUDE_CONFIG_DIR=C:\\Users\\dev\\.claude",
+      "DISABLE_AUTOUPDATER=1",
+      "HOME=C:\\Users\\dev",
+      "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Users\\dev\\.local\\bin;C:\\lab\\agentdesktop",
+      "TEMP=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp",
+      "TERM=xterm-256color",
+      "TMP=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp"
+    ]
+  },
+  "filesystem": {
+    "readwritePaths": [
+      "C:\\ws",
+      "C:\\Users\\dev\\.claude",
+      "C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp"
+    ],
+    "readonlyPaths": [],
+    "deniedPaths": [
+      "C:\\ws\\.claude",
+      "C:\\ws\\.git",
+      "C:\\Users\\dev\\.claude\\settings.json",
+      "C:\\Users\\dev\\.claude\\hooks",
+      "C:\\Users\\dev\\.claude\\plugins",
+      "C:\\ws\\.mcp.json",
+      "C:\\ws\\HEAD",
+      "C:\\Users\\dev\\.claude\\.credentials.json",
+      "C:\\Users\\dev\\.claude\\history.jsonl",
+      "C:\\Users\\dev\\.claude\\ide",
+      "C:\\Users\\dev\\.ssh",
+      "C:\\Users\\dev\\.aws",
+      "C:\\Users\\dev\\.azure",
+      "C:\\Users\\dev\\.kube"
+    ]
+  },
+  "network": {
+    "egress": {
+      "default": "allow"
+    },
+    "ingress": {
+      "default": "allow",
+      "hostLoopback": "allow"
+    }
+  }
+}"#;
+
+    // Fixture (a)
+    let exists_a = |path: &Path| snapshot_existing().contains(path.to_str().expect("UTF-8 path"));
+    let is_dir_a = |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
+    let input_a = launch_input(&exists_a, &is_dir_a);
+    let plan_a = plan(&input_a, &CLAUDE_CODE);
+    let bytes_a = MxcEngine.request(&plan_a, LAUNCH_ID).unwrap();
+    assert_eq!(String::from_utf8_lossy(&bytes_a), ORACLE_A);
+
+    // Fixture (b)
+    let exists_b = |path: &Path| snapshot_existing().contains(path.to_str().expect("UTF-8 path"));
+    let is_dir_b = |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
+    let mut input_b = launch_input(&exists_b, &is_dir_b);
+    input_b.egress = agentdesktop_core::config::ContainmentEgress::Deny;
+    let plan_b = plan(&input_b, &CLAUDE_CODE);
+    let bytes_b = MxcEngine.request(&plan_b, LAUNCH_ID).unwrap();
+    assert_eq!(String::from_utf8_lossy(&bytes_b), ORACLE_B);
+
+    // Fixture (c)
+    let exists_c = |_: &Path| false;
+    let is_dir_c = |_: &Path| false;
+    let input_c = LaunchInput {
+        launch_id: LAUNCH_ID.into(),
+        executable: PathBuf::from(r"C:\Users\dev\.local\bin\claude.exe"),
+        client_exe_dir: PathBuf::from(r"C:\lab\agentdesktop"),
+        cwd: PathBuf::from(r"C:\ws"),
+        args: vec![],
+        home: PathBuf::from(r"C:\Users\dev"),
+        state_dir: PathBuf::from(r"C:\Users\dev\.local/state\agentdesktop"),
+        launch_dir: PathBuf::from(r"C:\Users\dev\.local/state\agentdesktop\launches\0123456789abcdef"),
+        git_dir: None,
+        program_files_claude: None,
+        egress: agentdesktop_core::config::ContainmentEgress::Allow,
+        relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
+        pairing: "test-pairing-value".into(),
+        base_env: BTreeMap::new(),
+        exists: &exists_c,
+        is_dir: &is_dir_c,
+    };
+    let plan_c = plan(&input_c, &CLAUDE_CODE);
+    let bytes_c = MxcEngine.request(&plan_c, LAUNCH_ID).unwrap();
+    assert_eq!(String::from_utf8_lossy(&bytes_c), ORACLE_C);
+}
+
+#[test]
+fn engine_selection_absent_key_defaults_to_mxc() {
+    use agentdesktop_core::config::ContainmentEngine;
+    let json = r#"{"executor": "C:\\path\\to\\wxc-exec.exe"}"#;
+    let cfg: agentdesktop_core::config::ContainmentStartupConfig = 
+        serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.engine, ContainmentEngine::Mxc);
+}
+
+#[test]
+fn engine_selection_unknown_value_fails() {
+    let json = r#"{"executor": "C:\\path\\to\\wxc-exec.exe", "engine": "unknown"}"#;
+    let result: Result<agentdesktop_core::config::ContainmentStartupConfig, _> = 
+        serde_json::from_str(json);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("mxc"), "error should name accepted values: {}", err);
+}
+
+#[test]
+fn posture_carries_engine_name() {
+    use engine::mxc::MxcEngine;
+    use engine::Engine;
+    
+    let info = containment_info(
+        Some(&agentdesktop_core::config::ContainmentStartupConfig {
+            executor: p("path/to/wxc-exec.exe"),
+            egress: agentdesktop_core::config::ContainmentEgress::Allow,
+            engine: agentdesktop_core::config::ContainmentEngine::Mxc,
+        }),
+        true,
+        true,
+        false,
+        &|_| true,
+        MxcEngine.name(),
+    );
+    assert_eq!(info.as_ref().unwrap().engine, "mxc");
+}
+
+#[test]
+fn posture_carries_engine_when_containment_unavailable() {
+    use engine::mxc::MxcEngine;
+    use engine::Engine;
+    
+    let info = containment_info(
+        Some(&agentdesktop_core::config::ContainmentStartupConfig {
+            executor: p("path/to/missing.exe"),
+            egress: agentdesktop_core::config::ContainmentEgress::Allow,
+            engine: agentdesktop_core::config::ContainmentEngine::Mxc,
+        }),
+        true,
+        true,
+        false,
+        &|_| false,
+        MxcEngine.name(),
+    );
+    let info = info.unwrap();
+    assert!(!info.available);
+    assert_eq!(info.engine, "mxc");
+}
+
+#[test]
+fn mxc_engine_name_is_mxc() {
+    use engine::mxc::MxcEngine;
+    use engine::Engine;
+    assert_eq!(MxcEngine.name(), "mxc");
+}
+
+#[test]
+fn mxc_engine_container_id() {
+    use engine::mxc::MxcEngine;
+    use engine::Engine;
+    assert_eq!(MxcEngine.container_id("0123456789abcdef"), "agentdesktop-0123456789abcdef");
+}
+
+#[test]
+fn plan_yields_expected_env_keys() {
+    use profile::CLAUDE_CODE;
+    
+    let exists = |path: &Path| snapshot_existing().contains(path.to_str().expect("UTF-8 path"));
+    let is_dir = |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
+    let input = launch_input(&exists, &is_dir);
+    let plan_result = plan(&input, &CLAUDE_CODE);
+    
+    // Check that plan has the relay URL and pairing in env
+    assert!(plan_result.env.contains_key("ANTHROPIC_BASE_URL"));
+    assert!(plan_result.env.contains_key("ANTHROPIC_CUSTOM_HEADERS"));
+    assert_eq!(plan_result.env.get("ANTHROPIC_BASE_URL").unwrap(), "http://127.0.0.1:4000/sandbox");
 }
