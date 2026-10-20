@@ -172,17 +172,31 @@ impl SessionRegistry {
 
     /// The session a pairing belongs to, with its idle timeout restarted
     /// (`expires_at = max(expires_at, now + idle_ttl)`). The digest is compared
-    /// against every unexpired entry without an early return, so the time a
-    /// lookup takes does not depend on which entry matches.
+    /// against every entry without an early return, so the time a lookup takes
+    /// does not depend on which entry matches. An expired pairing is removed on
+    /// observation, so it cannot become valid again even if the system clock
+    /// steps backward.
     pub(crate) fn authorize(&self, pairing: &str, now: u64) -> Option<SessionRef> {
         let offered = pairing_hash(pairing);
         let mut entries = self.lock();
         let mut found = None;
+        let mut expired_index = None;
         for (index, entry) in entries.iter().enumerate() {
-            let matches = constant_time_eq(&offered, &entry.pairing_hash) & !entry.expired(now);
+            let expired = entry.expired(now);
+            let matches = constant_time_eq(&offered, &entry.pairing_hash) & !expired;
             if matches {
                 found = Some(index);
             }
+            // When the offered pairing matches an expired entry, remember it so
+            // it can be removed after the constant-time loop, preventing revival
+            // on a backward clock step.
+            if constant_time_eq(&offered, &entry.pairing_hash) & expired {
+                expired_index = Some(index);
+            }
+        }
+        if let Some(index) = expired_index {
+            entries.remove(index);
+            return None;
         }
         let entry = &mut entries[found?];
         entry.expires_at_unix_seconds = entry
@@ -553,6 +567,24 @@ mod tests {
         assert!(registry.authorize(&session.pairing, 1_301).is_none());
         assert_eq!(registry.len(1_300), 0);
         assert!(registry.list(1_300).is_empty());
+    }
+
+    #[test]
+    fn an_expired_pairing_cannot_revive_on_a_backward_clock_step() {
+        let registry = SessionRegistry::default();
+        let session = register_ok(
+            &registry,
+            "claude-code",
+            "lab",
+            Duration::from_secs(60),
+            1_000,
+        );
+        // Session expires at 1_060. At 1_061 it is expired and rejected.
+        assert!(registry.authorize(&session.pairing, 1_061).is_none());
+        // The rejection removed the entry. Even if the clock steps back to
+        // 1_059 (before the sweep at ≤1_121), the pairing is gone.
+        assert!(registry.authorize(&session.pairing, 1_059).is_none());
+        assert_eq!(registry.len(1_059), 0);
     }
 
     #[test]

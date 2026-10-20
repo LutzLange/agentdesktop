@@ -677,11 +677,14 @@ pass-through on this route, and the gateway identity is sent without a
 subscription token: with `programs.claudeCode.auth: subscription` (or the
 same for `claudeDesktop`) a session for that program is refused with `409`.
 With `authentication.type: controllerJwt` the session's client id must be in
-`allowedClientIds`; that is checked when the session is created, so a refused
-id fails at `session create` rather than at the first prompt; a session that
-already exists keeps its gateway identity when the configuration later switches
-that program to subscription mode or narrows `allowedClientIds`, until it is
-revoked or idles out. With `oidc` the client id only labels the log.
+`allowedClientIds`; that is checked when the session is created (so a refused
+id fails at `session create` rather than at the first prompt) and independently
+by the controller on every credential it issues; a session that already exists
+keeps its gateway identity when the configuration later switches that program
+to subscription mode, until it is revoked or idles out. Narrowing
+`allowedClientIds` makes its requests fail within about a minute, because the
+proxy reuses a credential for at most 60 seconds and the controller then denies
+the next fetch. With `oidc` the client id only labels the log.
 
 Sessions live in memory and expire `ttlSeconds` after their last request
 (default 28800, at most 86400 and at least 60; the timeout restarts on every
