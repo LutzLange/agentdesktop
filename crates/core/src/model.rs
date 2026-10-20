@@ -189,6 +189,9 @@ pub struct Launch {
     pub exit_code: Option<i32>,
     pub started_at_unix_seconds: u64,
     pub ended_at_unix_seconds: Option<u64>,
+    /// The relay session this launch runs on; revoked when the box exits.
+    /// Empty when an older daemon answers without the field.
+    #[serde(default)]
     pub session_id: String,
 }
 

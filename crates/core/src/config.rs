@@ -361,7 +361,7 @@ pub enum ContainmentEgress {
 }
 
 impl ContainmentEgress {
-    pub fn is_default(&self) -> bool {
+    fn is_default(&self) -> bool {
         *self == Self::default()
     }
 }

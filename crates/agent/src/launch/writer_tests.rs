@@ -13,21 +13,21 @@ fn the_user_mode_pipe_admits_system_and_the_daemon_user_only() {
     );
 }
 
-/// The read-only grant for `credential\` is only honoured when the directory
-/// exists, so it is created before the request is built.
+/// The grants are only honoured when the directories exist, so the launch
+/// directory and the box's `tmp` are created before the request is built;
+/// no credential directory exists any more.
 #[test]
-fn the_credential_directory_exists_before_the_request_is_written() {
+fn the_launch_directories_exist_before_the_request_is_written() {
     let temp = tempfile::tempdir().unwrap();
     let launch_dir = temp.path().join("launches").join("0123456789abcdef");
 
-    create_launch_dir(&launch_dir, "gateway-token").unwrap();
+    create_launch_dir(&launch_dir).unwrap();
 
-    assert!(launch_dir.join("credential").is_dir());
-    assert_eq!(
-        std::fs::read_to_string(launch_dir.join("credential").join("token")).unwrap(),
-        "gateway-token"
-    );
     assert!(launch_dir.join("tmp").is_dir());
+    assert!(
+        !launch_dir.join("credential").exists(),
+        "no credential directory is created"
+    );
     assert!(
         !launch_dir.join("request.json").exists(),
         "the request is built after the directories it grants exist"
@@ -317,11 +317,21 @@ mod handler {
                 error: None,
             }),
             daemon_sid: None,
+            sessions: crate::llm_proxy::sessions::SessionRegistry::default(),
+            proxy_address: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 4000))),
+            session_policy: Arc::new(crate::llm_proxy::sessions::ConfigPolicy {
+                config: serde_yaml::from_str(
+                    "llmGateway: {url: 'https://gw', authentication: {type: oidc, issuer: 'https://kc', clientId: 'agentdesktop'}}",
+                )
+                .unwrap(),
+                state_dir: std::env::temp_dir(),
+            }),
+            egress: agentdesktop_core::config::ContainmentEgress::default(),
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_credential_directory_is_granted_read_only_to_the_box() {
+    async fn no_credential_directory_is_granted_to_the_box() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let home = root.join("home");
@@ -354,10 +364,6 @@ mod handler {
             serde_json::from_str(recorder.request_json.lock().unwrap().as_deref().unwrap())
                 .unwrap();
         let launch_dir = state_dir.join("launches").join(&launch.launch_id);
-        let credential_dir = launch_dir
-            .join("credential")
-            .to_string_lossy()
-            .replace('/', "\\");
         let readonly: Vec<String> = request["filesystem"]["readonlyPaths"]
             .as_array()
             .unwrap()
@@ -365,10 +371,13 @@ mod handler {
             .map(|v| v.as_str().unwrap().to_owned())
             .collect();
         assert!(
-            readonly.contains(&credential_dir),
-            "credential directory {credential_dir} must be granted; got {readonly:?}"
+            !readonly.iter().any(|path| path.contains("credential")),
+            "no credential path is granted; got {readonly:?}"
         );
-        assert!(launch_dir.join("credential").join("token").is_file());
+        assert!(
+            !launch_dir.join("credential").exists(),
+            "no credential directory is created"
+        );
         // `~\.claude` did not exist before the launch; its entries need it.
         assert!(
             *recorder.home_claude_existed.lock().unwrap(),
