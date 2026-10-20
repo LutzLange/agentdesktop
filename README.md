@@ -674,8 +674,10 @@ cannot create it in place, except for the git configuration files (granted when
 present, not emitted otherwise); a workspace without a `.claude` folder gets
 the folder denied as a whole; a workspace without `.git` cannot `git init` one.
 Residual risk: direct creation of those denied paths is blocked, but renaming a file
-into such a path succeeds; after that the file exists on disk (for example, an agent
-could rename a crafted git config into `<cwd>\HEAD` or `<cwd>\.git\commondir`).
+into such a path succeeds, and the file then exists on disk. For example, an agent
+could rename a file into `<cwd>\.git\commondir` to point git at a writable directory
+with its own config and hooks, or into `<cwd>\HEAD` so that git treats the workspace
+as a bare repository. Renaming a folder into these names has not been tested.
 The daemon creates `~\.claude` if it is missing. Always denied:
 `~\.claude\.credentials.json`, `~\.claude\history.jsonl`, `~\.claude\ide`,
 `~\.ssh`, `~\.aws`, `~\.azure`, `~\.kube`. The workspace may not be a drive or share root, the home
