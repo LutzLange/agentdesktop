@@ -189,7 +189,10 @@ pub struct Launch {
     pub exit_code: Option<i32>,
     pub started_at_unix_seconds: u64,
     pub ended_at_unix_seconds: Option<u64>,
-    pub credential_expires_at_unix_seconds: Option<u64>,
+    /// The relay session this launch runs on; revoked when the box exits.
+    /// Empty when an older daemon answers without the field.
+    #[serde(default)]
+    pub session_id: String,
 }
 
 /// State of the daemon's receiver for gateway usage.
@@ -507,14 +510,18 @@ mod tests {
             exit_code: None,
             started_at_unix_seconds: 1_700_000_000,
             ended_at_unix_seconds: None,
-            credential_expires_at_unix_seconds: Some(1_700_003_600),
+            session_id: "test-session-id".into(),
         };
         let json = serde_json::to_value(&running).unwrap();
         assert_eq!(json["launchId"], "0123456789abcdef");
         assert_eq!(json["containerId"], "agentdesktop-0123456789abcdef");
         assert_eq!(json["status"], "running");
         assert_eq!(json["startedAtUnixSeconds"], 1_700_000_000u64);
-        assert_eq!(json["credentialExpiresAtUnixSeconds"], 1_700_003_600u64);
+        assert_eq!(json["sessionId"], "test-session-id");
+        assert!(
+            json.get("credentialExpiresAtUnixSeconds").is_none(),
+            "credentialExpiresAtUnixSeconds is removed"
+        );
         let again: Launch = serde_json::from_value(json).unwrap();
         assert_eq!(again, running);
 
