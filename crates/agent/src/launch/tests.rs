@@ -1139,8 +1139,6 @@ fn credential_and_ssh_style_paths_are_denied_whether_or_not_they_exist() {
     }
 }
 
-// ============================================================ write_request (AC 7)
-
 #[test]
 fn write_request_creates_the_private_launch_dir_and_writes_json_without_a_bom() {
     let temp = tempfile::tempdir().unwrap();

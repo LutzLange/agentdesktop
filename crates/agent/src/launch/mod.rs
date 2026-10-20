@@ -934,7 +934,12 @@ async fn start_launch(
 ) -> Result<(StatusCode, Json<Launch>), LaunchError> {
     let host = state.host.clone();
     let launch_id = format!("{:016x}", rand::random::<u64>());
-    let state_dir = state.app.state_dir.clone();
+    let state_dir = std::path::absolute(&state.app.state_dir).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("resolve the daemon state directory: {error}"),
+        )
+    })?;
     let launch_dir = state_dir.join("launches").join(&launch_id);
     let log_path = launch_dir.join("wxc-exec.log");
     let fail = |launch_dir: &Path, message: String| {
