@@ -1,13 +1,10 @@
 //! MXC engine: Windows AppContainer request generation.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::Engine;
-use crate::launch::profile::CLAUDE_CODE;
-use crate::launch::{LaunchInput, plan::LaunchPlan};
+use crate::launch::{plan::LaunchPlan, win};
 
 /// MXC sandbox engine.
 pub(crate) struct MxcEngine;
@@ -80,6 +77,7 @@ impl MxcEngine {
     }
 }
 
+// No Debug: the request's environment carries the session pairing.
 #[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MxcRequest {
@@ -139,15 +137,12 @@ pub(crate) struct MxcIngress {
     pub host_loopback: String,
 }
 
-/// A path as the request carries it: `\` separators only.
-fn win(path: &Path) -> String {
-    path.to_string_lossy().replace('/', "\\")
-}
-
 /// Builds the MXC request from a launch input: the resolved plan through the
-/// MXC envelope as one call. Production goes through `plan` and the
-/// [`Engine`] stored in `LaunchState`; the tests call this shim.
-#[allow(dead_code)]
-pub(crate) fn build_request(input: &LaunchInput) -> MxcRequest {
-    MxcEngine.to_request(&crate::launch::plan(input, &CLAUDE_CODE), &input.launch_id)
+/// MXC envelope as one call.
+#[cfg(test)]
+pub(crate) fn build_request(input: &crate::launch::LaunchInput) -> MxcRequest {
+    MxcEngine.to_request(
+        &crate::launch::plan(input, &crate::launch::profile::CLAUDE_CODE),
+        &input.launch_id,
+    )
 }

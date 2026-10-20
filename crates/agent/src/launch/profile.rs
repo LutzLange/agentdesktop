@@ -13,22 +13,30 @@ pub(crate) struct ClaudeCodeProfile {
     pub base_env_keys: &'static [&'static str],
     /// Fixed environment variable key-value pairs set for every launch.
     pub fixed_env: &'static [(&'static str, &'static str)],
-    /// Home-relative runtime paths (`\`-joined), granted read-only when they
-    /// exist and simply absent otherwise. Order is part of the request: the
-    /// first entry sits between the executable's directory and the git
-    /// installation, the git user configuration comes after the discovered
-    /// directories (git reads the user's configuration before anything else;
-    /// unreadable means every git command fails in the box, lab L4e).
-    pub runtime_readonly: &'static [&'static str],
+    /// Home-relative runtime path (`\`-joined) of the client's shared data,
+    /// granted read-only when it exists and simply absent otherwise. Order is
+    /// part of the request: this entry sits between the executable's
+    /// directory and the git installation.
+    pub runtime_share: &'static str,
+    /// The git user configuration (home-relative), granted read-only when it
+    /// exists; comes after the discovered directories (git reads the user's
+    /// configuration before anything else; unreadable means every git
+    /// command fails in the box, lab L4e).
+    pub git_user_config: &'static str,
+    /// The XDG fallback of the git user configuration (`\`-joined), granted
+    /// read-only directly after `git_user_config`.
+    pub git_xdg_config: &'static str,
     /// Executable configuration under `<home>\.claude`: read-only when
     /// present, denied when absent, so the box can neither change nor
     /// create it.
     pub home_executable_config: &'static [&'static str],
     /// Executable configuration at the workspace root, same read-only-or-
-    /// denied rule. `HEAD` is guarded because a `HEAD` file at the workspace
-    /// root would let git treat the workspace itself as a bare repository
-    /// with box-written config.
-    pub workspace_executable_config: &'static [&'static str],
+    /// denied rule as the home entries.
+    pub mcp_json: &'static str,
+    /// Executable configuration at the workspace root, same rule: a `HEAD`
+    /// file at the workspace root would let git treat the workspace itself
+    /// as a bare repository with box-written config.
+    pub workspace_head: &'static str,
     /// Executable configuration under `<cwd>\.claude`, same rule; emitted
     /// only when the folder (or one of the entries) exists, because MXC
     /// refuses a denied path whose parent folder does not exist
@@ -70,9 +78,12 @@ pub(crate) const CLAUDE_CODE: ClaudeCodeProfile = ClaudeCodeProfile {
         ("ANTHROPIC_AUTH_TOKEN", "placeholder"),
         ("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1"),
     ],
-    runtime_readonly: &[r".local\share\claude", ".gitconfig", r".config\git\config"],
+    runtime_share: r".local\share\claude",
+    git_user_config: ".gitconfig",
+    git_xdg_config: r".config\git\config",
     home_executable_config: &["settings.json", "hooks", "plugins"],
-    workspace_executable_config: &[".mcp.json", "HEAD"],
+    mcp_json: ".mcp.json",
+    workspace_head: "HEAD",
     workspace_claude_entries: &["settings.json", "settings.local.json", "hooks"],
     git_executable_config: &["config", "hooks", "commondir"],
     denied_secrets: &[

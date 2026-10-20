@@ -33,11 +33,11 @@ use axum::{
     routing::{get, post},
 };
 
-pub mod engine;
+pub(crate) mod engine;
 pub mod host;
 pub mod integrity;
-pub mod plan;
-pub mod profile;
+pub(crate) mod plan;
+pub(crate) mod profile;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -336,7 +336,7 @@ pub fn check_args(args: &[String]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-/// Everything `build_request` may use. Paths are Windows-style strings in a
+/// Everything `plan` may use. Paths are Windows-style strings in a
 /// `PathBuf`; `exists` is called with `\`-joined paths.
 pub struct LaunchInput<'a> {
     pub launch_id: String,
@@ -359,7 +359,7 @@ pub struct LaunchInput<'a> {
 }
 
 /// A path as the request carries it: `\` separators only.
-fn win(path: &Path) -> String {
+pub(crate) fn win(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\")
 }
 
@@ -425,17 +425,14 @@ pub(crate) fn plan(input: &LaunchInput, profile: &profile::ClaudeCodeProfile) ->
     // otherwise (nothing the box could create there matters). The profile's
     // home-relative entries keep their positions among the discovered
     // directories; the request bytes pin the order.
-    let &[runtime_share, git_user_config, git_xdg_config] = profile.runtime_readonly else {
-        unreachable!("the Claude Code profile has three home-relative runtime entries")
-    };
     let runtime = [
         Some(exe_dir),
-        Some(join(&home, runtime_share)),
+        Some(join(&home, profile.runtime_share)),
         git_dir,
         Some(client_exe_dir),
         program_files_claude,
-        Some(join(&home, git_user_config)),
-        Some(join(&home, git_xdg_config)),
+        Some(join(&home, profile.git_user_config)),
+        Some(join(&home, profile.git_xdg_config)),
     ];
     for candidate in runtime.into_iter().flatten() {
         if exists(&candidate) && !readonly.contains(&candidate) {
@@ -449,12 +446,8 @@ pub(crate) fn plan(input: &LaunchInput, profile: &profile::ClaudeCodeProfile) ->
         .iter()
         .map(|entry| join(&claude_dir, entry))
         .collect();
-    executable_config.extend(
-        profile
-            .workspace_executable_config
-            .iter()
-            .map(|entry| join(&cwd, entry)),
-    );
+    executable_config.push(join(&cwd, profile.mcp_json));
+    executable_config.push(join(&cwd, profile.workspace_head));
     // MXC refuses a denied path whose parent folder does not exist
     // (lab-verified, 0x80070003), so a workspace without `.claude` gets the
     // folder itself denied instead of its executable-config entries.

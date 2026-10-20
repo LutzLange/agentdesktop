@@ -2695,4 +2695,39 @@ programs:
             "deny egress is serialized"
         );
     }
+
+    #[test]
+    fn containment_engine_explicit_mxc_parses() {
+        let config = super::parse_local_daemon(
+            "daemon:\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n    engine: mxc\n",
+        )
+        .expect("explicit mxc engine parses");
+        let engine = config.daemon.unwrap().containment.unwrap().engine;
+        assert_eq!(engine, super::ContainmentEngine::Mxc);
+    }
+
+    #[test]
+    fn containment_engine_rejects_mxc_capitalized() {
+        assert!(
+            super::parse_local_daemon(
+                "daemon:\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n    engine: MXC\n"
+            )
+            .is_err(),
+            "MXC capitalized is rejected"
+        );
+    }
+
+    #[test]
+    fn containment_engine_unset_not_serialized() {
+        let cfg = super::ContainmentStartupConfig {
+            executor: std::path::PathBuf::from("/x/wxc-exec"),
+            egress: super::ContainmentEgress::Allow,
+            engine: super::ContainmentEngine::default(),
+        };
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            json.get("engine").is_none(),
+            "default engine is not serialized"
+        );
+    }
 }

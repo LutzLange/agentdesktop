@@ -3529,7 +3529,10 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
 
     const LAUNCH_ID: &str = "0123456789abcdef";
 
-    // Oracle (a): launch_input + snapshot_existing, egress: Allow
+    // Oracle (a): launch_input + snapshot_existing extended with both git
+    // user-configuration files, egress: Allow. The extension pins the order
+    // of the profile's two git user-configuration entries in `readonlyPaths`;
+    // re-captured at the baseline with the same fixture (ledger ## v2).
     const ORACLE_A: &str = r#"{
   "version": "1.0.0",
   "containment": "processcontainer",
@@ -3584,6 +3587,8 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Program Files\\Git",
       "C:\\lab\\agentdesktop",
       "C:\\Program Files\\ClaudeCode",
+      "C:\\Users\\dev\\.gitconfig",
+      "C:\\Users\\dev\\.config\\git\\config",
       "C:\\Users\\dev\\.claude\\settings.json",
       "C:\\Users\\dev\\.claude\\plugins",
       "C:\\lab\\ws pr1\\.mcp.json",
@@ -3770,8 +3775,15 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
   }
 }"#;
 
-    // Fixture (a)
-    let exists_a = |path: &Path| snapshot_existing().contains(path.to_str().expect("UTF-8 path"));
+    // Fixture (a): both git user-configuration files exist, so the oracle
+    // covers their positions among the read-only grants.
+    let existing_a = {
+        let mut existing = snapshot_existing();
+        existing.insert(r"C:\Users\dev\.gitconfig".to_owned());
+        existing.insert(r"C:\Users\dev\.config\git\config".to_owned());
+        existing
+    };
+    let exists_a = |path: &Path| existing_a.contains(path.to_str().expect("UTF-8 path"));
     let is_dir_a =
         |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
     let input_a = launch_input(&exists_a, &is_dir_a);
@@ -3915,4 +3927,119 @@ fn plan_yields_expected_env_keys() {
         plan_result.env.get("ANTHROPIC_BASE_URL").unwrap(),
         "http://127.0.0.1:4000/sandbox"
     );
+}
+
+// --- Profile equivalence (spec "Tests first"): every `ClaudeCodeProfile`
+// field equals the hard-coded list it replaced, written out literally from
+// the baseline commit 8910230 and compared entry by entry in order, so a
+// future profile edit shows up as a reviewable test diff here.
+
+#[test]
+fn the_profile_base_env_keys_equal_the_replaced_base_env() {
+    // Baseline 8910230 crates/agent/src/launch/host.rs:24-38 (`BASE_ENV`).
+    let expected: &[&str] = &[
+        "SystemRoot",
+        "windir",
+        "SystemDrive",
+        "ComSpec",
+        "PATHEXT",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramFiles",
+        "ProgramData",
+        "USERNAME",
+    ];
+    assert_eq!(profile::CLAUDE_CODE.base_env_keys, expected);
+}
+
+#[test]
+fn the_profile_fixed_env_equals_the_replaced_env_inserts() {
+    // Baseline 8910230 crates/agent/src/launch/mod.rs:463-480: the six fixed
+    // `env.insert` literals, in insertion order (the dynamic inserts between
+    // them stay in `plan`; the map is a `BTreeMap`, so order is not
+    // observable, but the list is pinned verbatim anyway).
+    let expected: &[(&str, &str)] = &[
+        ("TERM", "xterm-256color"),
+        ("CLAUDE_CODE_USE_POWERSHELL_TOOL", "1"),
+        ("DISABLE_AUTOUPDATER", "1"),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ("ANTHROPIC_AUTH_TOKEN", "placeholder"),
+        ("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "1"),
+    ];
+    assert_eq!(profile::CLAUDE_CODE.fixed_env, expected);
+}
+
+#[test]
+fn the_profile_runtime_entries_equal_the_replaced_runtime_list() {
+    // Baseline 8910230 crates/agent/src/launch/mod.rs:495-506 (the `runtime`
+    // array): the three home-relative entries and their order among the
+    // discovered directories; the byte oracle (fixture (a)) pins the
+    // positions in the request.
+    assert_eq!(profile::CLAUDE_CODE.runtime_share, r".local\share\claude");
+    assert_eq!(profile::CLAUDE_CODE.git_user_config, ".gitconfig");
+    assert_eq!(profile::CLAUDE_CODE.git_xdg_config, r".config\git\config");
+}
+
+#[test]
+fn the_profile_home_executable_config_equals_the_replaced_list() {
+    // Baseline 8910230 crates/agent/src/launch/mod.rs:514-516 (the
+    // `claude_dir` joins of `executable_config`).
+    let expected: &[&str] = &["settings.json", "hooks", "plugins"];
+    assert_eq!(profile::CLAUDE_CODE.home_executable_config, expected);
+}
+
+#[test]
+fn the_profile_workspace_entries_equal_the_replaced_lists() {
+    // Baseline 8910230 crates/agent/src/launch/mod.rs:517-520 (the two `cwd`
+    // joins of `executable_config`) and :526-530
+    // (`workspace_claude_entries`).
+    assert_eq!(profile::CLAUDE_CODE.mcp_json, ".mcp.json");
+    assert_eq!(profile::CLAUDE_CODE.workspace_head, "HEAD");
+    let expected: &[&str] = &["settings.json", "settings.local.json", "hooks"];
+    assert_eq!(profile::CLAUDE_CODE.workspace_claude_entries, expected);
+}
+
+#[test]
+fn the_profile_git_executable_config_equals_the_replaced_list() {
+    // Baseline 8910230 crates/agent/src/launch/mod.rs:548-550 (the `.git`
+    // pushes onto `executable_config`).
+    let expected: &[&str] = &["config", "hooks", "commondir"];
+    assert_eq!(profile::CLAUDE_CODE.git_executable_config, expected);
+}
+
+#[test]
+fn the_profile_denied_secrets_equal_the_replaced_secret_list() {
+    // Baseline 8910230 crates/agent/src/launch/mod.rs:560-569: the first
+    // three were joined onto `claude_dir = join(home, ".claude")`, the rest
+    // onto `home`; a `.claude\<entry>` segment joined onto `home` is
+    // string-identical through `join`.
+    let expected: &[&str] = &[
+        r".claude\.credentials.json",
+        r".claude\history.jsonl",
+        r".claude\ide",
+        ".ssh",
+        ".aws",
+        ".azure",
+        ".kube",
+    ];
+    assert_eq!(profile::CLAUDE_CODE.denied_secrets, expected);
+    // The single-segment entries double as the workspace-validation denied
+    // home directories (baseline host.rs:50, `DENIED_HOME_DIRS`).
+    let denied_home_dirs: Vec<&str> = profile::CLAUDE_CODE
+        .denied_secrets
+        .iter()
+        .copied()
+        .filter(|entry| !entry.contains('\\'))
+        .collect();
+    assert_eq!(denied_home_dirs, [".ssh", ".aws", ".azure", ".kube"]);
+}
+
+#[test]
+fn the_profile_window_title_equals_the_replaced_command_line_title() {
+    // Baseline 8910230 crates/agent/src/launch/mod.rs:483-485 (the `start`
+    // window title in the command line).
+    assert_eq!(profile::CLAUDE_CODE.window_title, "agentdesktop: claude");
 }

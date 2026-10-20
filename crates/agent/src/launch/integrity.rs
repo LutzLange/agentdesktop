@@ -710,9 +710,6 @@ pub fn integrity_paths(home: &Path, cwd: &Path) -> Vec<IntegrityRoot> {
     let git = cwd.join(".git");
     // The workspace entries interleave with the two identity-only folders in
     // the order the watcher has always reported them.
-    let &[mcp_json, head] = profile.workspace_executable_config else {
-        unreachable!("the Claude Code profile has two workspace executable-config entries")
-    };
     let mut roots: Vec<IntegrityRoot> = profile
         .home_executable_config
         .iter()
@@ -735,7 +732,7 @@ pub fn integrity_paths(home: &Path, cwd: &Path) -> Vec<IntegrityRoot> {
             }),
     );
     roots.push(IntegrityRoot {
-        path: cwd.join(mcp_json),
+        path: cwd.join(profile.mcp_json),
         mode: RootMode::Recursive,
     });
     roots.push(IntegrityRoot {
@@ -743,7 +740,7 @@ pub fn integrity_paths(home: &Path, cwd: &Path) -> Vec<IntegrityRoot> {
         mode: RootMode::IdentityOnly,
     });
     roots.push(IntegrityRoot {
-        path: cwd.join(head),
+        path: cwd.join(profile.workspace_head),
         mode: RootMode::Recursive,
     });
     roots.extend(
