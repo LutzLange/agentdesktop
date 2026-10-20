@@ -1468,11 +1468,48 @@ impl Clock {
     }
 }
 
+/// Successful `read_bytes` calls recorded by `RecordingIntegrityFs`.
+type IntegrityReads = Arc<Mutex<Vec<(PathBuf, Vec<u8>)>>>;
+
+/// Delegates to the real integrity filesystem and records every successful
+/// `read_bytes`, so a test can see which bytes a verify pass read.
+struct RecordingIntegrityFs {
+    reads: IntegrityReads,
+}
+
+impl integrity::IntegrityFs for RecordingIntegrityFs {
+    fn metadata(&self, p: &Path) -> io::Result<integrity::EntryKind> {
+        integrity::REAL_FS.metadata(p)
+    }
+
+    fn read_bytes(&self, p: &Path) -> io::Result<Vec<u8>> {
+        let bytes = integrity::REAL_FS.read_bytes(p)?;
+        self.reads
+            .lock()
+            .unwrap()
+            .push((p.to_path_buf(), bytes.clone()));
+        Ok(bytes)
+    }
+
+    fn read_dir_names(&self, p: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        integrity::REAL_FS.read_dir_names(p)
+    }
+
+    fn file_identity(&self, p: &Path) -> io::Result<integrity::FileIdentity> {
+        integrity::REAL_FS.file_identity(p)
+    }
+
+    fn read_link(&self, p: &Path) -> io::Result<std::ffi::OsString> {
+        integrity::REAL_FS.read_link(p)
+    }
+}
+
 struct FakeHost {
     home: PathBuf,
     state_dir: PathBuf,
     client_exe_dir: PathBuf,
     clock: Clock,
+    integrity_reads: IntegrityReads,
 }
 
 impl LaunchHost for FakeHost {
@@ -1523,6 +1560,12 @@ impl LaunchHost for FakeHost {
 
     fn now(&self) -> u64 {
         self.clock.now()
+    }
+
+    fn integrity_fs(&self) -> Arc<dyn integrity::IntegrityFs> {
+        Arc::new(RecordingIntegrityFs {
+            reads: self.integrity_reads.clone(),
+        })
     }
 }
 
@@ -1599,6 +1642,8 @@ struct StubExecutor {
     pid_as_dir: AtomicBool,
     /// Records whether the launch directory existed when `kill` was called.
     dir_existed_at_kill: Arc<Mutex<Option<bool>>>,
+    /// Called at the start of `spawn` if set.
+    on_spawn: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl StubExecutor {
@@ -1658,6 +1703,9 @@ impl Executor for StubExecutor {
         request: &Path,
         log: &Path,
     ) -> io::Result<Box<dyn LaunchChild>> {
+        if let Some(callback) = self.on_spawn.lock().unwrap().take() {
+            callback();
+        }
         if let Some(error) = self.error.lock().unwrap().take() {
             return Err(error);
         }
@@ -1731,6 +1779,7 @@ struct Harness {
     client: reqwest::Client,
     executor: Arc<StubExecutor>,
     credentials: Arc<StubCredentials>,
+    integrity_reads: IntegrityReads,
 }
 
 fn strip_verbatim(path: PathBuf) -> PathBuf {
@@ -1778,6 +1827,7 @@ impl Harness {
             kills: Arc::new(AtomicU32::new(0)),
             pid_as_dir: AtomicBool::new(false),
             dir_existed_at_kill: Arc::new(Mutex::new(None)),
+            on_spawn: Mutex::new(None),
         });
         let executor_path = client_exe_dir.join("wxc-exec.exe");
         let availability = match setup.availability {
@@ -1822,6 +1872,7 @@ impl Harness {
             logout: None,
             usage: None,
         };
+        let integrity_reads: IntegrityReads = Arc::new(Mutex::new(Vec::new()));
         let state = LaunchState {
             app,
             executor: executor.clone(),
@@ -1831,6 +1882,7 @@ impl Harness {
                 state_dir: state_dir.clone(),
                 client_exe_dir,
                 clock: clock.clone(),
+                integrity_reads: integrity_reads.clone(),
             }),
             registry: LaunchRegistry::new(),
             availability,
@@ -1854,6 +1906,7 @@ impl Harness {
             client: reqwest::Client::new(),
             executor,
             credentials,
+            integrity_reads,
         }
     }
 
@@ -2725,17 +2778,27 @@ async fn integrity_drift_detected_when_file_modified_during_launch() {
     let h = Harness::start(Setup::default()).await;
     let launched = h.launch_ok().await;
 
-    // Simulate modification of a protected file
-    // (stub implementation will fail on todo!() until implemented)
+    // Modify a protected file
+    let mcp_path = launched.cwd.join(".mcp.json");
+    std::fs::write(&mcp_path, b"{\"modified\":true}").unwrap();
 
     // Wait for periodic check (60s + margin)
     tokio::time::sleep(Duration::from_secs(80)).await;
 
     // Exit the launch
     h.executor.exit_with(0);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Wait for launch to be marked exited
+    for _ in 0..1000 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let listed = h.listed().await;
+        if listed[0].status == LaunchStatus::Exited {
+            break;
+        }
+    }
 
     let listed = h.listed().await;
+    assert_eq!(listed[0].status, LaunchStatus::Exited);
     assert!(
         listed[0].integrity_drift,
         "integrity drift should be detected"
@@ -2745,15 +2808,29 @@ async fn integrity_drift_detected_when_file_modified_during_launch() {
 #[tokio::test(start_paused = true)]
 async fn integrity_drift_detected_when_file_replaced_before_spawn() {
     let h = Harness::start(Setup::default()).await;
+    std::fs::write(h.cwd.join(".mcp.json"), b"{}").unwrap();
 
-    // Stub executor will replace .mcp.json inside spawn
-    // (stub implementation will fail on todo!() until implemented)
+    // The snapshot is taken before `spawn`; replacing the file inside `spawn`
+    // must therefore show up as drift (this fails if the snapshot moved after).
+    let mcp = h.cwd.join(".mcp.json");
+    *h.executor.on_spawn.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(&mcp, b"{\"replaced\":true}").unwrap();
+    }));
 
-    let launched = h.launch_ok().await;
+    let _launched = h.launch_ok().await;
     h.executor.exit_with(0);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Wait for launch to be marked exited
+    for _ in 0..1000 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let listed = h.listed().await;
+        if listed[0].status == LaunchStatus::Exited {
+            break;
+        }
+    }
 
     let listed = h.listed().await;
+    assert_eq!(listed[0].status, LaunchStatus::Exited);
     assert!(
         listed[0].integrity_drift,
         "drift should be detected even if changed during spawn"
@@ -2763,16 +2840,34 @@ async fn integrity_drift_detected_when_file_replaced_before_spawn() {
 #[tokio::test(start_paused = true)]
 async fn integrity_drift_on_early_exit_verify() {
     let h = Harness::start(Setup::default()).await;
+    std::fs::write(h.cwd.join(".mcp.json"), b"{}").unwrap();
 
-    // Stub executor replaces .mcp.json and exits with error
-    // (stub implementation will fail on todo!() until implemented)
-
+    let mcp = h.cwd.join(".mcp.json");
+    *h.executor.on_spawn.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(&mcp, b"{\"replaced\":true}").unwrap();
+    }));
     h.executor.exit_with(1);
+
     let (status, _) = h.launch(&h.body()).await;
     assert_eq!(status, 500, "early exit returns 500");
 
-    // Verify that integrity check ran and detected change
-    // (would need test hook to verify this)
+    // An early exit leaves no launch record, so the verify pass is observed
+    // through the recording integrity filesystem: the pre-spawn snapshot read
+    // the original bytes, and the early-exit verify re-read the replaced ones.
+    let reads = h.integrity_reads.lock().unwrap();
+    let mcp_reads: Vec<&[u8]> = reads
+        .iter()
+        .filter(|(path, _)| path.ends_with(".mcp.json"))
+        .map(|(_, bytes)| bytes.as_slice())
+        .collect();
+    assert!(
+        mcp_reads.contains(&b"{}".as_slice()),
+        "the snapshot before spawn read the original file: {mcp_reads:?}"
+    );
+    assert!(
+        mcp_reads.contains(&b"{\"replaced\":true}".as_slice()),
+        "the early-exit verify re-read the replaced file: {mcp_reads:?}"
+    );
 }
 
 // ----------------------------------------------------------------- Windows only

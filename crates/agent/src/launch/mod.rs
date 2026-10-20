@@ -680,6 +680,29 @@ pub trait LaunchChild: Send {
     fn kill(&mut self) -> io::Result<()>;
 }
 
+/// Format SHA-256 hash for logging (hex or "N/A").
+fn format_sha256(snapshot: &integrity::FileSnapshot) -> String {
+    match snapshot {
+        integrity::FileSnapshot::File { sha256, .. }
+        | integrity::FileSnapshot::Folder { sha256, .. }
+        | integrity::FileSnapshot::Link {
+            target_sha256: sha256,
+            ..
+        }
+        | integrity::FileSnapshot::TooLarge {
+            top_level_names_sha256: sha256,
+            ..
+        } => {
+            let mut hex = String::with_capacity(64);
+            for byte in sha256 {
+                hex.push_str(&format!("{:02x}", byte));
+            }
+            hex
+        }
+        _ => "N/A".to_string(),
+    }
+}
+
 fn stop_executor(child: &mut dyn LaunchChild, launch_id: &str) {
     if let Err(error) = child.kill() {
         tracing::warn!(launch_id, %error, "failed to stop the executor process");
@@ -989,6 +1012,25 @@ async fn start_launch(
         Ok(path) => path,
         Err(error) => return fail(&launch_dir, format!("prepare launch: {error:#}")),
     };
+
+    // Take integrity snapshot before spawn
+    let integrity_roots = integrity::integrity_paths(&host.home(), &input.cwd);
+    let integrity_fs = host.integrity_fs();
+    let baseline = tokio::task::spawn_blocking({
+        let roots = integrity_roots.clone();
+        let fs = integrity_fs.clone();
+        move || integrity::snapshot(&roots, fs.as_ref())
+    })
+    .await
+    .unwrap_or_else(|_| BTreeMap::new());
+
+    // Log TooLarge folders
+    for (path, snap) in &baseline {
+        if matches!(snap, integrity::FileSnapshot::TooLarge { .. }) {
+            tracing::warn!(launch_id, path = %path.display(), "integrity check: folder too large, content not covered");
+        }
+    }
+
     let mut child =
         match state
             .executor
@@ -1005,6 +1047,28 @@ async fn start_launch(
         format!("{} {}", child.pid(), child.start_time()),
     ) {
         stop_executor(child.as_mut(), &launch_id);
+        // Verify integrity at early exit (pid write failure)
+        let verify_result = tokio::task::spawn_blocking({
+            let baseline = baseline.clone();
+            let fs = integrity_fs.clone();
+            move || integrity::verify(&baseline, fs.as_ref())
+        })
+        .await
+        .unwrap_or_else(|_| integrity::VerifyResult {
+            changed: Vec::new(),
+        });
+        for (path, change) in verify_result.changed {
+            let before_sha256 = format_sha256(&change.before);
+            let after_sha256 = format_sha256(&change.after);
+            tracing::warn!(
+                launch_id,
+                path = %path.display(),
+                change = %change.kind,
+                before_sha256,
+                after_sha256,
+                "executable config changed while launch ran"
+            );
+        }
         return fail(&launch_dir, format!("record the launch pid: {error}"));
     }
 
@@ -1015,6 +1079,28 @@ async fn start_launch(
         match child.try_wait() {
             Ok(None) => {}
             Ok(Some(code)) => {
+                // Verify integrity at early exit
+                let verify_result = tokio::task::spawn_blocking({
+                    let baseline = baseline.clone();
+                    let fs = integrity_fs.clone();
+                    move || integrity::verify(&baseline, fs.as_ref())
+                })
+                .await
+                .unwrap_or_else(|_| integrity::VerifyResult {
+                    changed: Vec::new(),
+                });
+                for (path, change) in verify_result.changed {
+                    let before_sha256 = format_sha256(&change.before);
+                    let after_sha256 = format_sha256(&change.after);
+                    tracing::warn!(
+                        launch_id,
+                        path = %path.display(),
+                        change = %change.kind,
+                        before_sha256,
+                        after_sha256,
+                        "executable config changed while launch ran"
+                    );
+                }
                 let tail = log_tail(&log_path);
                 return fail(
                     &launch_dir,
@@ -1026,6 +1112,28 @@ async fn start_launch(
             }
             Err(error) => {
                 stop_executor(child.as_mut(), &launch_id);
+                // Verify integrity at early exit (watch error)
+                let verify_result = tokio::task::spawn_blocking({
+                    let baseline = baseline.clone();
+                    let fs = integrity_fs.clone();
+                    move || integrity::verify(&baseline, fs.as_ref())
+                })
+                .await
+                .unwrap_or_else(|_| integrity::VerifyResult {
+                    changed: Vec::new(),
+                });
+                for (path, change) in verify_result.changed {
+                    let before_sha256 = format_sha256(&change.before);
+                    let after_sha256 = format_sha256(&change.after);
+                    tracing::warn!(
+                        launch_id,
+                        path = %path.display(),
+                        change = %change.kind,
+                        before_sha256,
+                        after_sha256,
+                        "executable config changed while launch ran"
+                    );
+                }
                 return fail(&launch_dir, format!("watch wxc-exec: {error}"));
             }
         }
@@ -1049,6 +1157,32 @@ async fn start_launch(
     };
     state.registry.insert(launch.clone());
     tracing::info!(launch_id, cwd = %launch.cwd.display(), "sandboxed launch started");
+
+    // Start periodic integrity check
+    let periodic = {
+        let registry = state.registry.clone();
+        let launch_id_clone = launch_id.clone();
+        let on_drift = Arc::new(move |path: PathBuf, change: integrity::Change| {
+            let before_sha256 = format_sha256(&change.before);
+            let after_sha256 = format_sha256(&change.after);
+            tracing::warn!(
+                launch_id = launch_id_clone,
+                path = %path.display(),
+                change = %change.kind,
+                before_sha256,
+                after_sha256,
+                "executable config changed during launch"
+            );
+            registry.set_integrity_drift(&launch_id_clone);
+        });
+        tokio::spawn(integrity::run_periodic(
+            baseline.clone(),
+            integrity_fs.clone(),
+            Duration::from_secs(60),
+            on_drift,
+        ))
+    };
+
     let refresh = tokio::spawn(refresh_task(
         state.credentials.clone(),
         host.clone(),
@@ -1060,11 +1194,14 @@ async fn start_launch(
     tokio::spawn(poll_task(
         child,
         refresh.abort_handle(),
+        periodic.abort_handle(),
         state.registry.clone(),
-        host,
+        host.clone(),
         launch_id,
         launch_dir,
         log_path,
+        baseline,
+        integrity_fs,
     ));
     Ok((StatusCode::CREATED, Json(launch)))
 }
@@ -1090,14 +1227,18 @@ fn log_tail(log: &Path) -> String {
 /// Watches the executor: copies new log lines to the daemon log. When it exits,
 /// or when it can no longer be watched (then it is stopped first), records the
 /// exit, stops the refresh and removes the launch directory.
+#[allow(clippy::too_many_arguments)]
 async fn poll_task(
     mut child: Box<dyn LaunchChild>,
     refresh: tokio::task::AbortHandle,
+    periodic: tokio::task::AbortHandle,
     registry: LaunchRegistry,
     host: Arc<dyn LaunchHost>,
     launch_id: String,
     launch_dir: PathBuf,
     log_path: PathBuf,
+    baseline: BTreeMap<PathBuf, integrity::FileSnapshot>,
+    integrity_fs: Arc<dyn integrity::IntegrityFs>,
 ) {
     let mut log_offset = 0u64;
     loop {
@@ -1112,6 +1253,34 @@ async fn poll_task(
                 None
             }
         };
+
+        // Stop periodic task and verify integrity at exit
+        periodic.abort();
+
+        let verify_result = {
+            let baseline = baseline.clone();
+            let fs = integrity_fs.clone();
+            tokio::task::spawn_blocking(move || integrity::verify(&baseline, fs.as_ref()))
+                .await
+                .unwrap_or_else(|_| integrity::VerifyResult {
+                    changed: Vec::new(),
+                })
+        };
+
+        for (path, change) in verify_result.changed {
+            let before_sha256 = format_sha256(&change.before);
+            let after_sha256 = format_sha256(&change.after);
+            tracing::warn!(
+                launch_id,
+                path = %path.display(),
+                change = %change.kind,
+                before_sha256,
+                after_sha256,
+                "executable config changed while launch ran"
+            );
+            registry.set_integrity_drift(&launch_id);
+        }
+
         refresh.abort();
         registry.mark_exited(&launch_id, exit, host.now());
         if let Err(error) = std::fs::remove_dir_all(&launch_dir) {

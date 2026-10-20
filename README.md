@@ -713,7 +713,8 @@ the executor first), or when the executor exits within three seconds (its last
 log lines are in the message). If the daemon can no longer watch a running
 sandboxed session, it stops it. Launches are
 listed by `GET /v1/launches`
-(running ones plus the last 32 that exited). A daemon restart keeps running
+(running ones plus the last 32 that exited); each
+entry carries `integrityDrift: true` once a change was detected. A daemon restart keeps running
 boxes alive but stops refreshing their credential: at startup the daemon removes
 the credential and request files of every earlier launch, and the directory of
 a launch whose box has exited. Residual risk: on Windows a read-only file inside
@@ -726,9 +727,21 @@ repository), `.mcp.json`, the workspace-root `HEAD`, and `.git\config`, `.git\ho
 and `.git\commondir`. The boxed agent can
 change them, and the next unboxed session reads them (Claude Code outside the box;
 git outside the box, where `core.fsmonitor` and `core.hooksPath` run code). The
-read-only grant stops in-place writes but not replacement. Files the agent creates
-in the workspace are not gated yet; nested repositories under the workspace, a
-renamed or recreated `.git` or `.claude` directory, and editor task files such as
+read-only grant stops in-place writes but not replacement. The daemon detects such
+changes but does not prevent them. At launch it records a SHA-256 and the
+file identity of each entry above (folders recursively, up to 1000 entries and 10 MiB
+per entry; a larger folder is recorded by identity and top-level names only and logged
+at launch), and the identity of the workspace `.claude` and `.git`. It compares them
+every 60 seconds while the box runs and at box exit. Each change is logged once as a
+warning (`executable config changed during launch` / `… while launch ran`, with
+path, change type and both hashes), and the launch shows `integrityDrift: true` in
+`GET /v1/launches`. Changes are not undone. A change is not proof that the box made it:
+the daemon's own reconcile when its configuration changes, Claude Code saving settings
+(inside or outside the box), git writing `.git\config`, and other boxes in the same
+workspace all register. A daemon restart drops the recorded state of running boxes
+without a check. Files the agent creates in the workspace are not gated yet; nested
+repositories under the workspace, a renamed or recreated `.git` or `.claude` directory
+(detected, not prevented), and editor task files such as
 `.vscode\tasks.json` are not protected; `~\.claude\.claude.json` (user-scope
 MCP servers) and skills under `~\.claude` stay writable so the agent keeps its
 context; managed `allowManaged*Only` settings arrive with the policy profile.

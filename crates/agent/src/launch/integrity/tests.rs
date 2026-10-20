@@ -520,14 +520,11 @@ fn verify_no_change() {
     };
     fs.set_file(path.clone(), b"content".to_vec(), identity);
 
-    let mut baseline = BTreeMap::new();
-    baseline.insert(
-        path.clone(),
-        FileSnapshot::File {
-            sha256: [0; 32],
-            identity,
-        },
-    );
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, &fs);
 
     let result = verify(&baseline, &fs);
     assert!(result.changed.is_empty());
@@ -689,30 +686,34 @@ fn verify_revert_to_baseline() {
     };
     fs.set_file(path.clone(), b"original".to_vec(), identity);
 
-    let mut baseline = BTreeMap::new();
-    baseline.insert(
-        path.clone(),
-        FileSnapshot::File {
-            sha256: [1; 32],
-            identity,
-        },
-    );
+    let roots = vec![IntegrityRoot {
+        path: path.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, &fs);
+
+    // Change the file, then revert it in place to the baseline content.
+    fs.set_file(path.clone(), b"changed".to_vec(), identity);
+    fs.set_file(path.clone(), b"original".to_vec(), identity);
 
     let result = verify(&baseline, &fs);
-    // If content matches baseline, no change
-    assert!(result.changed.is_empty() || result.changed.len() > 0);
+    assert!(
+        result.changed.is_empty(),
+        "content equal to the baseline is no drift: {:?}",
+        result.changed
+    );
 }
 
 // AC 1 Tests: integrity_paths
 
 #[test]
-fn integrity_paths_returns_twelve_roots() {
+fn integrity_paths_returns_thirteen_roots() {
     let home = PathBuf::from("/home/user");
     let cwd = PathBuf::from("/workspace");
 
     let paths = integrity_paths(&home, &cwd);
 
-    assert_eq!(paths.len(), 12);
+    assert_eq!(paths.len(), 13);
 }
 
 #[test]
@@ -1118,15 +1119,34 @@ async fn run_periodic_scenario_a_no_call_at_59s_one_at_61s_two_at_121s() {
         Duration::from_secs(60),
         on_drift.clone(),
     ));
+    // Poll the task once so its timer starts at t=0.
+    tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(59)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(fs.metadata_call_count(), 0);
 
     // Check at 61s - one call
     tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..1000 {
+        if fs.metadata_call_count() >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(fs.metadata_call_count(), 1);
 
     // Check at 121s - two calls
     tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..1000 {
+        if fs.metadata_call_count() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(fs.metadata_call_count(), 2);
 }
 
@@ -1158,8 +1178,17 @@ async fn run_periodic_scenario_b_abort_at_90s_exactly_one_call() {
         Duration::from_secs(60),
         on_drift,
     ));
+    // Poll the task once so its timer starts at t=0.
+    tokio::task::yield_now().await;
 
     tokio::time::advance(Duration::from_secs(90)).await;
+    for _ in 0..1000 {
+        if fs.metadata_call_count() >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     handle.abort();
 
     // Should have exactly one call at t=60
@@ -1167,6 +1196,10 @@ async fn run_periodic_scenario_b_abort_at_90s_exactly_one_call() {
 
     // No further call at 180s
     tokio::time::advance(Duration::from_secs(90)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(fs.metadata_call_count(), 1);
 }
 
@@ -1202,27 +1235,58 @@ async fn run_periodic_scenario_c_change_revert_second_replacement() {
         Duration::from_secs(60),
         on_drift,
     ));
+    // Poll the task once so its timer starts at t=0.
+    tokio::task::yield_now().await;
 
     // Change before 60s
     fs.set_file(path.clone(), b"changed".to_vec(), identity);
     tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..1000 {
+        if *drift_count.lock().unwrap() >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
     // One on_drift call
     assert_eq!(*drift_count.lock().unwrap(), 1);
 
     // No second call at 120s and 180s (same state)
     tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(*drift_count.lock().unwrap(), 1);
     tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(*drift_count.lock().unwrap(), 1);
 
     // Second replacement
     fs.set_file(path.clone(), b"changed_again".to_vec(), identity);
     tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..1000 {
+        if *drift_count.lock().unwrap() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(*drift_count.lock().unwrap(), 2);
 
     // Revert
     fs.set_file(path, b"changed".to_vec(), identity);
     tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..1000 {
+        if *drift_count.lock().unwrap() >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(*drift_count.lock().unwrap(), 3);
 }
