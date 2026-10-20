@@ -637,10 +637,22 @@ pub(crate) async fn serve_with_cache(
 
 /// What `forward` records about a request for the sandbox request log. Only a
 /// request on the sandbox route fills `sandbox`; every other route logs
-/// nothing new.
+/// nothing new. Drop guard: if the handler future is dropped (client
+/// disconnected) before `forward` or `LoggedBody` emitted the log, RequestLog's
+/// Drop emits with outcome=canceled.
 #[derive(Debug, Default)]
 pub(crate) struct RequestLog {
     pub sandbox: Option<SandboxRequest>,
+}
+
+impl Drop for RequestLog {
+    fn drop(&mut self) {
+        // If sandbox is still present, the request was canceled before the
+        // normal log paths (error arm or LoggedBody) took it and emitted.
+        if let Some(request) = self.sandbox.take() {
+            request.emit(0, "canceled");
+        }
+    }
 }
 
 /// One request on the sandbox route, as its log event reports it: never a
@@ -4833,6 +4845,82 @@ mod tests {
             proxy.abort();
             let _ = proxy.await;
             upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_request_canceled_before_upstream_headers_still_logs() {
+        let (logs, _guard) = capture_logs();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (socket, _) = upstream.accept().await.unwrap();
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            let _ = request.into_body().collect().await;
+                            // Never respond: the client will be aborted first.
+                            tokio::time::sleep(Duration::from_secs(600)).await;
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from_static(b"{}")))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await;
+            });
+            let (dir, state) = request_source_state(address).await;
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            // Client drops before the upstream responds: the handler future
+            // is dropped and RequestLog's Drop emits with outcome=canceled.
+            let canceled = tokio::spawn({
+                let client = client.clone();
+                let pairing = session.pairing.clone();
+                async move {
+                    let request =
+                        post_with(proxy_address, "/sandbox/v1/messages", Some(&pairing), b"{}");
+                    let _ = client.request(request).await;
+                }
+            });
+            // Give the request time to reach the proxy and upstream.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceled.abort();
+            let lines = logs.wait_for_lines(1).await;
+            let line = &lines[0];
+            assert_eq!(log_field(line, "session"), session.id);
+            assert_eq!(log_field(line, "client_id"), "claude-code");
+            assert_eq!(log_field(line, "method"), "POST");
+            assert_eq!(log_field(line, "path"), "/v1/messages");
+            assert_eq!(log_field(line, "status"), "0");
+            assert_eq!(log_field(line, "outcome"), "canceled");
+            assert_eq!(log_field(line, "bytes_out"), "0");
+            // Wait a bit to ensure no duplicate line is emitted.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let lines_later = logs.sandbox_lines();
+            assert_eq!(
+                lines_later.len(),
+                1,
+                "canceled request should log exactly once"
+            );
+
+            proxy.abort();
+            let _ = proxy.await;
+            upstream_task.abort();
+            drop(client);
             drop(dir);
         })
         .await

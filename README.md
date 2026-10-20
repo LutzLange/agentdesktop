@@ -697,9 +697,12 @@ gets `403 pairing_invalid` on its next request and has to be started again
 with a new session. Each request on `/sandbox` leaves one line in the daemon
 log, `LLM proxy sandbox request`, with the session id, client id, method, path
 (prefix stripped, no query), status, refusal code, request and response bytes,
-duration and whether the response completed or was cut off (for a request the
-proxy refused, the response bytes are 0: the error body is not counted); never
-a header, a body or a pairing value.
+duration and outcome. A completed or refused request has `outcome=complete`;
+one whose client disconnected before the upstream responded has `outcome=canceled`
+(status 0, response bytes 0); and one cut off during the response has
+`outcome=aborted`. For a request the proxy refused, the response bytes are 0:
+the error body is not counted. The log never carries a header, a body or a
+pairing value.
 
 What a session pairing is worth: it is a bearer secret for `/sandbox` on this
 machine. Any local process that holds it gets the user's gateway identity for
