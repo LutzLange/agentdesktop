@@ -1379,7 +1379,15 @@ async fn forward(
                     // fetches and the others find its credential in the cache.
                     let fetch = {
                         let state = state.clone();
-                        let effective = effective.clone();
+                        // On the sandbox route, the daemon never starts an interactive
+                        // sign-in on behalf of a box: if the stored session is
+                        // unusable, the box's request fails and the user signs in on
+                        // the host.
+                        let effective = if session.is_some() {
+                            api::non_interactive(effective.clone())
+                        } else {
+                            effective.clone()
+                        };
                         let client_id = client_id.clone();
                         let cache = cache.clone();
                         let cache_key = cache_key.clone();

@@ -810,7 +810,10 @@ With `authentication.type: controllerJwt` the session's client id must be in
 id fails at `session create` rather than at the first prompt; a session that
 already exists keeps its gateway identity when the configuration later switches
 that program to subscription mode or narrows `allowedClientIds`, until it is
-revoked or idles out. With `oidc` the client id only labels the log.
+revoked or idles out. With `oidc` the client id only labels the log. The daemon
+never starts an interactive sign-in on behalf of a sandbox: if a stored OIDC
+session is missing or unusable, the box's request fails and the user must sign
+in on the host.
 
 Sessions live in memory and expire `ttlSeconds` after their last request
 (default 28800, at most 86400 and at least 60; the timeout restarts on every
