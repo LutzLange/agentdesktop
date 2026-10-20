@@ -262,19 +262,7 @@ pub async fn run(command: ClientCommand, socket: PathBuf) -> anyhow::Result<()> 
             let request = run_request(&program, cwd, args);
             match client::post_json_response::<_, Launch>(&socket, "/v1/launch", &request).await {
                 Ok(launch) => {
-                    let valid_until = launch
-                        .credential_expires_at_unix_seconds
-                        .map(|seconds| {
-                            humantime::format_rfc3339_seconds(
-                                std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
-                            )
-                            .to_string()
-                        })
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    println!(
-                        "launched {} (container {}, credential valid until {valid_until})",
-                        launch.launch_id, launch.container_id
-                    );
+                    println!("{}", run_success_line(&launch));
                 }
                 Err(error) => {
                     eprintln!("{}", run_error_message(&error));
@@ -333,6 +321,11 @@ pub fn run_request(program: &str, cwd: PathBuf, args: Vec<String>) -> LaunchRequ
         cwd,
         args,
     }
+}
+
+/// The line `agentdesktop run` prints on stdout for a successful launch.
+pub fn run_success_line(launch: &Launch) -> String {
+    todo!("PR 3b: format the launch success line")
 }
 
 /// The line `agentdesktop run` prints on stderr for a failed launch request.
@@ -534,6 +527,28 @@ mod tests {
     fn run_error_message_keeps_the_text_of_a_transport_error() {
         let error = anyhow::anyhow!("connect to /tmp/x.sock\nCheck that the daemon is running.");
         assert!(run_error_message(&error).contains("connect to /tmp/x.sock"));
+    }
+
+    // AC 4: run_success_line test
+    #[test]
+    fn run_success_line_formats_launch_and_container_id() {
+        use agentdesktop_core::model::{Launch, LaunchStatus};
+        let launch = Launch {
+            launch_id: "0123456789abcdef".into(),
+            program: "claude-code".into(),
+            cwd: "/work/app".into(),
+            container_id: "agentdesktop-0123456789abcdef".into(),
+            status: LaunchStatus::Running,
+            exit_code: None,
+            started_at_unix_seconds: 1_700_000_000,
+            ended_at_unix_seconds: None,
+            session_id: "test-session-id".into(),
+        };
+        let line = super::run_success_line(&launch);
+        assert_eq!(
+            line,
+            "launched 0123456789abcdef (container agentdesktop-0123456789abcdef)"
+        );
     }
 
     fn credential_file(contents: &str) -> (tempfile::TempDir, PathBuf) {

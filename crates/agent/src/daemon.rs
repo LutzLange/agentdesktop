@@ -2221,6 +2221,7 @@ programs:
         config::DaemonStartupConfig {
             containment: Some(config::ContainmentStartupConfig {
                 executor: PathBuf::from(r"C:\mxc\x64\wxc-exec.exe"),
+                egress: config::ContainmentEgress::default(),
             }),
             ..Default::default()
         }

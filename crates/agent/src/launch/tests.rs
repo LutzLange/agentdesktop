@@ -50,6 +50,7 @@ fn p(relative: &str) -> PathBuf {
 fn executor_cfg(path: &str) -> ContainmentStartupConfig {
     ContainmentStartupConfig {
         executor: PathBuf::from(path),
+        egress: agentdesktop_core::config::ContainmentEgress::default(),
     }
 }
 
@@ -748,7 +749,9 @@ fn launch_input<'a>(exists: &'a dyn Fn(&Path) -> bool) -> LaunchInput<'a> {
         ),
         git_dir: Some(PathBuf::from(r"C:\Program Files\Git")),
         program_files_claude: Some(PathBuf::from(r"C:\Program Files\ClaudeCode")),
-        gateway_url: "https://alpha-dev.aks.solo.sademo.de".into(),
+        egress: agentdesktop_core::config::ContainmentEgress::Allow,
+        relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
+        pairing: "test-pairing-value".into(),
         base_env: base_env(),
         exists,
     }
@@ -824,6 +827,23 @@ fn the_request_has_the_fixed_shape_and_no_process_timeout() {
     );
     assert_eq!(request["process"]["inheritDefaultEnv"], false);
     assert!(request["process"].get("timeout").is_none());
+}
+
+// AC 1: egress deny test
+#[test]
+fn egress_deny_sets_the_network_default_to_deny() {
+    use agentdesktop_core::config::ContainmentEgress;
+    let request = request_json(&snapshot_existing(), |input| {
+        input.egress = ContainmentEgress::Deny;
+    });
+    assert_eq!(
+        request["network"],
+        serde_json::json!({
+            "egress": {"default": "deny"},
+            "ingress": {"default": "allow", "hostLoopback": "allow"},
+        }),
+        "egress deny sets network.egress.default to deny and hostLoopback to allow"
+    );
 }
 
 #[test]
@@ -921,11 +941,11 @@ fn the_request_contains_no_percent_sign_and_no_forward_slash_in_any_path() {
 #[test]
 fn a_url_in_the_request_keeps_its_slashes() {
     let request = request_json(&snapshot_existing(), |input| {
-        input.gateway_url = "https://gateway.example.com/anthropic".into();
+        input.relay_base_url = "http://127.0.0.1:4000/sandbox".into();
     });
     assert_eq!(
         env_map(&request)["ANTHROPIC_BASE_URL"],
-        "https://gateway.example.com/anthropic"
+        "http://127.0.0.1:4000/sandbox"
     );
 }
 
@@ -1198,7 +1218,7 @@ fn launch(id: &str, started_at: u64) -> Launch {
         exit_code: None,
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
-        credential_expires_at_unix_seconds: None,
+        session_id: format!("session-{id}"),
     }
 }
 
@@ -1261,31 +1281,6 @@ fn an_exit_without_a_code_is_recorded_as_exited() {
     let listed = registry.list();
     assert_eq!(listed[0].status, LaunchStatus::Exited);
     assert_eq!(listed[0].exit_code, None);
-}
-
-#[test]
-fn the_credential_expiry_of_a_running_launch_can_be_updated() {
-    let registry = LaunchRegistry::new();
-    registry.insert(launch("a", 10));
-    registry.set_credential_expiry("a", 3_600);
-    assert_eq!(
-        registry.list()[0].credential_expires_at_unix_seconds,
-        Some(3_600)
-    );
-    registry.set_credential_expiry("a", 7_200);
-    assert_eq!(
-        registry.list()[0].credential_expires_at_unix_seconds,
-        Some(7_200)
-    );
-}
-
-#[test]
-fn updating_an_unknown_launch_changes_nothing() {
-    let registry = LaunchRegistry::new();
-    registry.insert(launch("a", 10));
-    registry.mark_exited("nope", Some(1), 5);
-    registry.set_credential_expiry("nope", 5);
-    assert_eq!(registry.list(), vec![launch("a", 10)]);
 }
 
 #[test]
@@ -2296,12 +2291,7 @@ async fn a_launch_answers_201_with_the_launch_and_lists_it() {
     assert_eq!(launched.exit_code, None);
     assert_eq!(launched.ended_at_unix_seconds, None);
     assert!((BASE_TIME..BASE_TIME + 10).contains(&launched.started_at_unix_seconds));
-    let expires = launched
-        .credential_expires_at_unix_seconds
-        .expect("credential expiry");
-    assert!(
-        (BASE_TIME + CREDENTIAL_LIFETIME..BASE_TIME + CREDENTIAL_LIFETIME + 10).contains(&expires)
-    );
+    assert!(!launched.session_id.is_empty(), "session_id present");
     assert_eq!(h.listed().await, vec![launched]);
 }
 
@@ -2455,73 +2445,6 @@ async fn the_poller_marks_an_exit_stops_the_refresh_and_removes_the_launch_direc
 
     tokio::time::sleep(Duration::from_secs(2 * CREDENTIAL_LIFETIME)).await;
     assert_eq!(h.credentials.calls().len(), 1, "no refresh after the exit");
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_refresh_task_rewrites_the_token_before_it_expires_without_prompting() {
-    let h = Harness::start(Setup::default()).await;
-    let launched = h.launch_ok().await;
-    let first_expiry = launched.credential_expires_at_unix_seconds.unwrap();
-    assert_eq!(
-        h.token(&launched.launch_id).as_deref(),
-        Some("gateway-token-0")
-    );
-
-    tokio::time::sleep(Duration::from_secs(CREDENTIAL_LIFETIME - 40)).await;
-
-    assert_eq!(
-        h.token(&launched.launch_id).as_deref(),
-        Some("gateway-token-1")
-    );
-    let calls = h.credentials.calls();
-    assert_eq!(calls[0], ("claude-code".to_owned(), true));
-    assert_eq!(
-        calls[1],
-        ("claude-code".to_owned(), false),
-        "the refresh never prompts"
-    );
-    let listed = h.listed().await;
-    assert!(
-        listed[0].credential_expires_at_unix_seconds.unwrap() > first_expiry,
-        "the launch reports the new expiry"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_refresh_refused_by_policy_deletes_the_token_but_not_the_launch() {
-    let h = Harness::start(Setup::default()).await;
-    let launched = h.launch_ok().await;
-    h.credentials.fail_with(Some((
-        StatusCode::CONFLICT,
-        "programs.claudeCode must use the gateway",
-    )));
-
-    tokio::time::sleep(Duration::from_secs(CREDENTIAL_LIFETIME - 40)).await;
-
-    assert_eq!(h.token(&launched.launch_id), None);
-    assert_eq!(h.listed().await[0].status, LaunchStatus::Running);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_gateway_error_keeps_the_token_until_it_expires_then_deletes_it() {
-    let h = Harness::start(Setup::default()).await;
-    let launched = h.launch_ok().await;
-    h.credentials
-        .fail_with(Some((StatusCode::BAD_GATEWAY, "upstream down")));
-
-    tokio::time::sleep(Duration::from_secs(CREDENTIAL_LIFETIME - 40)).await;
-    assert_eq!(
-        h.token(&launched.launch_id).as_deref(),
-        Some("gateway-token-0"),
-        "a transient error keeps the still-valid token"
-    );
-
-    tokio::time::sleep(Duration::from_secs(120)).await;
-    assert_eq!(
-        h.token(&launched.launch_id),
-        None,
-        "an expired token is removed"
-    );
 }
 
 // -------------------------------------------------------------------- body errors

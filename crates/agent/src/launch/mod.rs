@@ -386,7 +386,9 @@ pub struct LaunchInput<'a> {
     pub launch_dir: PathBuf,
     pub git_dir: Option<PathBuf>,
     pub program_files_claude: Option<PathBuf>,
-    pub gateway_url: String,
+    pub egress: agentdesktop_core::config::ContainmentEgress,
+    pub relay_base_url: String,
+    pub pairing: String,
     pub base_env: BTreeMap<String, String>,
     pub exists: &'a dyn Fn(&Path) -> bool,
 }
@@ -447,10 +449,8 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
         "1".into(),
     );
-    env.insert("ANTHROPIC_BASE_URL".into(), input.gateway_url.clone());
-    env.insert(
-        "AGENTDESKTOP_CREDENTIAL_FILE".into(),
-        join(&credential_dir, "token"),
+    todo!(
+        "PR 3b: set relay environment vars ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_CUSTOM_HEADERS, CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
     );
     env.insert("HOME".into(), home.clone());
 
@@ -572,11 +572,11 @@ pub fn build_request(input: &LaunchInput) -> MxcRequest {
         },
         network: MxcNetwork {
             egress: MxcEgress {
-                default: "allow".into(),
+                default: todo!("PR 3b: set from input.egress (allow or deny)"),
             },
             ingress: MxcIngress {
                 default: "allow".into(),
-                host_loopback: "deny".into(),
+                host_loopback: todo!("PR 3b: set to allow"),
             },
         },
     }
@@ -765,14 +765,9 @@ impl LaunchRegistry {
         }
     }
 
-    pub fn set_credential_expiry(&self, launch_id: &str, expires_at: u64) {
-        if let Some(launch) = self
-            .lock()
-            .iter_mut()
-            .find(|launch| launch.launch_id == launch_id)
-        {
-            launch.credential_expires_at_unix_seconds = Some(expires_at);
-        }
+    // PR 3b: removed (credential mechanism removed)
+    pub fn set_credential_expiry(&self, _launch_id: &str, _expires_at: u64) {
+        todo!("PR 3b: set_credential_expiry removed");
     }
 
     /// Ordered by `started_at_unix_seconds` ascending.
@@ -966,7 +961,9 @@ async fn start_launch(
         launch_dir: launch_dir.clone(),
         git_dir: host.git_dir(),
         program_files_claude: host.program_files_claude(),
-        gateway_url: input.gateway_url,
+        egress: todo!("PR 3b: get egress from StartInput/LaunchState"),
+        relay_base_url: todo!("PR 3b: build relay base URL from proxy_address"),
+        pairing: todo!("PR 3b: get pairing from session.register()"),
         base_env: host.base_env(),
         exists: &exists,
     });
@@ -1029,7 +1026,7 @@ async fn start_launch(
         exit_code: None,
         started_at_unix_seconds: started_at,
         ended_at_unix_seconds: None,
-        credential_expires_at_unix_seconds: Some(input.credential.expires_at_unix_seconds),
+        session_id: todo!("PR 3b: get session id from sessions.register()"),
     };
     state.registry.insert(launch.clone());
     tracing::info!(launch_id, cwd = %launch.cwd.display(), "sandboxed launch started");

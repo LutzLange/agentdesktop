@@ -88,7 +88,9 @@ fn the_executable_configuration_rule_covers_git_commondir_and_the_ide_directory_
         ),
         git_dir: None,
         program_files_claude: None,
-        gateway_url: "https://gateway.example.com/".into(),
+        egress: agentdesktop_core::config::ContainmentEgress::Allow,
+        relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
+        pairing: "test-pairing".into(),
         base_env: BTreeMap::new(),
         exists: &exists,
     });
@@ -401,7 +403,9 @@ mod handler {
             ),
             git_dir: None,
             program_files_claude: None,
-            gateway_url: "https://gateway.example.com/".into(),
+            egress: agentdesktop_core::config::ContainmentEgress::Allow,
+            relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
+            pairing: "test-pairing".into(),
             base_env: BTreeMap::new(),
             exists: &exists,
         });
@@ -520,7 +524,9 @@ fn the_environment_is_a_list_of_key_value_entries_and_a_missing_workspace_claude
         ),
         git_dir: None,
         program_files_claude: None,
-        gateway_url: "https://gateway.example.com/".into(),
+        egress: agentdesktop_core::config::ContainmentEgress::Allow,
+        relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
+        pairing: "test-pairing".into(),
         base_env: BTreeMap::from([("SystemRoot".to_owned(), r"C:\Windows".to_owned())]),
         exists: &exists,
     });
@@ -565,7 +571,9 @@ fn the_box_environment_has_home_set_to_the_daemon_home_when_daemon_env_has_no_ho
         ),
         git_dir: None,
         program_files_claude: None,
-        gateway_url: "https://gateway.example.com/".into(),
+        egress: agentdesktop_core::config::ContainmentEgress::Allow,
+        relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
+        pairing: "test-pairing".into(),
         base_env: BTreeMap::new(),
         exists: &exists,
     });
