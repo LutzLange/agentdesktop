@@ -146,7 +146,12 @@ impl IntegrityFs for RealIntegrityFs {
     }
 
     fn read_bytes(&self, p: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(p)
+        use std::io::Read;
+        let mut buf = Vec::new();
+        std::fs::File::open(p)?
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut buf)?;
+        Ok(buf)
     }
 
     fn read_dir_names(&self, p: &Path) -> io::Result<Vec<OsString>> {
@@ -343,7 +348,7 @@ fn snapshot_folder_recursive(
         .read_dir_names(path)
         .map_err(|e| FolderError::Unreadable(e.kind()))?;
 
-    let mut children: Vec<(OsString, u8, [u8; 32])> = Vec::new();
+    let mut children: Vec<(OsString, u8, [u8; 32], Option<FileIdentity>)> = Vec::new();
 
     for name in names {
         // Each entry counts once, whatever its kind.
@@ -388,7 +393,8 @@ fn snapshot_folder_recursive(
             }
         };
 
-        children.push((name, kind_byte, hash));
+        let identity = fs.file_identity(&child_path).ok();
+        children.push((name, kind_byte, hash, identity));
     }
 
     children.sort_by(|a, b| os_bytes(&a.0).cmp(os_bytes(&b.0)));
@@ -397,12 +403,19 @@ fn snapshot_folder_recursive(
     let mut hasher = sha2::Sha256::new();
     use sha2::Digest;
 
-    for (name, kind_byte, hash) in children {
+    for (name, kind_byte, hash, identity) in children {
         let name_bytes = os_bytes(&name);
         hasher.update((name_bytes.len() as u32).to_le_bytes());
         hasher.update(name_bytes);
         hasher.update([kind_byte]);
         hasher.update(hash);
+        if let Some(id) = identity {
+            hasher.update([1u8]); // presence marker
+            hasher.update(id.volume.to_le_bytes());
+            hasher.update(id.file_id.to_le_bytes());
+        } else {
+            hasher.update([0u8]); // absence marker
+        }
     }
 
     Ok(hasher.finalize().into())
@@ -437,19 +450,36 @@ fn structure_hash(
                 hasher.update([0u8]);
                 hasher.update(len.to_le_bytes());
                 if let Ok(identity) = fs.file_identity(&child_path) {
+                    hasher.update([1u8]); // presence marker
                     hasher.update(identity.volume.to_le_bytes());
                     hasher.update(identity.file_id.to_le_bytes());
+                } else {
+                    hasher.update([0u8]); // absence marker
                 }
             }
             Ok(EntryKind::Folder) => {
                 hasher.update([1u8]);
                 let child_hash = structure_hash(&child_path, fs, entries_count)?;
                 hasher.update(child_hash);
+                if let Ok(identity) = fs.file_identity(&child_path) {
+                    hasher.update([1u8]); // presence marker
+                    hasher.update(identity.volume.to_le_bytes());
+                    hasher.update(identity.file_id.to_le_bytes());
+                } else {
+                    hasher.update([0u8]); // absence marker
+                }
             }
             Ok(EntryKind::Link) => {
                 hasher.update([2u8]);
                 if let Ok(target) = fs.read_link(&child_path) {
                     hasher.update(sha256_hash(os_bytes(&target)));
+                }
+                if let Ok(identity) = fs.file_identity(&child_path) {
+                    hasher.update([1u8]); // presence marker
+                    hasher.update(identity.volume.to_le_bytes());
+                    hasher.update(identity.file_id.to_le_bytes());
+                } else {
+                    hasher.update([0u8]); // absence marker
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {

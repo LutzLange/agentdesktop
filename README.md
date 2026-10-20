@@ -728,14 +728,16 @@ and `.git\commondir`. The boxed agent can
 change them, and the next unboxed session reads them (Claude Code outside the box;
 git outside the box, where `core.fsmonitor` and `core.hooksPath` run code). The
 read-only grant stops in-place writes but not replacement. The daemon detects such
-changes but does not prevent them. At launch it records a SHA-256 and the
-file identity of each entry above (folders recursively, up to 1000 entries and 10 MiB
-per entry; a larger folder, such as a well-filled `~\.claude\plugins`, is recorded by
-its structure instead: names, kinds, sizes and identities, recursively, without file
-contents, so a changed manifest or an atomically saved file still registers, while an
-in-place edit that keeps a file's size does not; past 10,000 entries only the top-level
-names are recorded), and the identity of the workspace
-`.claude` and `.git`. It compares them every 60 seconds while the box runs and at box
+changes but does not prevent them. At launch it records the content hash and file
+identity of each root file and of every child in a recursively hashed folder (up to
+1000 entries and 10 MiB per folder; a larger folder, such as a well-filled
+`~\.claude\plugins`, is recorded by its structure instead: names, kinds, sizes and
+identities for files, folders and links, recursively, without file contents, so a
+changed manifest or an atomically saved file still registers, while an in-place edit
+that keeps a file's size does not; past 10,000 entries only the top-level names are
+recorded), and the identity of the workspace `.claude` and `.git`, so a replacement
+with identical bytes is detected (except past 10,000 entries): lab-proven end to end
+for root files, unit-tested for folder children. It compares them every 60 seconds while the box runs and at box
 exit; a transition back to the original state and a repeated change each count again.
 Each change is logged once as a warning (`executable config changed while launch
 ran`, with path, change type and both content hashes, `N/A` where the entry is not a

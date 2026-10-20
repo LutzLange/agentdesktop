@@ -1467,3 +1467,245 @@ async fn run_periodic_scenario_c_change_revert_second_replacement() {
     }
     assert_eq!(*drift_count.lock().unwrap(), 3);
 }
+
+// v5: child identity tests
+
+#[test]
+fn child_replaced_with_identical_bytes_detected_via_identity() {
+    // A child inside a watched folder replaced with identical bytes (new identity)
+    // should be detected as Modified.
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("hooks");
+    let child = folder.join("pre-commit");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(&child, b"#!/bin/sh\nexit 0\n").unwrap();
+
+    let roots = vec![IntegrityRoot {
+        path: folder.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, &REAL_FS);
+    let before_identity = REAL_FS.file_identity(&child).unwrap();
+
+    // Replace with identical bytes via temp + rename
+    let temp_file = folder.join("pre-commit.tmp");
+    std::fs::write(&temp_file, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::rename(&temp_file, &child).unwrap();
+
+    let after_identity = REAL_FS.file_identity(&child).unwrap();
+    assert_ne!(
+        before_identity, after_identity,
+        "rename should change identity"
+    );
+
+    let result = verify(&roots, &baseline, &REAL_FS);
+    assert_eq!(result.changed.len(), 1, "{:?}", result.changed);
+    assert_eq!(
+        result.changed[0].0, folder,
+        "the folder should be reported as changed"
+    );
+    assert_eq!(
+        result.changed[0].1.kind,
+        ChangeKind::Modified,
+        "folder should be Modified due to child identity change"
+    );
+}
+
+#[test]
+fn structure_hash_detects_recreated_nested_directory() {
+    // A nested directory removed and recreated (new identity) should be detected
+    // in the structure_hash path.
+    let fs = MockFs::new();
+    let root = PathBuf::from("/test/plugins");
+    let nested = PathBuf::from("/test/plugins/subdir");
+    let root_identity = FileIdentity {
+        volume: 1,
+        file_id: 500,
+    };
+    let nested_identity_before = FileIdentity {
+        volume: 1,
+        file_id: 501,
+    };
+
+    // Create a large folder to trigger structure_hash path
+    let mut children = Vec::new();
+    for i in 0..1001 {
+        children.push(OsString::from(format!("file{}", i)));
+    }
+    children.push(OsString::from("subdir"));
+
+    // Set up files to trigger TooLarge
+    for i in 0..1001 {
+        let file_path = PathBuf::from(format!("/test/plugins/file{}", i));
+        let file_identity = FileIdentity {
+            volume: 1,
+            file_id: 600 + i as u128,
+        };
+        fs.set_file(file_path, vec![0u8; 100], file_identity);
+    }
+
+    fs.set_folder(nested.clone(), vec![], nested_identity_before);
+    fs.set_folder(root.clone(), children.clone(), root_identity);
+
+    let roots = vec![IntegrityRoot {
+        path: root.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, &fs);
+
+    // Verify we're using structure (TooLarge)
+    assert!(matches!(
+        baseline.get(&root),
+        Some(FileSnapshot::TooLarge { .. })
+    ));
+
+    // Recreate the nested directory with new identity
+    let nested_identity_after = FileIdentity {
+        volume: 1,
+        file_id: 999,
+    };
+    fs.set_folder(nested, vec![], nested_identity_after);
+
+    let result = verify(&roots, &baseline, &fs);
+    assert_eq!(result.changed.len(), 1, "{:?}", result.changed);
+    assert_eq!(
+        result.changed[0].1.kind,
+        ChangeKind::Modified,
+        "recreated directory should be detected via structure_hash identity"
+    );
+}
+
+#[test]
+fn read_bytes_bounded_detects_grown_file_as_too_large() {
+    // A file that grows past MAX_BYTES between metadata and read should be
+    // caught as TooLarge without unbounded allocation.
+    let fs = MockFs::new();
+    let folder = PathBuf::from("/test/workspace");
+    let file = PathBuf::from("/test/workspace/mcp.json");
+    let folder_identity = FileIdentity {
+        volume: 1,
+        file_id: 700,
+    };
+    let file_identity = FileIdentity {
+        volume: 1,
+        file_id: 701,
+    };
+
+    // Set file to MAX_BYTES + 1 (the read will see this size)
+    let oversized_content = vec![0u8; (MAX_BYTES + 1) as usize];
+    fs.set_file(file.clone(), oversized_content, file_identity);
+    fs.set_folder(
+        folder.clone(),
+        vec![OsString::from("mcp.json")],
+        folder_identity,
+    );
+
+    let roots = vec![IntegrityRoot {
+        path: folder.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let result = snapshot(&roots, &fs);
+
+    // The bounded read limits to MAX_BYTES+1, the post-check catches it as TooLarge
+    assert!(
+        matches!(result.get(&folder), Some(FileSnapshot::TooLarge { .. })),
+        "oversized file should trigger TooLarge, not unbounded allocation"
+    );
+}
+
+#[test]
+fn read_bytes_enforces_max_bytes_limit_on_real_file() {
+    // Verify that read_bytes actually limits the read to MAX_BYTES + 1,
+    // independent of metadata checks. A sparse file larger than the limit
+    // should yield exactly MAX_BYTES + 1 bytes.
+    let temp_dir = std::env::temp_dir();
+    let test_file = temp_dir.join(format!("integrity_read_test_{}", std::process::id()));
+
+    // Create a sparse file of MAX_BYTES + 4096
+    let file = std::fs::File::create(&test_file).unwrap();
+    file.set_len(MAX_BYTES + 4096).unwrap();
+    drop(file);
+
+    let result = REAL_FS.read_bytes(&test_file).unwrap();
+    std::fs::remove_file(&test_file).unwrap();
+
+    assert_eq!(
+        result.len() as u64,
+        MAX_BYTES + 1,
+        "read_bytes should limit read to MAX_BYTES + 1 even when file is larger"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structure_hash_detects_swapped_symlink_via_identity() {
+    // A symlink swapped to a different target with a different identity
+    // should be detected via identity in structure_hash.
+    let fs = MockFs::new();
+    let root = PathBuf::from("/test/plugins");
+    let link_path = PathBuf::from("/test/plugins/link1");
+    let root_identity = FileIdentity {
+        volume: 1,
+        file_id: 800,
+    };
+    let link_identity_before = FileIdentity {
+        volume: 1,
+        file_id: 801,
+    };
+
+    // Create a large folder to trigger structure_hash path
+    let mut children = Vec::new();
+    for i in 0..1001 {
+        children.push(OsString::from(format!("file{}", i)));
+    }
+    children.push(OsString::from("link1"));
+
+    // Set up files to trigger TooLarge
+    for i in 0..1001 {
+        let file_path = PathBuf::from(format!("/test/plugins/file{}", i));
+        let file_identity = FileIdentity {
+            volume: 1,
+            file_id: 900 + i as u128,
+        };
+        fs.set_file(file_path, vec![0u8; 100], file_identity);
+    }
+
+    fs.set_link(
+        link_path.clone(),
+        OsString::from("/target1"),
+        link_identity_before,
+    );
+    fs.set_folder(root.clone(), children.clone(), root_identity);
+
+    let roots = vec![IntegrityRoot {
+        path: root.clone(),
+        mode: RootMode::Recursive,
+    }];
+    let baseline = snapshot(&roots, &fs);
+
+    // Verify we're using structure (TooLarge)
+    assert!(matches!(
+        baseline.get(&root),
+        Some(FileSnapshot::TooLarge { .. })
+    ));
+
+    // Swap the symlink with a different identity (same target)
+    let link_identity_after = FileIdentity {
+        volume: 1,
+        file_id: 802,
+    };
+    fs.set_link(link_path, OsString::from("/target1"), link_identity_after);
+
+    let result = verify(&roots, &baseline, &fs);
+
+    // The identity change should be detected via structure_hash
+    assert!(
+        !result.changed.is_empty(),
+        "link identity change should be detected in structure_hash"
+    );
+    assert_eq!(
+        result.changed[0].1.kind,
+        ChangeKind::Modified,
+        "link identity change should report as Modified"
+    );
+}
