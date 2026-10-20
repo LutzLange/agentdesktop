@@ -694,7 +694,7 @@ async fn llm_gateway_login(
         .map_err(|error| (StatusCode::BAD_GATEWAY, format!("{error:#}")))
 }
 
-fn program_uses_subscription(config: &DaemonConfig, client_id: &str) -> bool {
+pub(crate) fn program_uses_subscription(config: &DaemonConfig, client_id: &str) -> bool {
     match client_id {
         "claude-code" => config
             .programs
@@ -759,6 +759,7 @@ mod tests {
                 controller: None,
                 llm_proxy: None,
                 usage_receiver: None,
+                containment: None,
             },
             discovery,
             enrollment: crate::enrollment::EnrollmentState::new(false),
