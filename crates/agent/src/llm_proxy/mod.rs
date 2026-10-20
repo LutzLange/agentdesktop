@@ -1391,7 +1391,15 @@ async fn forward(
                     // fetches and the others find its credential in the cache.
                     let fetch = {
                         let state = state.clone();
-                        let effective = effective.clone();
+                        // On the sandbox route, the daemon never starts an interactive
+                        // sign-in on behalf of a box: if the stored session is
+                        // unusable, the box's request fails and the user signs in on
+                        // the host.
+                        let effective = if session.is_some() {
+                            api::non_interactive(effective.clone())
+                        } else {
+                            effective.clone()
+                        };
                         let client_id = client_id.clone();
                         let cache = cache.clone();
                         let cache_key = cache_key.clone();
@@ -1429,7 +1437,19 @@ async fn forward(
                                 format!("credential fetch failed: {error}"),
                             ))
                         })?
-                        .map_err(ProxyError::credential)?;
+                        .map_err(|(status, message)| {
+                            // On the sandbox route, a 401 means deviceAuthorization is
+                            // false or the token is missing/expired. The endpoint for
+                            // device flow (agentdesktop-headless login) refuses with 424
+                            // in that configuration, so the honest guidance is to sign in
+                            // on the host session (the daemon's own environment).
+                            let message = if session.is_some() && status == StatusCode::UNAUTHORIZED {
+                                "LLM gateway sign-in required. Sign in on the host (the machine running the daemon), not inside the sandbox.".to_owned()
+                            } else {
+                                message
+                            };
+                            ProxyError::credential((status, message))
+                        })?;
                     let (credential, deadline, cached) = fetched;
                     from_cache = cached;
                     fetched_now = !cached;
@@ -4929,6 +4949,78 @@ mod tests {
             proxy.abort();
             let _ = proxy.await;
             upstream_task.abort();
+            drop(client);
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // When deviceAuthorization: false and no stored token exists, a sandbox
+    // request with a valid pairing returns 401 (not 502) because the sandbox
+    // route transforms the config to non-interactive before credential
+    // acquisition. Without the transform, discovery would attempt to contact
+    // the unreachable issuer and return 502. This test verifies mod.rs:1386.
+    #[tokio::test]
+    async fn sandbox_route_returns_401_when_oidc_device_authorization_is_false_and_no_stored_token()
+    {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            // No stored token (unlike request_source_state which stores one).
+            // Use an unreachable loopback HTTPS address.
+            let unreachable_issuer = "https://127.0.0.1:1/";
+            let config = parse_daemon(&format!(
+                "llmGateway:\n  url: http://127.0.0.1:9999\n  authentication:\n    type: oidc\n    issuer: {unreachable_issuer}\n    clientId: test-client\n    deviceAuthorization: false\n    allowInsecure: true\n"
+            )).unwrap();
+            let (_, discovery) = watch::channel(Arc::new(Discovery {
+                agents: vec![],
+                model_runtimes: vec![],
+            }));
+            let state = AppState {
+                controller_status: None,
+                config,
+                daemon_info: DaemonInfo {
+                    version: "test".into(),
+                    scope: DaemonScope::User,
+                    config_path: String::new(),
+                    state_directory: String::new(),
+                    inventory_interval: Duration::from_secs(60),
+                    controller: None,
+                    llm_proxy: None,
+                    usage_receiver: None,
+                    containment: None,
+                },
+                discovery,
+                enrollment: EnrollmentState::new(false),
+                state_dir: dir.path().to_owned(),
+                oidc_callback_listen: None,
+                telemetry: None,
+                logout: None,
+                usage: None,
+                programs: None,
+            };
+            let config = default_config();
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "claude-code");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+
+            let request = post_with(
+                proxy_address,
+                "/sandbox/v1/messages",
+                Some(&session.pairing),
+                b"{}",
+            );
+            let response = client.request(request).await.unwrap();
+            let (status, code, _) = refusal(response).await;
+            // Must be 401 (sign-in required), not 502 (bad gateway/discovery error).
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "non-interactive acquisition returns 401");
+            assert_eq!(code, "agentdesktop_credential", "the error is credential-related");
+
+            proxy.abort();
+            let _ = proxy.await;
             drop(client);
             drop(dir);
         })
