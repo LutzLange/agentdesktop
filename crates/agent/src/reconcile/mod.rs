@@ -1,5 +1,7 @@
 //! Shared reconciliation orchestration, plan application, and dry-run reporting.
 pub(crate) mod plan;
+#[cfg(any(windows, test))]
+pub(crate) mod registry;
 pub use plan::ReconcilePlan;
 pub(crate) use plan::grants_beyond;
 
@@ -81,6 +83,8 @@ impl Reconciler {
                 Box::new(ClaudeDesktop {
                     managed_settings_path: claude_desktop_managed_settings_path,
                     credential_helper_path: claude_desktop_credential_helper_path,
+                    #[cfg(windows)]
+                    policy_key: crate::provider::claude_desktop::claude_desktop_policy_key(),
                 }),
                 Box::new(Codex {
                     managed_config_path: codex_managed_config_path,
@@ -555,6 +559,9 @@ impl AttributedPlan {
                         detail: format!("{error:#}"),
                         written: match at {
                             plan::ApplyStop::Operation(index) => index,
+                            // Registry changes apply after every file operation.
+                            #[cfg(windows)]
+                            plan::ApplyStop::Registry(_) => usize::MAX,
                             _ => 0,
                         },
                     };
@@ -633,6 +640,8 @@ fn owners_of(entries: &[ProgramEntry], at: &plan::ApplyStop) -> Vec<&'static str
         .filter(|entry| match at {
             plan::ApplyStop::Conflict => false,
             plan::ApplyStop::Observed(path) => entry.paths.contains(path),
+            #[cfg(windows)]
+            plan::ApplyStop::Registry(path) => entry.paths.contains(path),
             plan::ApplyStop::PrivateDir(dir) => {
                 entry.paths.iter().any(|path| path.starts_with(dir))
             }
@@ -868,6 +877,8 @@ fn normalized_diff(before: &str, after: &str) -> (String, String) {
 mod tests {
     use std::{fs, path::Path, path::PathBuf};
 
+    #[cfg(windows)]
+    use agentdesktop_core::config::DaemonConfig;
     use agentdesktop_core::config::parse_daemon;
 
     use agentdesktop_core::model::ProgramChoice;
@@ -1108,7 +1119,8 @@ programs:
         // The Copilot CLI program is the inverse of Grok: it manages a file in
         // the user's home, so a system daemon (no providers path) rejects it
         // before any provider writes.
-        let reconciler = Reconciler::new(
+        #[allow(unused_mut)]
+        let mut reconciler = Reconciler::new(
             false,
             root.join("claude/settings.json"),
             root.join("claude-desktop/settings.json"),
@@ -1122,6 +1134,15 @@ programs:
             None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
+        );
+        #[cfg(windows)]
+        let policy_key = super::registry::TestPolicyKey::new();
+        #[cfg(windows)]
+        use_test_policy_key(
+            &mut reconciler,
+            root.join("claude-desktop/settings.json"),
+            root.join("claude-desktop/helper"),
+            policy_key.0.clone(),
         );
 
         let error = reconciler
@@ -1169,7 +1190,8 @@ programs:
         fs::write(root.join("claude/settings.json"), user_claude).unwrap();
         fs::write(root.join("codex/config.toml"), old_codex).unwrap();
         fs::write(root.join("opencode/plugin.js"), old_plugin).unwrap();
-        let reconciler = Reconciler::new(
+        #[allow(unused_mut)]
+        let mut reconciler = Reconciler::new(
             false,
             root.join("claude/settings.json"),
             root.join("claude-desktop/settings.json"),
@@ -1183,6 +1205,15 @@ programs:
             None,
             root.join("bin/agentdesktop"),
             root.join("agentdesktop.sock"),
+        );
+        #[cfg(windows)]
+        let policy_key = super::registry::TestPolicyKey::new();
+        #[cfg(windows)]
+        use_test_policy_key(
+            &mut reconciler,
+            root.join("claude-desktop/settings.json"),
+            root.join("claude-desktop/helper"),
+            policy_key.0.clone(),
         );
 
         reconciler.dry_run(&config).expect("dry run succeeds");
@@ -1201,9 +1232,35 @@ programs:
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Repoints the reconciler's Claude Desktop provider at `key`, a
+    /// disposable `HKCU` key, so the test never reads or writes the live
+    /// machine policy key.
+    #[cfg(windows)]
+    fn use_test_policy_key(
+        reconciler: &mut Reconciler,
+        settings: PathBuf,
+        helper: PathBuf,
+        key: super::registry::RegistryKey,
+    ) {
+        let providers = std::sync::Arc::get_mut(&mut reconciler.providers)
+            .expect("the providers are not shared yet");
+        let desktop = providers
+            .iter_mut()
+            .find(|provider| provider.id() == super::ClaudeDesktop::ID)
+            .expect("the Claude Desktop provider is registered");
+        *desktop = Box::new(super::ClaudeDesktop {
+            managed_settings_path: settings,
+            credential_helper_path: helper,
+            policy_key: key,
+        });
+    }
+
     struct Fixture {
         root: PathBuf,
         reconciler: Reconciler,
+        /// Stands in for the live policy key, deleted with the fixture.
+        #[cfg(windows)]
+        policy_key: super::registry::TestPolicyKey,
     }
 
     impl Fixture {
@@ -1213,7 +1270,8 @@ programs:
                 std::process::id(),
                 rand::random::<u64>()
             ));
-            let reconciler = Reconciler::new(
+            #[allow(unused_mut)]
+            let mut reconciler = Reconciler::new(
                 false,
                 root.join("claude/settings.json"),
                 root.join("desktop/settings.json"),
@@ -1228,7 +1286,21 @@ programs:
                 root.join("bin/agentdesktop"),
                 root.join("agentdesktop.sock"),
             );
-            Self { root, reconciler }
+            #[cfg(windows)]
+            let policy_key = super::registry::TestPolicyKey::new();
+            #[cfg(windows)]
+            use_test_policy_key(
+                &mut reconciler,
+                root.join("desktop/settings.json"),
+                root.join("desktop/helper"),
+                policy_key.0.clone(),
+            );
+            Self {
+                root,
+                reconciler,
+                #[cfg(windows)]
+                policy_key,
+            }
         }
     }
 
@@ -1270,7 +1342,10 @@ programs:
         assert!(!plan.has_conflicts());
         plan.apply().unwrap();
 
-        let paths = [
+        // On Windows the Claude Desktop managed settings land under the
+        // (test) policy registry key, asserted below, not in a file; the
+        // credential helper is a file there too.
+        let paths: Vec<&str> = [
             "claude/settings.json",
             "claude/.settings.json.owner",
             "desktop/settings.json",
@@ -1281,7 +1356,26 @@ programs:
             "opencode/config.json",
             "opencode/plugin.js",
             "grok/managed_config.toml",
-        ];
+        ]
+        .into_iter()
+        .filter(|path| {
+            !cfg!(windows)
+                || !matches!(
+                    *path,
+                    "desktop/settings.json" | "desktop/.settings.json.owner"
+                )
+        })
+        .collect();
+        #[cfg(windows)]
+        {
+            let values = super::registry::read_values(&fixture.policy_key.0).unwrap();
+            assert_eq!(values["inferenceProvider"].as_deref(), Some("gateway"));
+            assert_eq!(
+                values["inferenceGatewayBaseUrl"].as_deref(),
+                Some("https://gateway.example.com/")
+            );
+            assert!(values.contains_key(".agentdesktop.owner"));
+        }
         let contents: Vec<_> = paths
             .iter()
             .map(|path| fs::read(fixture.root.join(path)).unwrap())
@@ -1310,6 +1404,54 @@ programs:
         assert!(paths.iter().all(|path| fixture.root.join(path).exists()));
         cleanup.apply().unwrap();
         assert!(paths.iter().all(|path| !fixture.root.join(path).exists()));
+        #[cfg(windows)]
+        assert!(
+            !super::registry::key_exists(&fixture.policy_key.0).unwrap(),
+            "removal deletes the owned values, the marker and the empty key"
+        );
+    }
+
+    /// A registry write failure after the file operations: the failure is
+    /// attributed to Claude Desktop through `ApplyStop::Registry`, and the
+    /// file operations — all applied before the registry changes — stay.
+    #[cfg(windows)]
+    #[test]
+    fn registry_write_failure_is_attributed_to_claude_desktop() {
+        let fixture = Fixture::new();
+        // A value name past the registry's 16,383-character limit makes
+        // `RegSetValueExW` refuse after every file operation was written.
+        // Measured on Windows: 16,383 chars ok / 16,384+ returns rc 87 ERROR_INVALID_PARAMETER.
+        let long_name = "a".repeat(16_384);
+        let mut claude_desktop_settings = serde_json::Map::new();
+        claude_desktop_settings.insert(long_name, serde_json::json!("boom"));
+        let config_json = serde_json::json!({
+            "programs": {
+                "claudeCode": {},
+                "claudeDesktop": claude_desktop_settings,
+            }
+        });
+        let config: DaemonConfig = serde_json::from_value(config_json).unwrap();
+
+        let (report, result) = fixture.reconciler.apply_with_report(&config);
+
+        let error = result.expect_err("the registry write must fail");
+        assert!(error.to_string().contains("HKCU"), "{error}");
+        let outcome = |program: &str| {
+            report
+                .programs
+                .iter()
+                .find(|outcome| outcome.program == program)
+                .expect("program reported")
+        };
+        assert_eq!(outcome("claude-desktop").state, ProgramState::Failed);
+        assert!(
+            outcome("claude-desktop").detail.contains("HKCU"),
+            "{}",
+            outcome("claude-desktop").detail
+        );
+        // `written: usize::MAX`: Claude Code's files landed and stay.
+        assert_eq!(outcome("claude-code").state, ProgramState::Applied);
+        assert!(fixture.root.join("claude/settings.json").is_file());
     }
 
     #[test]
