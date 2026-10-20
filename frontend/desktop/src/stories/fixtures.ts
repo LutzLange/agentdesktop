@@ -46,6 +46,9 @@ export const containmentDaemonInfo: DaemonInfo = {
     executor: "C:\\Program Files\\mxc\\wxc-exec.exe",
     available: false,
     error: "executor not found: C:\\Program Files\\mxc\\wxc-exec.exe",
+    managedSettingsSource: null,
+    managedHooksLocked: false,
+    managedMcpLocked: false,
   },
 };
 
