@@ -34,6 +34,7 @@ use axum::{
 };
 
 pub(crate) mod engine;
+pub mod git_ssh;
 pub mod host;
 pub mod integrity;
 pub(crate) mod plan;
@@ -404,6 +405,11 @@ pub(crate) fn plan(input: &LaunchInput, profile: &profile::ClaudeCodeProfile) ->
         system_root.clone(),
         join(&system_root, r"System32\WindowsPowerShell\v1.0"),
     ];
+    // Windows OpenSSH (`ssh`, `ssh-add`) for the box's own ssh use; only with
+    // ssh hosts, so launches without ssh keep byte-identical requests.
+    if input.ssh_enabled {
+        path.push(join(&system_root, r"System32\OpenSSH"));
+    }
     if let Some(git_dir) = &git_dir {
         path.push(join(git_dir, "cmd"));
     }
@@ -443,14 +449,14 @@ pub(crate) fn plan(input: &LaunchInput, profile: &profile::ClaudeCodeProfile) ->
             "SSH_AUTH_SOCK".into(),
             format!("{}{}", ssh::pipe::AGENT_PIPE_PREFIX, input.launch_id),
         );
-        // Git splits GIT_SSH_COMMAND POSIX-style (`GIT_SSH` cannot carry
-        // arguments): both paths double-quoted with each backslash doubled,
-        // so a UNC state directory (`\\server\...`) survives the shell too.
-        let ssh_config = join(&launch_dir, SSH_CONFIG_FILE).replace('\\', "\\\\");
-        env.insert(
-            "GIT_SSH_COMMAND".into(),
-            format!("\"C:\\\\Windows\\\\System32\\\\OpenSSH\\\\ssh.exe\" -F \"{ssh_config}\""),
-        );
+        // No shell between git and ssh: git runs a `GIT_SSH_COMMAND` (or
+        // `core.sshCommand`) through `sh`, and Git for Windows' msys `sh`
+        // cannot start in the AppContainer. `GIT_SSH` is run without a
+        // shell; it names the launcher script, which adds
+        // `-F <launch-dir>\ssh_config` (see `git_ssh`). The variant skips
+        // git's `-G` probe of an unrecognized program name.
+        env.insert("GIT_SSH".into(), join(&launch_dir, GIT_SSH_FILE));
+        env.insert("GIT_SSH_VARIANT".into(), "ssh".into());
     }
 
     let mut readonly: Vec<String> = Vec::new();
@@ -474,10 +480,12 @@ pub(crate) fn plan(input: &LaunchInput, profile: &profile::ClaudeCodeProfile) ->
     // The generated gitconfig: exactly the file, read-only (it is written
     // before the box starts).
     readonly.push(git_config);
-    // AC 6: the generated ssh client configuration, exactly the file,
-    // read-only (written before the box starts, like the gitconfig).
+    // AC 6: the generated ssh client configuration and git's ssh launcher
+    // script, exactly the files, read-only (written before the box starts,
+    // like the gitconfig).
     if input.ssh_enabled {
         readonly.push(join(&launch_dir, SSH_CONFIG_FILE));
+        readonly.push(join(&launch_dir, GIT_SSH_FILE));
     }
     // Executable configuration: read-only when present, denied when absent, so
     // the box can neither change nor create it.
@@ -726,6 +734,12 @@ pub trait LaunchHost: Send + Sync {
     fn program_files_claude(&self) -> Option<PathBuf>;
     fn client_exe_dir(&self) -> PathBuf;
     fn now(&self) -> u64;
+
+    /// The file stem of the agentdesktop executable in `client_exe_dir`: the
+    /// interpreter of git's ssh launcher script.
+    fn client_exe_name(&self) -> String {
+        "agentdesktop".to_owned()
+    }
 
     fn integrity_fs(&self) -> Arc<dyn integrity::IntegrityFs> {
         Arc::new(integrity::REAL_FS)
@@ -1146,7 +1160,9 @@ async fn start_launch(
             .iter()
             .map(|(ssh_host, _, port)| (ssh_host.clone(), *port))
             .collect();
-        if let Err(error) = generate_ssh_files(&launch_dir, &leg_ports, &seeds) {
+        if let Err(error) =
+            generate_ssh_files(&launch_dir, &leg_ports, &seeds, &host.client_exe_name())
+        {
             return fail(&launch_dir, format!("prepare launch: {error:#}"));
         }
         // The leg tasks hold the session registry and die with the session
@@ -1579,6 +1595,10 @@ pub(crate) const SSH_CONFIG_FILE: &str = "ssh_config";
 /// points at.
 pub(crate) const KNOWN_HOSTS_FILE: &str = "known_hosts";
 
+/// File name of git's per-launch ssh launcher script (`GIT_SSH`), beside the
+/// `ssh_config` it hands to ssh.
+pub(crate) const GIT_SSH_FILE: &str = "git_ssh";
+
 /// The identity allowlist the generated gitconfig copies from the user's
 /// global git configuration, and whether the key is multi-valued (read with
 /// `--get-all`). Intentionally NOT copied: aliases, advanced core settings,
@@ -1648,7 +1668,7 @@ fn git_config_quote(value: &str) -> String {
 /// an emptied `credential.helper`, the copied identity values, and ssh-form
 /// insteadOf mappings of allowlisted hosts to the `/git-ssh` refusal route —
 /// except hosts in `daemon.containment.git.ssh.hosts` (`ssh_hosts`), which
-/// use their real remotes over `GIT_SSH_COMMAND` (D5).
+/// use their real remotes over `GIT_SSH` (D5).
 pub(crate) fn gitconfig_contents(
     pairing: &str,
     proxy_port: u16,
@@ -1677,7 +1697,7 @@ pub(crate) fn gitconfig_contents(
         ));
         let host = authority.split(':').next().unwrap_or(authority);
         // D5: a host on the ssh allowlist loses its `/git-ssh` refusal
-        // insteadOf; git then uses the real remote and `GIT_SSH_COMMAND`.
+        // insteadOf; git then uses the real remote and `GIT_SSH`.
         if !host.is_empty()
             && !refused_hosts.contains(&host)
             && !ssh_hosts
@@ -1741,15 +1761,29 @@ pub(crate) fn ssh_config_contents(launch_dir: &Path, legs: &[(String, u16)]) -> 
     contents
 }
 
-/// Writes the per-launch `ssh_config` (granted read-only, exactly the file)
-/// and `known_hosts` (granted read-write so `accept-new` persists within the
-/// launch) into the launch directory, both 0600. Neither carries a secret;
-/// both die with the launch directory.
+/// Writes the per-launch `ssh_config` (granted read-only, exactly the file),
+/// `known_hosts` (granted read-write so `accept-new` persists within the
+/// launch) and git's ssh launcher script (granted read-only, exactly the
+/// file) into the launch directory, all 0600. None carries a secret; all die
+/// with the launch directory.
+///
+/// The script is one `#!` line naming the agentdesktop executable
+/// (`client_exe_name`, the file stem; it is on the box PATH). Git for Windows
+/// runs a `GIT_SSH` script as `<interpreter>.exe <script> <ssh args>`, the
+/// interpreter found by name on PATH and started without a shell; the
+/// executable then runs ssh with this directory's `ssh_config`
+/// ([`git_ssh::run_if_invoked`]). Git cuts the interpreter name at the first
+/// space, so a name with whitespace is refused.
 pub(crate) fn generate_ssh_files(
     launch_dir: &Path,
     legs: &[(String, u16)],
     seeds: &[String],
+    client_exe_name: &str,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !client_exe_name.is_empty() && !client_exe_name.contains(char::is_whitespace),
+        "git over ssh needs an agentdesktop executable name without spaces (found {client_exe_name:?})"
+    );
     let config = launch_dir.join(SSH_CONFIG_FILE);
     secure_fs::atomic_write(
         &config,
@@ -1764,7 +1798,16 @@ pub(crate) fn generate_ssh_files(
     let known_hosts = launch_dir.join(KNOWN_HOSTS_FILE);
     secure_fs::atomic_write(&known_hosts, known.as_bytes(), 0o600)
         .with_context(|| format!("write {}", known_hosts.display()))?;
+    let script = launch_dir.join(GIT_SSH_FILE);
+    secure_fs::atomic_write(&script, git_ssh_script(client_exe_name).as_bytes(), 0o600)
+        .with_context(|| format!("write {}", script.display()))?;
     Ok(())
+}
+
+/// The contents of git's ssh launcher script: `#!/<client_exe_name>`. Git for
+/// Windows keeps only the last path component of a `#!` line.
+pub(crate) fn git_ssh_script(client_exe_name: &str) -> String {
+    format!("#!/{client_exe_name}\n")
 }
 
 /// AC 4: the egress default is deny; an explicit `egress: allow` keeps

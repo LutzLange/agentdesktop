@@ -703,8 +703,10 @@ in the box; configure `git.credentials` for private remotes.
 required): for each host in `git.ssh.hosts` (bare hostnames, port 22) the
 daemon binds a loopback leg and writes a per-launch `ssh_config` and
 `known_hosts` (seeded from your `known_hosts` via `ssh-keygen -F`; unknown
-hosts are accepted on first use, per launch); the box gets `GIT_SSH_COMMAND`
-pointing at that `ssh_config` and `SSH_AUTH_SOCK` naming a per-launch named
+hosts are accepted on first use, per launch); the box gets `GIT_SSH`, a
+one-line launcher script that Git for Windows runs with the agentdesktop
+executable (no shell, which cannot start in the box) and that runs Windows
+OpenSSH with that `ssh_config`, and `SSH_AUTH_SOCK` naming a per-launch named
 pipe that only that box can use. The daemon brokers the box's agent
 requests to your `\\.\pipe\openssh-ssh-agent`: only identity listing and
 signing are forwarded; adding, removing, locking and extension requests are

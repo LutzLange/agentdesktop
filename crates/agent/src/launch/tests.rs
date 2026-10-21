@@ -4224,6 +4224,7 @@ struct SpawnTimeFiles {
     ssh_config: Option<String>,
     known_hosts: Option<String>,
     git_config: Option<String>,
+    git_ssh: Option<String>,
     /// Unix permission bits of (ssh_config, known_hosts); `None` elsewhere
     /// or when absent.
     modes: (Option<u32>, Option<u32>),
@@ -4279,6 +4280,7 @@ fn capture_at_spawn(h: &Harness) -> Arc<Mutex<Option<SpawnTimeFiles>>> {
             ssh_config,
             known_hosts: read(KNOWN_HOSTS_FILE),
             git_config: read(GIT_CONFIG_FILE),
+            git_ssh: read(GIT_SSH_FILE),
             modes: (
                 file_mode(&launch_dir.join(SSH_CONFIG_FILE)),
                 file_mode(&launch_dir.join(KNOWN_HOSTS_FILE)),
@@ -4441,7 +4443,7 @@ async fn the_gitconfig_drops_the_ssh_refusal_mapping_only_for_ssh_hosts() {
 
     let files = spawn_time_files(&captured);
     let git_config = files.git_config.as_deref().expect("git_config at spawn");
-    // The ssh host: git uses the real remote and GIT_SSH_COMMAND.
+    // The ssh host: git uses the real remote and GIT_SSH.
     for absent in [
         format!("git-ssh/{SSH_HOST_A}/"),
         format!("insteadOf = ssh://{SSH_HOST_A}/"),
@@ -4484,19 +4486,32 @@ async fn ssh_env_names_the_launch_pipe_and_the_generated_ssh_config() {
         Some(&format!("{}{launch_id}", ssh::pipe::AGENT_PIPE_PREFIX)),
         "{env:?}"
     );
-    let command = env.get("GIT_SSH_COMMAND").expect("GIT_SSH_COMMAND in env");
-    // Accepts single or doubled backslashes inside the quotes (both survive
-    // git's POSIX-style splitting the same way).
+    // Git reaches ssh through the launcher script beside the ssh_config,
+    // which git runs without a shell (fix round v3, lab F-ssh-1).
+    let launcher = format!("{dir}\\{GIT_SSH_FILE}");
+    assert_eq!(env.get("GIT_SSH"), Some(&launcher), "{env:?}");
     assert_eq!(
-        command.replace("\\\\", "\\"),
-        format!("\"C:\\Windows\\System32\\OpenSSH\\ssh.exe\" -F \"{dir}\\{SSH_CONFIG_FILE}\""),
-        "{command}"
+        env.get("GIT_SSH_VARIANT").map(String::as_str),
+        Some("ssh"),
+        "{env:?}"
+    );
+    assert!(
+        env["PATH"]
+            .split(';')
+            .any(|entry| entry.eq_ignore_ascii_case(r"C:\Windows\System32\OpenSSH")),
+        "Windows OpenSSH is on the box PATH: {}",
+        env["PATH"]
     );
     let ssh_config = format!("{dir}\\{SSH_CONFIG_FILE}");
     let known_hosts = format!("{dir}\\{KNOWN_HOSTS_FILE}");
     assert!(
         readonly(&request).contains(&ssh_config),
         "ssh_config is granted read-only, exactly the file: {:?}",
+        readonly(&request)
+    );
+    assert!(
+        readonly(&request).contains(&launcher) && !readwrite(&request).contains(&launcher),
+        "the launcher script is granted read-only, exactly the file: {:?}",
         readonly(&request)
     );
     assert!(
@@ -4508,6 +4523,74 @@ async fn ssh_env_names_the_launch_pipe_and_the_generated_ssh_config() {
         !readwrite(&request).contains(&ssh_config),
         "ssh_config is not writable"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn git_over_ssh_sets_no_shell_run_ssh_command_and_the_launcher_names_the_client_executable() {
+    // Git runs GIT_SSH_COMMAND and core.sshCommand through `sh`, which cannot
+    // start in the box (lab F-ssh-1): neither may be set, and GIT_SSH must
+    // name the launcher script, whose interpreter is the agentdesktop
+    // executable, never a shell.
+    let h = Harness::start(ssh_setup(Some((&[SSH_HOST_A], &["*"])))).await;
+    let captured = capture_at_spawn(&h);
+
+    let _ = h.launch(&h.body()).await;
+
+    let (launch_id, request) = spawned_request(&h);
+    let env = env_map(&request);
+    assert!(
+        !env.keys()
+            .any(|key| key.eq_ignore_ascii_case("GIT_SSH_COMMAND")),
+        "{env:?}"
+    );
+    // Nor through the environment-config route (GIT_CONFIG_KEY_<n>).
+    assert!(
+        !env.iter()
+            .any(|(key, value)| key.starts_with("GIT_CONFIG_KEY_")
+                && value.eq_ignore_ascii_case("core.sshCommand")),
+        "{env:?}"
+    );
+    let files = spawn_time_files(&captured);
+    let git_config = files.git_config.as_deref().expect("git_config at spawn");
+    assert!(
+        !git_config.to_ascii_lowercase().contains("sshcommand"),
+        "the generated gitconfig sets no core.sshCommand: {git_config}"
+    );
+    assert_eq!(
+        env["GIT_SSH"],
+        format!("{}\\{GIT_SSH_FILE}", win(&h.launch_dir(&launch_id))),
+        "GIT_SSH is the bare launcher path, no arguments"
+    );
+    assert_eq!(
+        files.git_ssh.as_deref(),
+        Some("#!/agentdesktop\n"),
+        "the launcher is one #! line naming the client executable (the harness host's default)"
+    );
+}
+
+#[test]
+fn ssh_files_refuse_a_client_executable_name_git_would_cut_and_write_the_launcher_0600() {
+    let temp = tempfile::tempdir().unwrap();
+    let legs = [(SSH_HOST_A.to_owned(), 2222u16)];
+    for name in ["agent desktop", "", "agent\tdesktop"] {
+        let error = generate_ssh_files(temp.path(), &legs, &[], name)
+            .expect_err("a name with whitespace or none is refused");
+        assert!(format!("{error:#}").contains("without spaces"), "{error:#}");
+        assert!(
+            std::fs::read_dir(temp.path()).unwrap().next().is_none(),
+            "nothing is written for {name:?}"
+        );
+    }
+
+    generate_ssh_files(temp.path(), &legs, &[], "agentdesktop-windows-x64").unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(GIT_SSH_FILE)).unwrap(),
+        "#!/agentdesktop-windows-x64\n"
+    );
+    if cfg!(unix) {
+        assert_eq!(file_mode(&temp.path().join(GIT_SSH_FILE)), Some(0o600));
+    }
 }
 
 /// A request with the per-harness parts (temp root, launch id, pairing)

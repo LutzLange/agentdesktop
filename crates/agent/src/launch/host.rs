@@ -33,14 +33,25 @@ pub struct HostEnvironment {
     home: PathBuf,
     state_dir: PathBuf,
     client_exe_dir: PathBuf,
+    client_exe_name: String,
 }
 
 impl HostEnvironment {
-    pub fn new(home: PathBuf, state_dir: PathBuf, client_exe_dir: PathBuf) -> Self {
+    /// `client_executable` is the agentdesktop executable the box may run:
+    /// its directory goes on the box PATH, its file stem names the
+    /// interpreter of git's ssh launcher script.
+    pub fn new(home: PathBuf, state_dir: PathBuf, client_executable: &Path) -> Self {
         Self {
             home,
             state_dir,
-            client_exe_dir,
+            client_exe_dir: client_executable
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+            client_exe_name: client_executable
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         }
     }
 }
@@ -165,6 +176,10 @@ impl LaunchHost for HostEnvironment {
 
     fn client_exe_dir(&self) -> PathBuf {
         self.client_exe_dir.clone()
+    }
+
+    fn client_exe_name(&self) -> String {
+        self.client_exe_name.clone()
     }
 
     fn now(&self) -> u64 {
