@@ -38,6 +38,7 @@ pub mod host;
 pub mod integrity;
 pub(crate) mod plan;
 pub(crate) mod profile;
+pub(crate) mod ssh;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

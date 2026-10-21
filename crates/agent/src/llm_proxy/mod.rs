@@ -5981,6 +5981,7 @@ mod tests {
                     username: "git-user".to_owned(),
                     secret: "git-pat".to_owned(),
                 }],
+                ssh: None,
             });
             config.egress_upstream =
                 Some(url::Url::parse(&format!("http://{upstream_address}/")).unwrap());
@@ -6052,6 +6053,7 @@ mod tests {
                 allow: vec!["https://github.com/org/".to_owned()],
                 push_allow: vec![],
                 credentials: vec![],
+                ssh: None,
             });
             config.egress_upstream =
                 Some(url::Url::parse(&format!("http://{upstream_address}/")).unwrap());
@@ -6285,6 +6287,7 @@ mod tests {
                 allow: vec!["https://github.com/org/".to_string()],
                 push_allow: vec!["https://github.com/org/".to_string()],
                 credentials: vec![],
+                ssh: None,
             }),
         };
 
@@ -6296,6 +6299,7 @@ mod tests {
             allow: vec!["http://github.com/org/".to_string()],
             push_allow: vec![],
             credentials: vec![],
+                ssh: None,
         });
         assert!(validate_containment_startup(&cfg, true).is_err());
 
@@ -6304,6 +6308,7 @@ mod tests {
             allow: vec!["git@github.com:org/repo.git".to_string()],
             push_allow: vec![],
             credentials: vec![],
+                ssh: None,
         });
         assert!(validate_containment_startup(&cfg, true).is_err());
 
@@ -6312,6 +6317,7 @@ mod tests {
             allow: vec!["https://github.com/org/".to_string()],
             push_allow: vec!["http://github.com/org/".to_string()],
             credentials: vec![],
+                ssh: None,
         });
         assert!(validate_containment_startup(&cfg, true).is_err());
     }
@@ -6431,6 +6437,7 @@ mod tests {
             allow,
             push_allow: vec![],
             credentials: vec![],
+                ssh: None,
         });
         config.egress_upstream = egress_upstream;
         let sessions = config.sessions.clone();
@@ -6570,6 +6577,7 @@ mod tests {
                 username: "user".to_string(),
                 secret: "secret".to_string(),
             }],
+            ssh: None,
         };
 
         let url = |text: &str| url::Url::parse(text).unwrap();
@@ -6602,6 +6610,7 @@ mod tests {
                 username: "user".to_string(),
                 secret: "secret".to_string(),
             }],
+            ssh: None,
         };
 
         let url = |text: &str| url::Url::parse(text).unwrap();
@@ -7517,6 +7526,7 @@ mod tests {
                 allow: vec![format!("http://{up}/org/")],
                 push_allow: vec![format!("http://{up}/org/")],
                 credentials: vec![],
+                ssh: None,
             });
             let sessions = config.sessions.clone();
             let session = new_session(&sessions, "test-client");
@@ -7617,6 +7627,7 @@ mod tests {
                         secret: "s2".to_owned(),
                     },
                 ],
+                ssh: None,
             });
             config.egress_upstream = Some(url::Url::parse(&format!("http://{up}/")).unwrap());
             let sessions = config.sessions.clone();
@@ -7836,6 +7847,7 @@ mod tests {
                 allow: vec!["https://github.com/org/".to_owned()],
                 push_allow: vec!["https://github.com/org/".to_owned()],
                 credentials: vec![],
+                ssh: None,
             });
             config.egress_upstream = Some(url::Url::parse(&format!("http://{up}/")).unwrap());
             let sessions = config.sessions.clone();
