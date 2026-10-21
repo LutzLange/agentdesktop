@@ -1753,6 +1753,7 @@ struct FakeHost {
     home: PathBuf,
     state_dir: PathBuf,
     client_exe_dir: PathBuf,
+    client_exe_name: String,
     clock: Clock,
     integrity_reads: IntegrityReads,
     managed_file: Option<&'static str>,
@@ -1824,6 +1825,10 @@ impl LaunchHost for FakeHost {
 
     fn client_exe_dir(&self) -> PathBuf {
         self.client_exe_dir.clone()
+    }
+
+    fn client_exe_name(&self) -> String {
+        self.client_exe_name.clone()
     }
 
     fn now(&self) -> u64 {
@@ -2041,6 +2046,7 @@ struct Setup {
     managed_file_error: Option<&'static str>,
     git: Option<agentdesktop_core::config::GitConfig>,
     known_hosts: Vec<(&'static str, &'static str)>,
+    client_exe_name: Option<&'static str>,
 }
 
 impl Default for Setup {
@@ -2065,6 +2071,7 @@ impl Default for Setup {
             managed_file_error: None,
             git: None,
             known_hosts: Vec::new(),
+            client_exe_name: None,
         }
     }
 }
@@ -2219,6 +2226,10 @@ impl Harness {
                 home: home.clone(),
                 state_dir: state_dir.clone(),
                 client_exe_dir,
+                client_exe_name: setup
+                    .client_exe_name
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "agentdesktop".to_owned()),
                 clock: clock.clone(),
                 integrity_reads: integrity_reads.clone(),
                 managed_file: setup.managed_file,
@@ -4213,6 +4224,7 @@ fn ssh_setup(ssh: Option<(&[&str], &[&str])>) -> Setup {
             (SSH_HOST_B, SEED_B),
             (HTTPS_ONLY_HOST, SEED_OTHER),
         ],
+        client_exe_name: Some("agentdesktop-windows-x64"),
         ..Setup::default()
     }
 }
@@ -4563,8 +4575,8 @@ async fn git_over_ssh_sets_no_shell_run_ssh_command_and_the_launcher_names_the_c
     );
     assert_eq!(
         files.git_ssh.as_deref(),
-        Some("#!/agentdesktop\n"),
-        "the launcher is one #! line naming the client executable (the harness host's default)"
+        Some("#!/agentdesktop-windows-x64\n"),
+        "the launcher is one #! line naming the client executable"
     );
 }
 
@@ -4572,10 +4584,15 @@ async fn git_over_ssh_sets_no_shell_run_ssh_command_and_the_launcher_names_the_c
 fn ssh_files_refuse_a_client_executable_name_git_would_cut_and_write_the_launcher_0600() {
     let temp = tempfile::tempdir().unwrap();
     let legs = [(SSH_HOST_A.to_owned(), 2222u16)];
-    for name in ["agent desktop", "", "agent\tdesktop"] {
+    let long_name = "a".repeat(100);
+    for name in ["agent desktop", "", "agent\tdesktop", &long_name] {
         let error = generate_ssh_files(temp.path(), &legs, &[], name)
-            .expect_err("a name with whitespace or none is refused");
-        assert!(format!("{error:#}").contains("without spaces"), "{error:#}");
+            .expect_err("a name with whitespace, none, or too long is refused");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("without spaces") || msg.contains("fits the #! line"),
+            "{error:#}"
+        );
         assert!(
             std::fs::read_dir(temp.path()).unwrap().next().is_none(),
             "nothing is written for {name:?}"

@@ -631,8 +631,24 @@ pub(crate) mod windows {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_the_executable_name_and_directory_from_the_path() {
+        let env = HostEnvironment::new(
+            PathBuf::from("/home/user"),
+            PathBuf::from("/var/lib/agentdesktop"),
+            Path::new("/opt/x/agentdesktop-windows-x64.exe"),
+        );
+        assert_eq!(env.client_exe_name(), "agentdesktop-windows-x64");
+        assert_eq!(env.client_exe_dir(), PathBuf::from("/opt/x"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
     use super::*;
 
     #[test]

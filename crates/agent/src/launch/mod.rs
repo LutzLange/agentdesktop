@@ -1784,6 +1784,11 @@ pub(crate) fn generate_ssh_files(
         !client_exe_name.is_empty() && !client_exe_name.contains(char::is_whitespace),
         "git over ssh needs an agentdesktop executable name without spaces (found {client_exe_name:?})"
     );
+    anyhow::ensure!(
+        client_exe_name.len() <= 90,
+        "git over ssh needs an agentdesktop executable name that fits the #! line (found {client_exe_name:?}, {} bytes)",
+        client_exe_name.len()
+    );
     let config = launch_dir.join(SSH_CONFIG_FILE);
     secure_fs::atomic_write(
         &config,

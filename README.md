@@ -710,7 +710,15 @@ OpenSSH with that `ssh_config`, and `SSH_AUTH_SOCK` naming a per-launch named
 pipe that only that box can use. The daemon brokers the box's agent
 requests to your `\\.\pipe\openssh-ssh-agent`: only identity listing and
 signing are forwarded; adding, removing, locking and extension requests are
-refused. The private key never enters the box or the daemon. Posture:
+refused. The private key never enters the box or the daemon.
+
+Known limits: the box needs Git for Windows; a `core.sshCommand` in the
+repository's (or system) git configuration takes precedence over `GIT_SSH` and
+git runs it through `sh`, which cannot start in the box (the box cannot edit
+`.git/config` — it is granted read-only — so the user has to unset it on the
+host); git over ssh needs an agentdesktop executable name without spaces.
+
+Posture:
 
 - The daemon signs with your ssh keys on behalf of the box. A signature is
   not bound to a destination: the box can authenticate as you to any server
