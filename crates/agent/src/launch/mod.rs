@@ -701,6 +701,13 @@ pub trait LaunchHost: Send + Sync {
     fn git_identity(&self) -> Vec<(String, Vec<String>)> {
         read_git_identity()
     }
+
+    /// The user's `known_hosts` entries for `hosts`, seeding the per-launch
+    /// `known_hosts` file. The default reads them host-side with
+    /// `ssh-keygen -F <host>`, comment lines stripped.
+    fn known_hosts_seed(&self, _hosts: &[String]) -> Vec<String> {
+        todo!("PR 5: known_hosts_seed default implementation")
+    }
 }
 
 /// Running launches plus the last 32 exited ones. Clones share state.
@@ -1393,6 +1400,13 @@ fn parse_pid_file(text: &str) -> Option<(u32, u64)> {
 /// removed with the launch directory, and in the secrets-first `sweep` list
 /// (it carries the session pairing; never log its content).
 pub(crate) const GIT_CONFIG_FILE: &str = "git_config";
+
+/// File name of the generated per-launch ssh client configuration.
+pub(crate) const SSH_CONFIG_FILE: &str = "ssh_config";
+
+/// File name of the per-launch `known_hosts` the generated `ssh_config`
+/// points at.
+pub(crate) const KNOWN_HOSTS_FILE: &str = "known_hosts";
 
 /// The identity allowlist the generated gitconfig copies from the user's
 /// global git configuration, and whether the key is multi-valued (read with

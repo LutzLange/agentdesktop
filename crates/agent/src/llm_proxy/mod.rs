@@ -7212,6 +7212,38 @@ mod tests {
         .unwrap();
     }
 
+    /// PR 5 AC 6: the refusal route keeps serving ssh-form remotes of
+    /// `git.allow` hosts that are not ssh hosts, with the new message and no
+    /// stale PR reference, for fetch and push alike.
+    #[tokio::test]
+    async fn ssh_refusal_route_names_the_ssh_hosts_setting() {
+        const NEW_MESSAGE: &str = "ERR ssh remotes are not enabled for this host; use the https remote or add the host to daemon.containment.git.ssh.hosts";
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client = http_client();
+            let (direct, _seen, direct_task) = recording_upstream().await;
+            let (dir, proxy_address, _sessions, session, proxy) =
+                git_proxy(vec![format!("http://{direct}/org/")], None).await;
+            for service in ["git-upload-pack", "git-receive-pack"] {
+                let ssh = Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("http://{proxy_address}{GIT_SSH_ROUTE}/github.com/org/repo.git/info/refs?service={service}"))
+                    .header(PAIRING_HEADER, &*session.pairing)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                let response = client.request(ssh).await.unwrap();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.contains(NEW_MESSAGE), "{service}: {body}");
+                assert!(!body.contains("PR 5"), "{service}: {body}");
+            }
+            proxy.abort();
+            direct_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn log_outcome_values_unchanged() {
         let (logs, _guard) = capture_logs();
@@ -7239,7 +7271,7 @@ mod tests {
                 .unwrap();
             let response = client.request(ssh).await.unwrap();
             let body = response.into_body().collect().await.unwrap().to_bytes();
-            assert!(String::from_utf8_lossy(&body).contains("ERR ssh remotes are not available in the box yet (PR 5); use the https remote"));
+            assert!(String::from_utf8_lossy(&body).contains("ERR ssh remotes are not enabled for this host; use the https remote or add the host to daemon.containment.git.ssh.hosts"));
             let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:", session.pairing));
             raw_http(
                 proxy_address,
