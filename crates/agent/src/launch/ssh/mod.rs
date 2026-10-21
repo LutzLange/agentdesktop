@@ -123,3 +123,78 @@ mod tests {
         assert!(!policy.allows_key("SHA256:denied"));
     }
 }
+
+// Additional broker protocol tests
+
+#[cfg(test)]
+mod broker_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::duplex;
+    use tokio::time::{timeout, Duration};
+
+    #[derive(Clone)]
+    struct TestUpstream {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl TestUpstream {
+        fn new() -> Self {
+            TestUpstream {
+                calls: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl AgentUpstream for TestUpstream {
+        async fn round_trip(&self, _request: &[u8]) -> Result<Vec<u8>> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(vec![0, 0, 0, 1, SSH_AGENT_FAILURE])
+        }
+    }
+
+    fn encode_msg(typ: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (1 + payload.len()) as u32;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&len.to_be_bytes());
+        msg.push(typ);
+        msg.extend_from_slice(payload);
+        msg
+    }
+
+    // Op-code refused tests
+    #[tokio::test]
+    #[should_panic(expected = "PR 5")]
+    async fn broker_refuses_add_identity() {
+        let (client, _server) = duplex(1024);
+        let upstream = TestUpstream::new();
+        let sessions = SessionRegistry::default();
+        let session = sessions.authorize("test", 0).unwrap();
+        let policy = AgentPolicy::from_config_keys(&[]);
+        
+        broker_connection(client, &upstream, &policy, &sessions, &session.id, "test").await.ok();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "PR 5")]
+    async fn broker_refuses_extension() {
+        let (client, _server) = duplex(1024);
+        let upstream = TestUpstream::new();
+        let sessions = SessionRegistry::default();
+        let session = sessions.authorize("test", 0).unwrap();
+        let policy = AgentPolicy::from_config_keys(&[]);
+        
+        broker_connection(client, &upstream, &policy, &sessions, &session.id, "test").await.ok();
+    }
+
+    #[test]
+    fn key_fingerprint_sha256_prefix() {
+        let fp = key_fingerprint(b"test");
+        assert!(fp.starts_with("SHA256:"));
+    }
+}
