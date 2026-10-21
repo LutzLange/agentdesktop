@@ -38,6 +38,10 @@ pub const MAX_AGENT_CONNECTIONS: usize = 8;
 /// Maximum concurrent connections per TCP leg.
 pub const MAX_LEG_CONNECTIONS: usize = 8;
 
+/// Bound on one upstream agent round trip. Generous on purpose: a sign can
+/// wait on user presence (a FIDO touch, a confirm-on-use key).
+pub(crate) const AGENT_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// SSH agent protocol message types.
 pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
@@ -153,6 +157,49 @@ where
     }
 }
 
+/// What a revocation-raced write ended with.
+enum RevocableWrite {
+    Written,
+    /// Any transport error: the connection closes silently.
+    Closed,
+    /// The session died before or while the write was pending (D7).
+    Revoked,
+}
+
+/// Writes `bytes` to `client`, racing the write against the revocation
+/// poll: liveness is checked before the first byte (`biased`, the first tick
+/// is immediate), and a box that stops reading cannot hold the connection
+/// past a revoke.
+async fn write_revocable<C>(
+    client: &mut C,
+    bytes: &[u8],
+    sessions: &SessionRegistry,
+    session_id: &str,
+) -> RevocableWrite
+where
+    C: AsyncWrite + Unpin,
+{
+    let write = client.write_all(bytes);
+    tokio::pin!(write);
+    let mut poll = tokio::time::interval(REVOCATION_POLL);
+    loop {
+        tokio::select! {
+            biased;
+            _ = poll.tick() => {
+                if !sessions.live(session_id, now_unix()) {
+                    return RevocableWrite::Revoked;
+                }
+            }
+            result = &mut write => {
+                return match result {
+                    Ok(()) => RevocableWrite::Written,
+                    Err(_) => RevocableWrite::Closed,
+                };
+            }
+        }
+    }
+}
+
 /// One per-request log line (AC 8). The emit shape deliberately differs from
 /// the HTTP `SandboxRequest` one: this is not an HTTP surface.
 #[allow(clippy::too_many_arguments)]
@@ -231,6 +278,7 @@ fn filter_identities_answer(payload: &[u8], allowed: &BTreeSet<String>) -> Optio
 /// `false` when the write failed and the connection should close.
 async fn refuse_op<C>(
     client: &mut C,
+    sessions: &SessionRegistry,
     session_id: &str,
     launch_id: &str,
     op: u8,
@@ -239,7 +287,10 @@ async fn refuse_op<C>(
 where
     C: AsyncWrite + Unpin,
 {
-    if client.write_all(&FAILURE_FRAME).await.is_err() {
+    if !matches!(
+        write_revocable(client, &FAILURE_FRAME, sessions, session_id).await,
+        RevocableWrite::Written
+    ) {
         return false;
     }
     emit_agent_line(
@@ -271,6 +322,8 @@ fn validated_reply_payload(reply: &[u8]) -> Option<&[u8]> {
 /// Broker a single agent connection between the box and the upstream agent:
 /// framing per AC 2, the D3 op policy, the D4 key filter, the D7 per-request
 /// session check and revocation teardown, one AC 8 log line per request.
+/// A sign request whose key blob does not parse is refused locally under any
+/// key policy, `["*"]` included.
 // The production caller is the Windows pipe server; the broker core stays
 // engine- and OS-neutral for the future unix-socket leg (AC 9).
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -330,14 +383,14 @@ where
             | SSH_AGENTC_ADD_ID_CONSTRAINED
             | SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED
             | SSH_AGENTC_EXTENSION => {
-                if !refuse_op(&mut client, session_id, launch_id, op, started).await {
+                if !refuse_op(&mut client, sessions, session_id, launch_id, op, started).await {
                     return Ok(());
                 }
                 continue;
             }
             // Default-deny: an unknown request type is refused the same way.
             _ => {
-                if !refuse_op(&mut client, session_id, launch_id, op, started).await {
+                if !refuse_op(&mut client, sessions, session_id, launch_id, op, started).await {
                     return Ok(());
                 }
                 continue;
@@ -362,7 +415,10 @@ where
             && !sign_request_key_blob(&payload)
                 .is_some_and(|blob| policy.allows_key(&key_fingerprint(blob)))
         {
-            if client.write_all(&FAILURE_FRAME).await.is_err() {
+            if !matches!(
+                write_revocable(&mut client, &FAILURE_FRAME, sessions, session_id).await,
+                RevocableWrite::Written
+            ) {
                 return Ok(());
             }
             emit_agent_line(
@@ -370,17 +426,22 @@ where
             );
             continue;
         }
-        // Forward the frame as it was read (AC 4); race the round trip
-        // against revocation so an in-flight request gets connection EOF,
-        // never a late answer (D7).
+        // Forward the frame as it was read (AC 4), bounded by
+        // AGENT_ROUND_TRIP_TIMEOUT (expiry answers FAILURE like any upstream
+        // failure); race the round trip against revocation so an in-flight
+        // request gets connection EOF, never a late answer (D7).
         let mut framed = header.to_vec();
         framed.extend_from_slice(&payload);
-        let round = upstream.round_trip(&framed);
+        let round = tokio::time::timeout(AGENT_ROUND_TRIP_TIMEOUT, upstream.round_trip(&framed));
         tokio::pin!(round);
         let mut poll = tokio::time::interval(REVOCATION_POLL);
         let reply = loop {
             tokio::select! {
-                result = &mut round => break result,
+                result = &mut round => {
+                    break result.unwrap_or_else(|_elapsed| {
+                        Err(anyhow::anyhow!("upstream agent round trip timed out"))
+                    });
+                }
                 _ = poll.tick() => {
                     if !sessions.live(session_id, now_unix()) {
                         emit_agent_line(
@@ -392,6 +453,14 @@ where
                 }
             }
         };
+        // The round trip can complete in the same poll as a revoke (D7):
+        // a dead session gets EOF, never the answer.
+        if !sessions.live(session_id, now_unix()) {
+            emit_agent_line(
+                session_id, launch_id, op, op_name, "allow", &key, started, "canceled",
+            );
+            return Ok(());
+        }
         let reply = match reply {
             // Upstream failure (AC 4).
             Err(_) => None,
@@ -420,15 +489,25 @@ where
         };
         match reply {
             Some(reply) => {
-                if client.write_all(&reply).await.is_err() {
-                    return Ok(());
+                match write_revocable(&mut client, &reply, sessions, session_id).await {
+                    RevocableWrite::Written => {}
+                    RevocableWrite::Closed => return Ok(()),
+                    RevocableWrite::Revoked => {
+                        emit_agent_line(
+                            session_id, launch_id, op, op_name, "allow", &key, started, "canceled",
+                        );
+                        return Ok(());
+                    }
                 }
                 emit_agent_line(
                     session_id, launch_id, op, op_name, "allow", &key, started, "complete",
                 );
             }
             None => {
-                if client.write_all(&FAILURE_FRAME).await.is_err() {
+                if !matches!(
+                    write_revocable(&mut client, &FAILURE_FRAME, sessions, session_id).await,
+                    RevocableWrite::Written
+                ) {
                     return Ok(());
                 }
                 emit_agent_line(
@@ -900,6 +979,12 @@ mod broker_tests {
         Answer(Vec<u8>),
         Fail,
         After(Duration, Vec<u8>),
+        /// Returned verbatim, never framed.
+        Raw(Vec<u8>),
+        /// Never answers.
+        Hang,
+        /// Revokes the session, then answers at once.
+        RevokeThen(SessionRegistry, String, Vec<u8>),
     }
 
     /// Scripted `AgentUpstream`: records every request payload and answers
@@ -953,6 +1038,12 @@ mod broker_tests {
                     payload
                 }
                 Some(Reply::Fail) => anyhow::bail!("stub upstream: agent unreachable"),
+                Some(Reply::Raw(bytes)) => return Ok(bytes),
+                Some(Reply::Hang) => std::future::pending().await,
+                Some(Reply::RevokeThen(sessions, id, payload)) => {
+                    assert!(sessions.revoke(&id));
+                    payload
+                }
                 None => anyhow::bail!("stub upstream: no scripted reply"),
             };
             Ok(if framed { frame(&reply) } else { reply })
@@ -1105,6 +1196,7 @@ mod broker_tests {
     }
 
     fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        crate::launch::tests::pin_tracing_dispatchers();
         let capture = LogCapture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(capture.clone())
@@ -1547,6 +1639,200 @@ mod broker_tests {
             "a dead session answers nothing: {received:?}"
         );
         assert_eq!(fx.upstream.calls(), 0);
+    }
+
+    // --- Delta fix round (reviews/PR-5-delta-opus.md, sections 2 and 4)
+
+    #[tokio::test]
+    async fn session_revoked_while_round_trip_completes_gets_no_reply() {
+        let (logs, _guard) = capture_logs();
+        let mut fx = fixture(&["*"], vec![]);
+        fx.upstream = StubUpstream::replying(vec![Reply::RevokeThen(
+            fx.sessions.clone(),
+            fx.session_id.clone(),
+            sign_response(),
+        )]);
+        let (_result, received) = run(&fx, |mut client| async move {
+            client
+                .write_all(&frame(&sign_request(&key_a())))
+                .await
+                .expect("write the sign request");
+            let mut received = Vec::new();
+            let _ = client.read_to_end(&mut received).await;
+            received
+        })
+        .await;
+        assert_eq!(fx.upstream.calls(), 1, "the request reached the upstream");
+        assert!(
+            received.is_empty(),
+            "a revoked session gets EOF, never the sign reply: {received:?}"
+        );
+        let lines = logs.agent_lines();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line for the canceled request: {lines:?}"
+        );
+        assert_eq!(log_field(&lines[0], "outcome"), "canceled", "{}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn session_revocation_ends_a_broker_blocked_on_a_box_that_stops_reading() {
+        let fx = fixture(&["*"], vec![]);
+        let (mut client, server) = duplex(64);
+        let upstream = fx.upstream.clone();
+        let policy = fx.policy.clone();
+        let sessions = fx.sessions.clone();
+        let session_id = fx.session_id.clone();
+        let broker = tokio::spawn(async move {
+            broker_connection(
+                server,
+                &upstream,
+                &policy,
+                &sessions,
+                &session_id,
+                LAUNCH_ID,
+            )
+            .await
+        });
+        // 20 refused frames over a 64-byte duplex: the broker consumes 13
+        // before its reply buffer fills, and the remaining 35 bytes fit the
+        // request buffer, so the write_all itself completes.
+        let frames: Vec<u8> = (0..20).flat_map(|_| msg(SSH_AGENTC_LOCK, b"")).collect();
+        timeout(EXCHANGE_LIMIT, client.write_all(&frames))
+            .await
+            .expect("the frames fit the buffers")
+            .expect("write the frames");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !broker.is_finished(),
+            "the broker is blocked writing to a box that stopped reading"
+        );
+        assert!(fx.sessions.revoke(&fx.session_id));
+        let result = timeout(REVOKE_LIMIT, broker)
+            .await
+            .expect("the revoke ends the blocked broker within the limit");
+        assert!(matches!(result, Ok(Ok(()))), "{result:?}");
+        assert_eq!(fx.upstream.calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upstream_round_trip_timeout_answers_failure() {
+        let (logs, _guard) = capture_logs();
+        let fx = fixture(&["*"], vec![Reply::Hang]);
+        let (mut client, server) = duplex(1 << 20);
+        let broker = broker_connection(
+            server,
+            &fx.upstream,
+            &fx.policy,
+            &fx.sessions,
+            &fx.session_id,
+            LAUNCH_ID,
+        );
+        let script = async move {
+            client
+                .write_all(&frame(&request_identities()))
+                .await
+                .expect("write the request");
+            let reply = read_frame(&mut client).await;
+            client.shutdown().await.expect("half-close");
+            reply
+        };
+        let started = Instant::now();
+        let (_result, reply) = timeout(AGENT_ROUND_TRIP_TIMEOUT * 2, async {
+            tokio::join!(broker, script)
+        })
+        .await
+        .expect("a regression fails here instead of hanging");
+        let elapsed = started.elapsed();
+        assert_eq!(reply, Some(FAILURE_FRAME.to_vec()));
+        assert!(
+            elapsed >= AGENT_ROUND_TRIP_TIMEOUT
+                && elapsed < AGENT_ROUND_TRIP_TIMEOUT + Duration::from_secs(1),
+            "the timeout bounds the round trip: {elapsed:?}"
+        );
+        let lines = logs.agent_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(
+            log_field(&lines[0], "decision"),
+            "upstream_unreachable",
+            "{}",
+            lines[0]
+        );
+        assert_eq!(log_field(&lines[0], "outcome"), "complete", "{}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn key_filter_malformed_sign_request_refused_locally() {
+        let (logs, _guard) = capture_logs();
+        let fx = fixture(&["*"], vec![Reply::Answer(sign_response())]);
+        // The blob claims 255 bytes and carries none.
+        let (replies, trailing) =
+            exchange(&fx, vec![msg(SSH_AGENTC_SIGN_REQUEST, &[0, 0, 0, 0xff])]).await;
+        assert_eq!(replies, vec![Some(FAILURE_FRAME.to_vec())]);
+        assert!(trailing.is_empty(), "{trailing:?}");
+        assert_eq!(fx.upstream.calls(), 0);
+        let lines = logs.agent_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(log_field(&lines[0], "decision"), "refuse", "{}", lines[0]);
+        assert_eq!(log_field(&lines[0], "key"), "-", "{}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn key_filter_unparseable_identities_answer_is_refused_not_passed_through() {
+        let mut answer = both_keys_answer();
+        // The count field says 3, the payload carries two entries.
+        answer[1..5].copy_from_slice(&3u32.to_be_bytes());
+        let fx = fixture(&[KEY_A_FINGERPRINT], vec![Reply::Answer(answer)]);
+        let (replies, trailing) = exchange(&fx, vec![frame(&request_identities())]).await;
+        assert_eq!(replies, vec![Some(FAILURE_FRAME.to_vec())]);
+        assert!(trailing.is_empty(), "{trailing:?}");
+        assert_eq!(fx.upstream.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_reply_over_cap_answers_failure() {
+        let mut payload = both_keys_answer();
+        payload.resize(MAX_AGENT_MESSAGE + 1, 0);
+        let fx = fixture(&["*"], vec![Reply::Raw(frame(&payload))]);
+        let (replies, trailing) = exchange(&fx, vec![frame(&request_identities())]).await;
+        assert_eq!(replies, vec![Some(FAILURE_FRAME.to_vec())]);
+        assert!(trailing.is_empty(), "{trailing:?}");
+    }
+
+    #[tokio::test]
+    async fn upstream_reply_length_mismatch_answers_failure() {
+        let fx = fixture(
+            &["*"],
+            vec![
+                // Declares 1, carries 5.
+                Reply::Raw(vec![0, 0, 0, 1, SSH_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 0]),
+                // Declares 10, carries 5.
+                Reply::Raw(vec![0, 0, 0, 10, SSH_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 0]),
+            ],
+        );
+        let (replies, trailing) = exchange(
+            &fx,
+            vec![frame(&request_identities()), frame(&request_identities())],
+        )
+        .await;
+        assert_eq!(
+            replies,
+            vec![Some(FAILURE_FRAME.to_vec()), Some(FAILURE_FRAME.to_vec())]
+        );
+        assert!(trailing.is_empty(), "{trailing:?}");
+    }
+
+    #[tokio::test]
+    async fn framing_exact_max_length_accepted() {
+        let answer = identities_answer(&[(&key_a(), "a@test")]);
+        let mut request = request_identities();
+        request.resize(MAX_AGENT_MESSAGE, 0);
+        let fx = fixture(&["*"], vec![Reply::Answer(answer.clone())]);
+        let (replies, trailing) = exchange(&fx, vec![frame(&request)]).await;
+        assert_eq!(replies, vec![Some(frame(&answer))]);
+        assert!(trailing.is_empty(), "{trailing:?}");
+        assert_eq!(fx.upstream.requests(), vec![request]);
     }
 
     // --- Log shape per decision (Tests-first bullet 10)

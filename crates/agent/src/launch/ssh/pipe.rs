@@ -52,9 +52,21 @@ mod windows_impl {
     #[async_trait::async_trait]
     impl AgentUpstream for OpensshAgentUpstream {
         async fn round_trip(&self, request: &[u8]) -> Result<Vec<u8>> {
-            let mut client = ClientOptions::new()
-                .open(OPENSSH_AGENT_PIPE)
-                .with_context(|| format!("open {OPENSSH_AGENT_PIPE}"))?;
+            // CreateFile returns ERROR_PIPE_BUSY while every agent instance
+            // is in use; retry like the client crate's `connect`. The
+            // broker's round-trip timeout bounds the loop.
+            const ERROR_PIPE_BUSY: i32 = 231;
+            let mut client = loop {
+                match ClientOptions::new().open(OPENSSH_AGENT_PIPE) {
+                    Ok(client) => break client,
+                    Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("open {OPENSSH_AGENT_PIPE}"));
+                    }
+                }
+            };
             client
                 .write_all(request)
                 .await
@@ -109,9 +121,11 @@ mod windows_impl {
     /// AppContainer descendant of the executor child, polled within the
     /// early-exit watch window), creates the per-launch pipe and starts its
     /// server task. Any failure must fail the launch (AC 3, fail-closed).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_agent_pipe_server(
         launch_id: &str,
         executor_pid: u32,
+        executor_start_time: u64,
         daemon_sid: Option<&str>,
         policy: AgentPolicy,
         sessions: SessionRegistry,
@@ -123,9 +137,11 @@ mod windows_impl {
         };
         let deadline = tokio::time::Instant::now() + EARLY_EXIT_WATCH;
         let box_sid = loop {
-            match tokio::task::spawn_blocking(move || app_container_descendant_sid(executor_pid))
-                .await
-                .context("join the box process scan")?
+            match tokio::task::spawn_blocking(move || {
+                app_container_descendant_sid(executor_pid, executor_start_time)
+            })
+            .await
+            .context("join the box process scan")?
             {
                 Ok(Some(sid)) => break sid,
                 Ok(None) => {}
@@ -280,9 +296,11 @@ mod stub_impl {
 
     /// Typed-error stub: there is no agent pipe transport off Windows, and a
     /// launch with ssh hosts configured must fail closed (AC 3).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_agent_pipe_server(
         _launch_id: &str,
         _executor_pid: u32,
+        _executor_start_time: u64,
         _daemon_sid: Option<&str>,
         _policy: AgentPolicy,
         _sessions: SessionRegistry,

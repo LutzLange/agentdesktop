@@ -1289,6 +1289,7 @@ async fn start_launch(
         && let Err(error) = ssh::pipe::start_agent_pipe_server(
             &launch_id,
             child.pid(),
+            child.start_time(),
             state.daemon_sid.as_deref(),
             ssh::AgentPolicy::from_config_keys(&ssh.keys),
             state.sessions.clone(),

@@ -2105,7 +2105,7 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// every callsite: the two are serialized, so a capture installed before an
 /// event always sees it. Called from `Harness::start`, so every launch
 /// happens after the pins exist.
-fn pin_tracing_dispatchers() {
+pub(super) fn pin_tracing_dispatchers() {
     static PINS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
     PINS.get_or_init(|| {
         [

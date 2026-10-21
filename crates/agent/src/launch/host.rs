@@ -564,10 +564,17 @@ pub(crate) mod windows {
     }
 
     /// The AppContainer SID of the first AppContainer descendant of `root`
-    /// (AC 3, needs-lab-check L1): one process snapshot, breadth-first
+    /// (AC 3, needs-lab-check L1): one process snapshot, depth-first
     /// over the parent-pid tree; descendants whose token cannot be read are
     /// skipped. `None` when no descendant is in an AppContainer yet.
-    pub(crate) fn app_container_descendant_sid(root: u32) -> anyhow::Result<Option<String>> {
+    /// A candidate created before `root_start_time` (the executor's creation
+    /// FILETIME) is never a descendant: the snapshot's parent pid is not
+    /// updated when a parent exits, so after pid reuse an older process can
+    /// name the executor's pid.
+    pub(crate) fn app_container_descendant_sid(
+        root: u32,
+        root_start_time: u64,
+    ) -> anyhow::Result<Option<String>> {
         // SAFETY: plain system call.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot == INVALID_HANDLE_VALUE {
@@ -593,6 +600,10 @@ pub(crate) mod windows {
         while let Some(parent) = frontier.pop() {
             for (pid, parent_pid) in &processes {
                 if *parent_pid != parent || *pid == root || !seen.insert(*pid) {
+                    continue;
+                }
+                let created = open_process(*pid).and_then(|process| creation_time(process.0));
+                if !created.is_ok_and(|created| created >= root_start_time) {
                     continue;
                 }
                 if let Ok(Some(sid)) = app_container_sid(*pid) {

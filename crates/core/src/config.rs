@@ -372,11 +372,7 @@ pub fn validate_containment_startup(
 
             // Validate hosts: bare hostname only (no scheme, path, port)
             for (idx, host) in ssh_config.hosts.iter().enumerate() {
-                if host.is_empty()
-                    || host.contains('/')
-                    || host.contains(':')
-                    || host.starts_with("http")
-                {
+                if !is_bare_hostname(host) {
                     return Err(format!(
                         "daemon.containment.git.ssh.hosts[{}] must be a bare hostname (no scheme, path, or port)",
                         idx
@@ -397,6 +393,23 @@ pub fn validate_containment_startup(
     }
 
     Ok(())
+}
+
+/// A bare DNS hostname or IPv4 literal: dot-separated non-empty labels of
+/// ASCII letters, digits and `-`, no label starting with `-`. Everything else
+/// (scheme, path, port, whitespace, ssh_config patterns, `%` tokens) is
+/// refused: the value is written verbatim into the generated `ssh_config`
+/// and passed to `ssh-keygen -F`.
+fn is_bare_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 /// Token and cost collection for a daemon without a controller. agentgateway
@@ -3227,6 +3240,61 @@ programs:
             error.contains("bare hostname (no scheme, path, or port)"),
             "error: {error}"
         );
+    }
+
+    #[test]
+    fn git_ssh_host_validation_charset() {
+        fn validate_host(host: &str) -> Result<(), String> {
+            let cfg = super::ContainmentStartupConfig {
+                executor: std::path::PathBuf::from("C:\\mxc\\wxc-exec.exe"),
+                egress: super::ContainmentEgress::default(),
+                engine: super::ContainmentEngine::default(),
+                egress_upstream: None,
+                git: Some(super::GitConfig {
+                    allow: vec![],
+                    push_allow: vec![],
+                    credentials: vec![],
+                    ssh: Some(super::GitSshConfig {
+                        hosts: vec![host.to_owned()],
+                        keys: vec![],
+                    }),
+                }),
+            };
+            super::validate_containment_startup(&cfg, true)
+        }
+        for host in [
+            "github.com",
+            "httpbin.org",
+            "httpd.corp.example",
+            "git-01.corp.example",
+            "github-demo",
+            "10.0.0.5",
+        ] {
+            assert_eq!(validate_host(host), Ok(()), "accepted: {host}");
+        }
+        for host in [
+            "a.com\n\tProxyCommand x",
+            "a.com ProxyCommand",
+            " github.com",
+            "a\tb",
+            "*",
+            "*.corp.example",
+            "git?.corp",
+            "%h",
+            "-oProxyCommand=x",
+            "a..com",
+            "github.com.",
+            ".github.com",
+        ] {
+            assert_eq!(
+                validate_host(host),
+                Err(
+                    "daemon.containment.git.ssh.hosts[0] must be a bare hostname (no scheme, path, or port)"
+                        .to_owned()
+                ),
+                "refused: {host}"
+            );
+        }
     }
 
     #[test]

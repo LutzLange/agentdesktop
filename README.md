@@ -705,7 +705,7 @@ daemon binds a loopback leg and writes a per-launch `ssh_config` and
 `known_hosts` (seeded from your `known_hosts` via `ssh-keygen -F`; unknown
 hosts are accepted on first use, per launch); the box gets `GIT_SSH_COMMAND`
 pointing at that `ssh_config` and `SSH_AUTH_SOCK` naming a per-launch named
-pipe that only that box can open. The daemon brokers the box's agent
+pipe that only that box can use. The daemon brokers the box's agent
 requests to your `\\.\pipe\openssh-ssh-agent`: only identity listing and
 signing are forwarded; adding, removing, locking and extension requests are
 refused. The private key never enters the box or the daemon. Posture:
@@ -715,7 +715,10 @@ refused. The private key never enters the box or the daemon. Posture:
   that accepts an offered key, over any channel it has. The key filter is the
   blast-radius control: `git.ssh.keys` lists the fingerprints offered to the
   box; empty or absent offers no key at all, and `["*"]` offers every key in
-  your agent.
+  your agent. The filter matches the exact key blob, and the agent signs with
+  the private key behind it: offering only a certificate still gives the box
+  signatures from that private key, usable with any server that trusts the
+  plain key. Treat each offered key's reach as that of its private key.
 - An ssh host grants fetch AND push to that whole host; `git.allow` and
   `git.pushAllow` prefixes do not apply to ssh. Use https remotes where
   per-repository push control matters.
