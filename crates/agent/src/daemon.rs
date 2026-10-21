@@ -733,12 +733,21 @@ where
             .and_then(|listener| listener.local_addr().ok()),
         session_policy,
         egress: args.containment_egress,
+        git: args.containment.as_ref().and_then(|c| c.git.clone()),
         engine,
     };
     let app = api::router(state.clone())
         .merge(llm_proxy::sessions::session_router(session_api))
         .merge(launch::router(launch_state));
     let session_sweep = tokio::spawn(llm_proxy::sessions::sweep_forever(sessions.clone()));
+    // The git allowlists/credentials and the central egress upstream the git
+    // routes serve, read once at startup from daemon.containment (PR 4).
+    let containment_git = args.containment.as_ref().and_then(|c| c.git.clone());
+    let containment_egress_upstream = args
+        .containment
+        .as_ref()
+        .and_then(|c| c.egress_upstream.as_ref())
+        .map(|upstream| upstream.url.clone());
     // The proxy is optional at runtime too: if serving fails (for example the
     // TLS root store cannot be built), log it and keep the daemon running
     // without the proxy rather than dropping the device out of the fleet.
@@ -751,6 +760,8 @@ where
                     default_client_id: args.llm_proxy_client_id,
                     pairing: pairing.expect("pairing exists whenever the listener does"),
                     sessions,
+                    git: containment_git,
+                    egress_upstream: containment_egress_upstream,
                 },
             )
             .await
@@ -2396,10 +2407,7 @@ programs:
                 PathBuf::from(DEFAULT_SOCKET_PATH),
             )
             .unwrap();
-        assert_eq!(
-            resolved.containment_egress,
-            config::ContainmentEgress::Deny
-        );
+        assert_eq!(resolved.containment_egress, config::ContainmentEgress::Deny);
     }
 
     fn startup_with_llm_proxy(listen: &str) -> config::DaemonStartupConfig {

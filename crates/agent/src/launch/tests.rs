@@ -1008,6 +1008,7 @@ fn the_integrity_roots_are_protected_in_the_request() {
         r"C:\Users\dev\.gitconfig".into(),
         r"C:\Users\dev\.config\git\config".into(),
         format!(r"{LAUNCH_DIR}\credential"),
+        format!(r"{LAUNCH_DIR}\git_config"),
         r"C:\Users\dev\.claude\.credentials.json".into(),
         r"C:\Users\dev\.claude\history.jsonl".into(),
         r"C:\Users\dev\.claude\ide".into(),
@@ -1334,12 +1335,15 @@ fn a_git_file_of_a_worktree_or_submodule_is_left_as_it_is() {
         existing.remove(gone);
     }
     let request = request_json(&existing, &directories, |_| {});
+    // PR 4: the home git user-configuration files are always denied and the
+    // generated git_config always granted, so the check is scoped to the
+    // workspace `.git` the test is about.
     for path in readwrite(&request)
         .into_iter()
         .chain(readonly(&request))
         .chain(denied(&request))
     {
-        assert!(!path.contains(r"\.git"), "{path}");
+        assert!(!path.contains(r"C:\lab\ws pr1\.git"), "{path}");
     }
 }
 
@@ -1713,6 +1717,11 @@ struct FakeHost {
 impl LaunchHost for FakeHost {
     fn home(&self) -> PathBuf {
         self.home.clone()
+    }
+
+    fn git_identity(&self) -> Vec<(String, Vec<String>)> {
+        // Deterministic: never read the test machine's git configuration.
+        Vec::new()
     }
 
     fn path_dirs(&self) -> Vec<PathBuf> {
@@ -2136,6 +2145,7 @@ impl Harness {
             proxy_address: setup.proxy_address,
             session_policy: setup.session_policy.clone(),
             egress: setup.egress,
+            git: None,
             engine: Arc::new(engine::mxc::MxcEngine),
         };
 
@@ -3533,9 +3543,11 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
     const LAUNCH_ID: &str = "0123456789abcdef";
 
     // Oracle (a): launch_input + snapshot_existing extended with both git
-    // user-configuration files, egress: Allow. The extension pins the order
-    // of the profile's two git user-configuration entries in `readonlyPaths`;
-    // re-captured at the baseline with the same fixture (ledger ## v2).
+    // user-configuration files, egress: Allow. Re-captured for PR 4 with the
+    // same fixture (ledger ## v5 writer): the git user-configuration files
+    // moved from readonlyPaths to deniedPaths, the generated git_config is
+    // granted read-only, and the box env gains GIT_CONFIG_GLOBAL and
+    // GIT_TERMINAL_PROMPT=0 (AC 6).
     const ORACLE_A: &str = r#"{
   "version": "1.0.0",
   "containment": "processcontainer",
@@ -3560,6 +3572,8 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "CLAUDE_CONFIG_DIR=C:\\Users\\dev\\.claude",
       "ComSpec=C:\\Windows\\system32\\cmd.exe",
       "DISABLE_AUTOUPDATER=1",
+      "GIT_CONFIG_GLOBAL=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\git_config",
+      "GIT_TERMINAL_PROMPT=0",
       "HOME=C:\\Users\\dev",
       "HOMEDRIVE=C:",
       "HOMEPATH=\\Users\\dev",
@@ -3590,8 +3604,7 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Program Files\\Git",
       "C:\\lab\\agentdesktop",
       "C:\\Program Files\\ClaudeCode",
-      "C:\\Users\\dev\\.gitconfig",
-      "C:\\Users\\dev\\.config\\git\\config",
+      "C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\git_config",
       "C:\\Users\\dev\\.claude\\settings.json",
       "C:\\Users\\dev\\.claude\\plugins",
       "C:\\lab\\ws pr1\\.mcp.json",
@@ -3611,7 +3624,9 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Users\\dev\\.ssh",
       "C:\\Users\\dev\\.aws",
       "C:\\Users\\dev\\.azure",
-      "C:\\Users\\dev\\.kube"
+      "C:\\Users\\dev\\.kube",
+      "C:\\Users\\dev\\.gitconfig",
+      "C:\\Users\\dev\\.config\\git\\config"
     ]
   },
   "network": {
@@ -3650,6 +3665,8 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "CLAUDE_CONFIG_DIR=C:\\Users\\dev\\.claude",
       "ComSpec=C:\\Windows\\system32\\cmd.exe",
       "DISABLE_AUTOUPDATER=1",
+      "GIT_CONFIG_GLOBAL=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\git_config",
+      "GIT_TERMINAL_PROMPT=0",
       "HOME=C:\\Users\\dev",
       "HOMEDRIVE=C:",
       "HOMEPATH=\\Users\\dev",
@@ -3680,6 +3697,7 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Program Files\\Git",
       "C:\\lab\\agentdesktop",
       "C:\\Program Files\\ClaudeCode",
+      "C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\git_config",
       "C:\\Users\\dev\\.claude\\settings.json",
       "C:\\Users\\dev\\.claude\\plugins",
       "C:\\lab\\ws pr1\\.mcp.json",
@@ -3699,7 +3717,9 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Users\\dev\\.ssh",
       "C:\\Users\\dev\\.aws",
       "C:\\Users\\dev\\.azure",
-      "C:\\Users\\dev\\.kube"
+      "C:\\Users\\dev\\.kube",
+      "C:\\Users\\dev\\.gitconfig",
+      "C:\\Users\\dev\\.config\\git\\config"
     ]
   },
   "network": {
@@ -3736,6 +3756,8 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "CLAUDE_CODE_USE_POWERSHELL_TOOL=1",
       "CLAUDE_CONFIG_DIR=C:\\Users\\dev\\.claude",
       "DISABLE_AUTOUPDATER=1",
+      "GIT_CONFIG_GLOBAL=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\git_config",
+      "GIT_TERMINAL_PROMPT=0",
       "HOME=C:\\Users\\dev",
       "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\WindowsPowerShell\\v1.0;C:\\Users\\dev\\.local\\bin;C:\\lab\\agentdesktop",
       "TEMP=C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp",
@@ -3749,7 +3771,9 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Users\\dev\\.claude",
       "C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\tmp"
     ],
-    "readonlyPaths": [],
+    "readonlyPaths": [
+      "C:\\Users\\dev\\.local\\state\\agentdesktop\\launches\\0123456789abcdef\\git_config"
+    ],
     "deniedPaths": [
       "C:\\ws\\.claude",
       "C:\\ws\\.git",
@@ -3764,7 +3788,9 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Users\\dev\\.ssh",
       "C:\\Users\\dev\\.aws",
       "C:\\Users\\dev\\.azure",
-      "C:\\Users\\dev\\.kube"
+      "C:\\Users\\dev\\.kube",
+      "C:\\Users\\dev\\.gitconfig",
+      "C:\\Users\\dev\\.config\\git\\config"
     ]
   },
   "network": {

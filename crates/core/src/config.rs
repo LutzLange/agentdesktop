@@ -146,23 +146,32 @@ pub struct ContainmentStartupConfig {
     /// (restart the daemon after changing it); ignored with `--once` and `--dry-run`.
     #[serde(default, skip_serializing_if = "ContainmentEngine::is_default")]
     pub engine: ContainmentEngine,
-    /// Forward proxy upstream for CONNECT and absolute-form requests.
+    /// Central L7 egress endpoint (an agentgateway HTTPS listener whose
+    /// per-prefix routes are the central allowlist). When set, the relay sends
+    /// the box's git smart-HTTP requests to `https://<egress host>/<path>`
+    /// instead of directly to the remote. CONNECT is always refused, with or
+    /// without it. Read at startup only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_upstream: Option<EgressUpstreamConfig>,
-    /// Git repository access configuration.
+    /// Git over the relay: the remotes the box may fetch from and push to, and
+    /// the static credentials the relay attaches host-side. Absent = no git
+    /// egress. Read at startup only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitConfig>,
 }
 
-/// Forward proxy upstream configuration.
+/// The central L7 egress endpoint the git leg chains to.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressUpstreamConfig {
-    /// URL of the central forward proxy endpoint.
+    /// HTTPS URL of the egress endpoint; must include a host and no
+    /// credentials, query or fragment.
     #[cfg_attr(feature = "schema", schemars(with = "String"))]
     pub url: Url,
-    /// Authentication mechanism for the upstream proxy.
+    /// Reserved for gateway-hop authentication, which is not available yet:
+    /// startup refuses a config that sets it (the relay sends only the git
+    /// credential in `Authorization`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authentication: Option<LlmGatewayAuthentication>,
 }
@@ -207,8 +216,10 @@ pub fn validate_containment_startup(
     if windows {
         let text = cfg.executor.to_string_lossy();
         let bytes = text.as_bytes();
-        let drive_absolute =
-            bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+        let drive_absolute = bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\';
         let unc_absolute = text.starts_with("\\\\")
             && text[2..]
                 .split('\\')
@@ -220,23 +231,41 @@ pub fn validate_containment_startup(
             .next()
             .is_some_and(|name| name.to_ascii_lowercase().ends_with(".exe"));
         if !(drive_absolute || unc_absolute) || !exe {
-            return Err("daemon.containment.executor must be an absolute path to wxc-exec.exe".to_owned());
+            return Err(
+                "daemon.containment.executor must be an absolute path to wxc-exec.exe".to_owned(),
+            );
         }
     }
 
-    // Validate egress_upstream URL like LlmGatewayConfig.url
+    // Validate egress_upstream URL like LlmGatewayConfig.url, HTTPS only
+    // (the leg carries the git credential).
     if let Some(upstream) = &cfg.egress_upstream {
+        if upstream.url.scheme() != "https" {
+            return Err("daemon.containment.egressUpstream.url must be an https:// URL".to_owned());
+        }
+        // v1 defers gateway-hop authentication (AC 2): a configured block
+        // would otherwise be silently ignored.
+        if upstream.authentication.is_some() {
+            return Err(
+                "daemon.containment.egressUpstream.authentication is not supported yet; remove it"
+                    .to_owned(),
+            );
+        }
         if upstream.url.host().is_none() {
             return Err("daemon.containment.egressUpstream.url must include a host".to_owned());
         }
         if upstream.url.username() != "" || upstream.url.password().is_some() {
-            return Err("daemon.containment.egressUpstream.url cannot include credentials".to_owned());
+            return Err(
+                "daemon.containment.egressUpstream.url cannot include credentials".to_owned(),
+            );
         }
         if upstream.url.query().is_some() {
             return Err("daemon.containment.egressUpstream.url cannot include a query".to_owned());
         }
         if upstream.url.fragment().is_some() {
-            return Err("daemon.containment.egressUpstream.url cannot include a fragment".to_owned());
+            return Err(
+                "daemon.containment.egressUpstream.url cannot include a fragment".to_owned(),
+            );
         }
     }
 
@@ -244,12 +273,18 @@ pub fn validate_containment_startup(
     if let Some(git) = &cfg.git {
         for (idx, url_str) in git.allow.iter().enumerate() {
             if !url_str.starts_with("https://") {
-                return Err(format!("daemon.containment.git.allow[{}] must be an https:// URL", idx));
+                return Err(format!(
+                    "daemon.containment.git.allow[{}] must be an https:// URL",
+                    idx
+                ));
             }
         }
         for (idx, url_str) in git.push_allow.iter().enumerate() {
             if !url_str.starts_with("https://") {
-                return Err(format!("daemon.containment.git.pushAllow[{}] must be an https:// URL", idx));
+                return Err(format!(
+                    "daemon.containment.git.pushAllow[{}] must be an https:// URL",
+                    idx
+                ));
             }
         }
     }
@@ -2766,13 +2801,14 @@ programs:
     }
 
     #[test]
-    fn containment_egress_absent_defaults_to_allow() {
+    fn containment_egress_absent_defaults_to_deny() {
+        // PR 4 (AC 4): the default flipped from allow to deny.
         let config = super::parse_local_daemon(
             "daemon:\n  containment:\n    executor: 'C:\\mxc\\wxc-exec.exe'\n",
         )
         .expect("absent defaults");
         let egress = config.daemon.unwrap().containment.unwrap().egress;
-        assert_eq!(egress, super::ContainmentEgress::Allow);
+        assert_eq!(egress, super::ContainmentEgress::Deny);
     }
 
     #[test]
