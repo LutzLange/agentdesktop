@@ -7850,8 +7850,9 @@ mod tests {
     }
 
     // T14 (F6, adv minor 10): a session revoked while the request body is
-    // still being collected sends nothing upstream (biased select, revoked
-    // arm first).
+    // still being collected sends nothing upstream. This pins the revocation
+    // watch during body collect; the `biased` ordering itself is not
+    // observable from the current-thread test runtime.
     /// A request body streamed from an mpsc channel (T14).
     type ChannelBody = StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>;
 
