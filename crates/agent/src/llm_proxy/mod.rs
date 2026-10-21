@@ -306,8 +306,9 @@ pub(crate) const SANDBOX_ROUTE: &str = "/sandbox";
 pub(crate) const GIT_ROUTE: &str = "/git";
 
 /// Refusal route the generated gitconfig maps ssh-form remotes of allowlisted
-/// hosts to: it answers a pkt-line `ERR` so the user sees a clear message
-/// instead of a deny-mode timeout (ssh itself is PR 5).
+/// hosts WITHOUT a `daemon.containment.git.ssh.hosts` entry to: it answers a
+/// pkt-line `ERR` so the user sees a clear message instead of a deny-mode
+/// timeout (hosts on the ssh allowlist use real ssh via `GIT_SSH_COMMAND`).
 pub(crate) const GIT_SSH_ROUTE: &str = "/git-ssh";
 
 /// The prefixed routes: the Copilot programs and the sandbox route. A prefix
@@ -1829,8 +1830,9 @@ fn git_credential_for<'c>(
 }
 
 /// Answer on the `/git-ssh` refusal route: the generated gitconfig maps
-/// ssh-form remotes of allowlisted hosts here so the user sees a pkt-line
-/// `ERR` instead of a deny-mode timeout (ssh itself is PR 5).
+/// ssh-form remotes of allowlisted hosts without a
+/// `daemon.containment.git.ssh.hosts` entry here so the user sees a pkt-line
+/// `ERR` instead of a deny-mode timeout.
 fn ssh_refused_response(
     rest: &str,
     query: Option<&str>,
@@ -1841,8 +1843,7 @@ fn ssh_refused_response(
         sandbox.host = Some(host.to_owned());
         sandbox.decision = Some("refuse");
     }
-    const MESSAGE: &str =
-        "ssh remotes are not available in the box yet (PR 5); use the https remote";
+    const MESSAGE: &str = "ssh remotes are not enabled for this host; use the https remote or add the host to daemon.containment.git.ssh.hosts";
     match classify_git_endpoint(rest, query) {
         Some(endpoint) if endpoint.is_push() => {
             pkt_line_err_response(endpoint.service(), endpoint.is_rpc(), MESSAGE)
@@ -1914,8 +1915,9 @@ fn handle_connect_request(
     ))
 }
 
-/// How often an in-flight git request checks whether its session was revoked.
-const REVOCATION_POLL: Duration = Duration::from_millis(50);
+/// How often an in-flight git request (and the ssh broker and legs) checks
+/// whether its session was revoked.
+pub(crate) const REVOCATION_POLL: Duration = Duration::from_millis(50);
 
 /// A git response body that ends as soon as its session is revoked (AC 1).
 /// The registry is read without restarting the idle timeout; the revocation
@@ -6299,7 +6301,7 @@ mod tests {
             allow: vec!["http://github.com/org/".to_string()],
             push_allow: vec![],
             credentials: vec![],
-                ssh: None,
+            ssh: None,
         });
         assert!(validate_containment_startup(&cfg, true).is_err());
 
@@ -6308,7 +6310,7 @@ mod tests {
             allow: vec!["git@github.com:org/repo.git".to_string()],
             push_allow: vec![],
             credentials: vec![],
-                ssh: None,
+            ssh: None,
         });
         assert!(validate_containment_startup(&cfg, true).is_err());
 
@@ -6317,7 +6319,7 @@ mod tests {
             allow: vec!["https://github.com/org/".to_string()],
             push_allow: vec!["http://github.com/org/".to_string()],
             credentials: vec![],
-                ssh: None,
+            ssh: None,
         });
         assert!(validate_containment_startup(&cfg, true).is_err());
     }
@@ -6350,6 +6352,7 @@ mod tests {
             relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
             pairing: "test-pairing".into(),
             base_env: std::collections::BTreeMap::new(),
+            ssh_enabled: false,
             exists: &exists,
             is_dir: &is_dir,
         };
@@ -6437,7 +6440,7 @@ mod tests {
             allow,
             push_allow: vec![],
             credentials: vec![],
-                ssh: None,
+            ssh: None,
         });
         config.egress_upstream = egress_upstream;
         let sessions = config.sessions.clone();
@@ -6661,7 +6664,7 @@ mod tests {
             "https://github.com/org/".to_owned(),
             "https://git.example.com:8443/team".to_owned(),
         ];
-        let contents = crate::launch::gitconfig_contents("pairing-x", 4000, &allow, &[]);
+        let contents = crate::launch::gitconfig_contents("pairing-x", 4000, &allow, &[], &[]);
         // One rewrite per allow entry, onto GIT_ROUTE on the loopback
         // listener; the authority is verbatim (port only when configured),
         // the value in git's quoted form.
@@ -6676,7 +6679,7 @@ mod tests {
             "[url \"http://127.0.0.1:4000{GIT_SSH_ROUTE}/github.com/\"]\n\tinsteadOf = ssh://github.com/\n\tinsteadOf = git@github.com:\n"
         )), "{contents}");
         // No allow entries: no rewrites at all.
-        let empty = crate::launch::gitconfig_contents("pairing-x", 4000, &[], &[]);
+        let empty = crate::launch::gitconfig_contents("pairing-x", 4000, &[], &[], &[]);
         assert!(!empty.contains("insteadOf"), "{empty}");
     }
 
@@ -6684,7 +6687,7 @@ mod tests {
     fn gitconfig_pairing_scoped_to_loopback() {
         let pairing = "secret-session-pairing-value";
         let allow = vec!["https://github.com/org/".to_owned()];
-        let contents = crate::launch::gitconfig_contents(pairing, 4123, &allow, &[]);
+        let contents = crate::launch::gitconfig_contents(pairing, 4123, &allow, &[], &[]);
         // The pairing appears exactly once, as the extraHeader of the
         // url-matched loopback section; never in a global http section
         // (which git would send to every remote).
@@ -6707,6 +6710,7 @@ mod tests {
             4000,
             &["https://github.com/org/".to_owned()],
             &[],
+            &[],
         );
         let section = "[http \"http://127.0.0.1:4000/\"]\n";
         let start = contents.find(section).expect("loopback http section");
@@ -6723,6 +6727,7 @@ mod tests {
             "p",
             4000,
             &["https://github.com/org/".to_owned()],
+            &[],
             &[],
         );
         // The empty helper entry is the first (and only) credential.helper
@@ -6760,7 +6765,7 @@ mod tests {
                 vec!["C:/ws/a".to_owned(), "C:/ws/b".to_owned()],
             ),
         ];
-        let contents = crate::launch::gitconfig_contents("p", 4000, &[], &identity);
+        let contents = crate::launch::gitconfig_contents("p", 4000, &[], &identity, &[]);
         assert!(
             contents.contains("[user]\n\tname = \"Dev User\"\n"),
             "{contents}"
@@ -6783,7 +6788,7 @@ mod tests {
             "user.name".to_owned(),
             vec!["x\n[alias]\n\tco = !evil".to_owned()],
         )];
-        let contents = crate::launch::gitconfig_contents("p", 4000, &[], &hostile);
+        let contents = crate::launch::gitconfig_contents("p", 4000, &[], &hostile, &[]);
         assert!(!contents.contains("[alias]"), "{contents}");
     }
 
@@ -6797,6 +6802,7 @@ mod tests {
             "pairing-x",
             4000,
             &["https://github.com/org/".to_owned()],
+            &[],
             &[],
         )
         .unwrap();
@@ -7604,7 +7610,7 @@ mod tests {
             ("user.name".to_owned(), vec!["Max ; Mustermann".to_owned()]),
             ("user.email".to_owned(), vec![r#"a"b@x"#.to_owned()]),
         ];
-        let contents = crate::launch::gitconfig_contents("p", 4000, &[], &identity);
+        let contents = crate::launch::gitconfig_contents("p", 4000, &[], &identity, &[]);
         assert!(
             contents.contains(r#"signingkey = "C:\\Users\\dev\\.ssh\\id.pub""#),
             "{contents}"
@@ -7620,7 +7626,7 @@ mod tests {
     #[test]
     fn gitconfig_host_only_entry_has_no_double_slash() {
         let allow = vec!["https://github.com".to_owned()];
-        let contents = crate::launch::gitconfig_contents("p", 4000, &allow, &[]);
+        let contents = crate::launch::gitconfig_contents("p", 4000, &allow, &[], &[]);
         assert!(
             contents.contains(&format!(
                 "[url \"http://127.0.0.1:4000{GIT_ROUTE}/github.com\"]\n\tinsteadOf = \"https://github.com\"\n"

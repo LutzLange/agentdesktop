@@ -1,10 +1,28 @@
 //! SSH agent proxy for git over ssh in containment.
+//!
+//! The broker core speaks the ssh-agent wire protocol over any
+//! `AsyncRead + AsyncWrite` transport (AC 2), so every policy path is
+//! unit-testable off-Windows; the Windows named-pipe transport lives in
+//! [`pipe`]. Only identity-list and sign requests are forwarded to the
+//! user's agent (D3); everything else is answered `SSH_AGENT_FAILURE`
+//! locally. The key filter (D4) is the blast-radius control: a brokered
+//! signature is not destination-bound.
 
-use std::collections::BTreeSet;
-use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
 use anyhow::Result;
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::llm_proxy::REVOCATION_POLL;
 use crate::llm_proxy::sessions::SessionRegistry;
 
 pub mod pipe;
@@ -13,6 +31,8 @@ pub mod pipe;
 pub const MAX_AGENT_MESSAGE: usize = 256 * 1024;
 
 /// Maximum concurrent pipe connections per launch.
+// Used by the Windows pipe server; off Windows only tests drive it.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const MAX_AGENT_CONNECTIONS: usize = 8;
 
 /// Maximum concurrent connections per TCP leg.
@@ -23,6 +43,9 @@ pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
+// A wire name pinned by the contract; the broker passes sign replies
+// through without matching on the type, so only tests reference it.
+#[allow(dead_code)]
 pub const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 
 /// Refused operation codes (add/remove, smartcard, lock/unlock, extensions).
@@ -49,9 +72,7 @@ impl AgentPolicy {
     /// Empty keys → Some(∅) (deny all), ["*"] → None (all keys), otherwise Some(set).
     pub(crate) fn from_config_keys(keys: &[String]) -> Self {
         if keys.iter().any(|k| k == "*") {
-            AgentPolicy {
-                allowed_keys: None,
-            }
+            AgentPolicy { allowed_keys: None }
         } else if keys.is_empty() {
             AgentPolicy {
                 allowed_keys: Some(BTreeSet::new()),
@@ -71,72 +92,667 @@ impl AgentPolicy {
     }
 }
 
-/// Upstream ssh-agent connection.
+/// Upstream ssh-agent connection. `round_trip` takes ONE complete framed
+/// request (4-byte length prefix included) and returns one complete framed
+/// response (addendum G3); the broker validates the response frame length
+/// before filtering or re-encoding.
 #[async_trait]
 pub(crate) trait AgentUpstream: Send + Sync {
     async fn round_trip(&self, request: &[u8]) -> Result<Vec<u8>>;
 }
 
-/// Broker a single agent connection between the box and the upstream agent.
+/// `SSH_AGENT_FAILURE` as one complete frame.
+const FAILURE_FRAME: [u8; 5] = [0, 0, 0, 1, SSH_AGENT_FAILURE];
+
+/// Seconds since the Unix epoch, for `SessionRegistry::live`.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// What a revocation-raced exact read ended with.
+enum RevocableRead {
+    Filled,
+    /// EOF or any transport error: the connection closes silently.
+    Closed,
+    /// The session died while the read was pending (D7).
+    Revoked,
+}
+
+/// Fills `buffer` from `client`, racing the read against the session
+/// revocation poll so an idle connection closes within one
+/// [`REVOCATION_POLL`] of a revoke.
+async fn read_revocable<C>(
+    client: &mut C,
+    buffer: &mut [u8],
+    sessions: &SessionRegistry,
+    session_id: &str,
+) -> RevocableRead
+where
+    C: AsyncRead + Unpin,
+{
+    let read = client.read_exact(buffer);
+    tokio::pin!(read);
+    let mut poll = tokio::time::interval(REVOCATION_POLL);
+    loop {
+        tokio::select! {
+            result = &mut read => {
+                return match result {
+                    Ok(_) => RevocableRead::Filled,
+                    Err(_) => RevocableRead::Closed,
+                };
+            }
+            _ = poll.tick() => {
+                if !sessions.live(session_id, now_unix()) {
+                    return RevocableRead::Revoked;
+                }
+            }
+        }
+    }
+}
+
+/// One per-request log line (AC 8). The emit shape deliberately differs from
+/// the HTTP `SandboxRequest` one: this is not an HTTP surface.
+#[allow(clippy::too_many_arguments)]
+fn emit_agent_line(
+    session_id: &str,
+    launch_id: &str,
+    op: u8,
+    op_name: &str,
+    decision: &str,
+    key: &str,
+    started: tokio::time::Instant,
+    outcome: &str,
+) {
+    tracing::info!(
+        session = %session_id,
+        launch_id = %launch_id,
+        op = u64::from(op),
+        op_name = %op_name,
+        decision = %decision,
+        key = %key,
+        duration_ms = started.elapsed().as_millis() as u64,
+        outcome = %outcome,
+        "ssh agent request"
+    );
+}
+
+/// A big-endian `u32` at `cursor`, advancing it.
+fn read_u32(payload: &[u8], cursor: &mut usize) -> Option<u32> {
+    let bytes = payload.get(*cursor..*cursor + 4)?;
+    *cursor += 4;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+/// An ssh `string` (length-prefixed bytes) at `cursor`, advancing it.
+fn read_ssh_string<'p>(payload: &'p [u8], cursor: &mut usize) -> Option<&'p [u8]> {
+    let length = read_u32(payload, cursor)? as usize;
+    let bytes = payload.get(*cursor..*cursor + length)?;
+    *cursor += length;
+    Some(bytes)
+}
+
+fn push_ssh_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// The key blob of a `SIGN_REQUEST` payload (`[13][string blob]...`).
+fn sign_request_key_blob(payload: &[u8]) -> Option<&[u8]> {
+    let mut cursor = 1;
+    read_ssh_string(payload, &mut cursor)
+}
+
+/// Re-encodes an `IDENTITIES_ANSWER` payload with only the allowed keys,
+/// count field corrected (AC 2). `None` when the payload does not parse.
+fn filter_identities_answer(payload: &[u8], allowed: &BTreeSet<String>) -> Option<Vec<u8>> {
+    let mut cursor = 1;
+    let count = read_u32(payload, &mut cursor)? as usize;
+    let mut kept: Vec<(&[u8], &[u8])> = Vec::new();
+    for _ in 0..count {
+        let blob = read_ssh_string(payload, &mut cursor)?;
+        let comment = read_ssh_string(payload, &mut cursor)?;
+        if allowed.contains(&key_fingerprint(blob)) {
+            kept.push((blob, comment));
+        }
+    }
+    let mut out = vec![SSH_AGENT_IDENTITIES_ANSWER];
+    out.extend_from_slice(&(kept.len() as u32).to_be_bytes());
+    for (blob, comment) in kept {
+        push_ssh_string(&mut out, blob);
+        push_ssh_string(&mut out, comment);
+    }
+    Some(out)
+}
+
+/// Answers one refused op `SSH_AGENT_FAILURE` (D3) with its AC 8 log line;
+/// `false` when the write failed and the connection should close.
+async fn refuse_op<C>(
+    client: &mut C,
+    session_id: &str,
+    launch_id: &str,
+    op: u8,
+    started: tokio::time::Instant,
+) -> bool
+where
+    C: AsyncWrite + Unpin,
+{
+    if client.write_all(&FAILURE_FRAME).await.is_err() {
+        return false;
+    }
+    emit_agent_line(
+        session_id,
+        launch_id,
+        op,
+        &format!("refused:{op}"),
+        "refuse",
+        "-",
+        started,
+        "complete",
+    );
+    true
+}
+
+/// A framed reply from the upstream, validated (addendum G3): the 4-byte
+/// length prefix must match, be non-zero and within [`MAX_AGENT_MESSAGE`].
+fn validated_reply_payload(reply: &[u8]) -> Option<&[u8]> {
+    if reply.len() < 5 {
+        return None;
+    }
+    let declared = u32::from_be_bytes(reply[..4].try_into().ok()?) as usize;
+    if declared == 0 || declared > MAX_AGENT_MESSAGE || declared != reply.len() - 4 {
+        return None;
+    }
+    Some(&reply[4..])
+}
+
+/// Broker a single agent connection between the box and the upstream agent:
+/// framing per AC 2, the D3 op policy, the D4 key filter, the D7 per-request
+/// session check and revocation teardown, one AC 8 log line per request.
+// The production caller is the Windows pipe server; the broker core stays
+// engine- and OS-neutral for the future unix-socket leg (AC 9).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) async fn broker_connection<C>(
-    _client: C,
-    _upstream: &dyn AgentUpstream,
-    _policy: &AgentPolicy,
-    _sessions: &SessionRegistry,
-    _session_id: &str,
-    _launch_id: &str,
+    mut client: C,
+    upstream: &dyn AgentUpstream,
+    policy: &AgentPolicy,
+    sessions: &SessionRegistry,
+    session_id: &str,
+    launch_id: &str,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    todo!("PR 5: broker_connection implementation");
+    loop {
+        let mut header = [0u8; 4];
+        match read_revocable(&mut client, &mut header, sessions, session_id).await {
+            RevocableRead::Filled => {}
+            // EOF, a truncated frame, or a dead session: close silently.
+            RevocableRead::Closed | RevocableRead::Revoked => return Ok(()),
+        }
+        let declared = u32::from_be_bytes(header) as usize;
+        if declared == 0 || declared > MAX_AGENT_MESSAGE {
+            tracing::info!(
+                session = %session_id,
+                launch_id = %launch_id,
+                length = declared as u64,
+                "ssh agent frame length out of bounds; closing the connection"
+            );
+            return Ok(());
+        }
+        let mut payload = vec![0u8; declared];
+        match read_revocable(&mut client, &mut payload, sessions, session_id).await {
+            RevocableRead::Filled => {}
+            RevocableRead::Closed | RevocableRead::Revoked => return Ok(()),
+        }
+        // Per-request session check (AC 2): a dead session answers nothing.
+        if !sessions.live(session_id, now_unix()) {
+            return Ok(());
+        }
+        let started = tokio::time::Instant::now();
+        let op = payload[0];
+        match op {
+            SSH_AGENTC_REQUEST_IDENTITIES | SSH_AGENTC_SIGN_REQUEST => {}
+            // D3: add/remove, smartcard, lock/unlock and extensions are
+            // refused locally and never reach the user's agent; the
+            // connection stays open. (Refusing 27 also refuses
+            // `session-bind@openssh.com`; a client treats extension failure
+            // as "agent without extension support" and proceeds.)
+            SSH_AGENTC_ADD_IDENTITY
+            | SSH_AGENTC_REMOVE_IDENTITY
+            | SSH_AGENTC_REMOVE_ALL_IDENTITIES
+            | SSH_AGENTC_ADD_SMARTCARD_KEY
+            | SSH_AGENTC_REMOVE_SMARTCARD_KEY
+            | SSH_AGENTC_LOCK
+            | SSH_AGENTC_UNLOCK
+            | SSH_AGENTC_ADD_ID_CONSTRAINED
+            | SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED
+            | SSH_AGENTC_EXTENSION => {
+                if !refuse_op(&mut client, session_id, launch_id, op, started).await {
+                    return Ok(());
+                }
+                continue;
+            }
+            // Default-deny: an unknown request type is refused the same way.
+            _ => {
+                if !refuse_op(&mut client, session_id, launch_id, op, started).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
+        let op_name = if op == SSH_AGENTC_REQUEST_IDENTITIES {
+            "request_identities"
+        } else {
+            "sign_request"
+        };
+        // The D4 key filter: a sign request for a key outside the allowlist
+        // is refused locally, before the upstream sees anything.
+        let key = if op == SSH_AGENTC_SIGN_REQUEST {
+            match sign_request_key_blob(&payload) {
+                Some(blob) => key_fingerprint(blob),
+                None => "-".to_owned(),
+            }
+        } else {
+            "-".to_owned()
+        };
+        if op == SSH_AGENTC_SIGN_REQUEST
+            && !sign_request_key_blob(&payload)
+                .is_some_and(|blob| policy.allows_key(&key_fingerprint(blob)))
+        {
+            if client.write_all(&FAILURE_FRAME).await.is_err() {
+                return Ok(());
+            }
+            emit_agent_line(
+                session_id, launch_id, op, op_name, "refuse", &key, started, "complete",
+            );
+            continue;
+        }
+        // Forward the frame as it was read (AC 4); race the round trip
+        // against revocation so an in-flight request gets connection EOF,
+        // never a late answer (D7).
+        let mut framed = header.to_vec();
+        framed.extend_from_slice(&payload);
+        let round = upstream.round_trip(&framed);
+        tokio::pin!(round);
+        let mut poll = tokio::time::interval(REVOCATION_POLL);
+        let reply = loop {
+            tokio::select! {
+                result = &mut round => break result,
+                _ = poll.tick() => {
+                    if !sessions.live(session_id, now_unix()) {
+                        emit_agent_line(
+                            session_id, launch_id, op, op_name, "allow", &key, started,
+                            "canceled",
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let reply = match reply {
+            // Upstream failure (AC 4).
+            Err(_) => None,
+            Ok(bytes) => {
+                if validated_reply_payload(&bytes).is_none() {
+                    // A reply frame out of bounds or malformed (addendum G3).
+                    None
+                } else if op == SSH_AGENTC_REQUEST_IDENTITIES
+                    && policy.allowed_keys.is_some()
+                    && bytes.get(4) == Some(&SSH_AGENT_IDENTITIES_ANSWER)
+                {
+                    // The D4 filter: the IDENTITIES_ANSWER is re-encoded with
+                    // only the allowed keys; an answer the broker cannot
+                    // parse is never passed through unfiltered. `None` policy
+                    // (all keys) passes the reply through byte-identical.
+                    let allowed = policy.allowed_keys.as_ref().expect("checked is_some");
+                    filter_identities_answer(&bytes[4..], allowed).map(|filtered| {
+                        let mut framed = (filtered.len() as u32).to_be_bytes().to_vec();
+                        framed.extend_from_slice(&filtered);
+                        framed
+                    })
+                } else {
+                    Some(bytes)
+                }
+            }
+        };
+        match reply {
+            Some(reply) => {
+                if client.write_all(&reply).await.is_err() {
+                    return Ok(());
+                }
+                emit_agent_line(
+                    session_id, launch_id, op, op_name, "allow", &key, started, "complete",
+                );
+            }
+            None => {
+                if client.write_all(&FAILURE_FRAME).await.is_err() {
+                    return Ok(());
+                }
+                emit_agent_line(
+                    session_id,
+                    launch_id,
+                    op,
+                    op_name,
+                    "upstream_unreachable",
+                    &key,
+                    started,
+                    "complete",
+                );
+            }
+        }
+    }
+}
+
+/// What a budget counts against its limit.
+struct BudgetInner {
+    live: AtomicUsize,
+    limit: usize,
 }
 
 /// Shared count of live connections against a fixed limit (the per-launch
-/// pipe cap, or one TCP leg's cap). Clones share one count; a permit holds
-/// one slot until it is dropped.
+/// pipe cap, or one TCP leg's cap; addendum G1). Clones share one count; a
+/// permit holds one slot until it is dropped. The cap refusal (close + the
+/// AC 8 log line) happens where `try_acquire` returns `None`.
 #[derive(Clone)]
 pub(crate) struct ConnectionBudget {
-    _private: (),
+    inner: Arc<BudgetInner>,
 }
 
 /// One slot of a `ConnectionBudget`, released on drop.
 pub(crate) struct ConnectionPermit {
-    _private: (),
+    inner: Arc<BudgetInner>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.inner.live.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ConnectionBudget {
     /// A budget admitting at most `limit` live connections.
-    pub(crate) fn new(_limit: usize) -> Self {
-        todo!("PR 5: ConnectionBudget::new implementation");
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(BudgetInner {
+                live: AtomicUsize::new(0),
+                limit,
+            }),
+        }
     }
 
     /// A slot, or `None` when `limit` permits are live.
     pub(crate) fn try_acquire(&self) -> Option<ConnectionPermit> {
-        todo!("PR 5: ConnectionBudget::try_acquire implementation");
+        self.inner
+            .live
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                (live < self.inner.limit).then_some(live + 1)
+            })
+            .ok()
+            .map(|_| ConnectionPermit {
+                inner: self.inner.clone(),
+            })
     }
 }
 
 /// Pumps bytes between an accepted leg connection and its upstream until
 /// both directions reach EOF, or the session is revoked or expires (then
-/// both sides are closed). Holds `permit` for the connection's lifetime.
+/// both sides are closed within one [`REVOCATION_POLL`] and bytes written
+/// afterwards never cross; addendum G2, D7). Holds `permit` for the
+/// connection's lifetime. Dialing the upstream stays with the caller.
 pub(crate) async fn pump_leg<C, U>(
-    _client: C,
-    _upstream: U,
-    _permit: ConnectionPermit,
-    _sessions: &SessionRegistry,
-    _session_id: &str,
+    client: C,
+    upstream: U,
+    permit: ConnectionPermit,
+    sessions: &SessionRegistry,
+    session_id: &str,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    todo!("PR 5: pump_leg implementation");
+    let _permit = permit;
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+    // Each direction propagates its EOF as a half-close, so a request can
+    // still be answered over a half-closed leg.
+    let to_upstream = async {
+        let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+        let _ = upstream_write.shutdown().await;
+    };
+    let to_client = async {
+        let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+        let _ = client_write.shutdown().await;
+    };
+    let both = async {
+        tokio::join!(to_upstream, to_client);
+    };
+    tokio::pin!(both);
+    let mut poll = tokio::time::interval(REVOCATION_POLL);
+    loop {
+        tokio::select! {
+            () = &mut both => return Ok(()),
+            _ = poll.tick() => {
+                // Returning drops both halves of both streams: the client
+                // sees EOF and nothing the upstream writes later reaches it.
+                if !sessions.live(session_id, now_unix()) {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
-/// Compute SHA256 fingerprint of an ssh key blob.
-pub(crate) fn key_fingerprint(_blob: &[u8]) -> String {
-    todo!("PR 5: key_fingerprint implementation");
+/// Connect timeout of a leg's upstream dial (AC 5).
+pub(crate) const LEG_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Counts the bytes crossing a stream, for the AC 8 leg line.
+struct Counted<T> {
+    inner: T,
+    read: Arc<AtomicUsize>,
+    written: Arc<AtomicUsize>,
+}
+
+impl<T> Counted<T> {
+    fn new(inner: T) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let read = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                inner,
+                read: read.clone(),
+                written: written.clone(),
+            },
+            read,
+            written,
+        )
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counted<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            self.read
+                .fetch_add(buf.filled().len() - before, Ordering::Relaxed);
+        }
+        poll
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(written)) = &poll {
+            self.written.fetch_add(*written, Ordering::Relaxed);
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// One AC 8 leg-connection log line.
+#[allow(clippy::too_many_arguments)]
+fn emit_leg_line(
+    session_id: &str,
+    launch_id: &str,
+    host: &str,
+    port: u16,
+    bytes_in: usize,
+    bytes_out: usize,
+    started: tokio::time::Instant,
+    outcome: &str,
+) {
+    tracing::info!(
+        session = %session_id,
+        launch_id = %launch_id,
+        host = %host,
+        port = u64::from(port),
+        bytes_in = bytes_in as u64,
+        bytes_out = bytes_out as u64,
+        duration_ms = started.elapsed().as_millis() as u64,
+        outcome = %outcome,
+        "ssh leg connection"
+    );
+}
+
+/// The clock the launch-side accept loops check session liveness against:
+/// the launch host's (`LaunchHost::now`), the same clock the session was
+/// registered with. The contract-level seams (`broker_connection`,
+/// `pump_leg`) read system time, which is what `LaunchHost::now` is in
+/// production.
+pub(crate) type SessionClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Serves one host's loopback leg (AC 5): each accepted connection is a dumb
+/// byte pump to `host:22` originated by the daemon, capped per D9, torn down
+/// with the session per D7 (the listener drop closes the leg port).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_leg(
+    listener: tokio::net::TcpListener,
+    host: String,
+    port: u16,
+    sessions: SessionRegistry,
+    session_id: String,
+    launch_id: String,
+    clock: SessionClock,
+) {
+    let budget = ConnectionBudget::new(MAX_LEG_CONNECTIONS);
+    let mut poll = tokio::time::interval(REVOCATION_POLL);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((client, _)) = accepted else { continue };
+                match budget.try_acquire() {
+                    // D9: the excess connection is accepted, then closed,
+                    // with one log line.
+                    None => tracing::info!(
+                        session = %session_id,
+                        launch_id = %launch_id,
+                        host = %host,
+                        port = u64::from(port),
+                        "ssh leg connection over the cap; closed"
+                    ),
+                    Some(permit) => {
+                        let sessions = sessions.clone();
+                        let session_id = session_id.clone();
+                        let launch_id = launch_id.clone();
+                        let host = host.clone();
+                        tokio::spawn(async move {
+                            serve_leg_connection(
+                                client, permit, &host, port, &sessions, &session_id,
+                                &launch_id,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+            _ = poll.tick() => {
+                if !sessions.live(&session_id, clock()) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Dials `host:22` (connect timeout [`LEG_CONNECT_TIMEOUT`]; failure closes
+/// the client side) and pumps until EOF or revocation.
+async fn serve_leg_connection(
+    client: tokio::net::TcpStream,
+    permit: ConnectionPermit,
+    host: &str,
+    port: u16,
+    sessions: &SessionRegistry,
+    session_id: &str,
+    launch_id: &str,
+) {
+    let started = tokio::time::Instant::now();
+    let upstream = tokio::time::timeout(
+        LEG_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, 22u16)),
+    )
+    .await;
+    match upstream {
+        Ok(Ok(upstream)) => {
+            let (counted, bytes_in, bytes_out) = Counted::new(client);
+            let _ = pump_leg(counted, upstream, permit, sessions, session_id).await;
+            let outcome = if sessions.live(session_id, now_unix()) {
+                "complete"
+            } else {
+                "canceled"
+            };
+            emit_leg_line(
+                session_id,
+                launch_id,
+                host,
+                port,
+                bytes_in.load(Ordering::Relaxed),
+                bytes_out.load(Ordering::Relaxed),
+                started,
+                outcome,
+            );
+        }
+        Ok(Err(_)) | Err(_) => {
+            drop(permit);
+            emit_leg_line(session_id, launch_id, host, port, 0, 0, started, "complete");
+        }
+    }
+}
+
+/// The SHA256 fingerprint of an ssh key blob, `SHA256:<base64, no padding>`,
+/// as `ssh-add -l` prints it.
+pub(crate) fn key_fingerprint(blob: &[u8]) -> String {
+    use base64::Engine as _;
+    let digest = Sha256::digest(blob);
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
+    )
 }
 
 #[cfg(test)]
@@ -159,7 +775,10 @@ mod tests {
 
     #[test]
     fn agent_policy_from_config_specific_keys_filters() {
-        let policy = AgentPolicy::from_config_keys(&["SHA256:allowed1".to_owned(), "SHA256:allowed2".to_owned()]);
+        let policy = AgentPolicy::from_config_keys(&[
+            "SHA256:allowed1".to_owned(),
+            "SHA256:allowed2".to_owned(),
+        ]);
         assert!(policy.allows_key("SHA256:allowed1"));
         assert!(policy.allows_key("SHA256:allowed2"));
         assert!(!policy.allows_key("SHA256:denied"));
@@ -393,9 +1012,11 @@ mod broker_tests {
             &fx.session_id,
             LAUNCH_ID,
         );
-        timeout(EXCHANGE_LIMIT, async { tokio::join!(broker, script(client)) })
-            .await
-            .expect("broker and client finish within the exchange limit")
+        timeout(EXCHANGE_LIMIT, async {
+            tokio::join!(broker, script(client))
+        })
+        .await
+        .expect("broker and client finish within the exchange limit")
     }
 
     /// One whole frame, length prefix included; `None` on EOF before or
@@ -524,7 +1145,10 @@ mod broker_tests {
             received
         })
         .await;
-        assert!(received.is_empty(), "no reply to an oversize frame: {received:?}");
+        assert!(
+            received.is_empty(),
+            "no reply to an oversize frame: {received:?}"
+        );
         assert_eq!(fx.upstream.calls(), 0);
         let visible = logs.visible_lines();
         assert_eq!(visible.len(), 1, "one log line for the close: {visible:?}");
@@ -535,13 +1159,19 @@ mod broker_tests {
         let (logs, _guard) = capture_logs();
         let fx = fixture(&["*"], vec![Reply::Answer(both_keys_answer())]);
         let (_result, received) = run(&fx, |mut client| async move {
-            client.write_all(&[0, 0, 0, 0]).await.expect("write the length");
+            client
+                .write_all(&[0, 0, 0, 0])
+                .await
+                .expect("write the length");
             let mut received = Vec::new();
             let _ = client.read_to_end(&mut received).await;
             received
         })
         .await;
-        assert!(received.is_empty(), "no reply to a zero-length frame: {received:?}");
+        assert!(
+            received.is_empty(),
+            "no reply to a zero-length frame: {received:?}"
+        );
         assert_eq!(fx.upstream.calls(), 0);
         let visible = logs.visible_lines();
         assert_eq!(visible.len(), 1, "one log line for the close: {visible:?}");
@@ -563,10 +1193,20 @@ mod broker_tests {
             received
         })
         .await;
-        assert!(received.is_empty(), "no reply to a truncated frame: {received:?}");
-        assert_eq!(fx.upstream.calls(), 0, "a partial request is never forwarded");
+        assert!(
+            received.is_empty(),
+            "no reply to a truncated frame: {received:?}"
+        );
+        assert_eq!(
+            fx.upstream.calls(),
+            0,
+            "a partial request is never forwarded"
+        );
         let visible = logs.visible_lines();
-        assert!(visible.is_empty(), "a truncated read closes silently: {visible:?}");
+        assert!(
+            visible.is_empty(),
+            "a truncated read closes silently: {visible:?}"
+        );
     }
 
     // --- Op-code battery (Tests-first bullet 2)
@@ -579,7 +1219,10 @@ mod broker_tests {
         let fx = fixture(&["*"], vec![Reply::Answer(answer.clone())]);
         let (replies, trailing) = exchange(
             &fx,
-            vec![msg(op, b"\x00\x00\x00\x04body"), frame(&request_identities())],
+            vec![
+                msg(op, b"\x00\x00\x00\x04body"),
+                frame(&request_identities()),
+            ],
         )
         .await;
         assert_eq!(
@@ -687,7 +1330,10 @@ mod broker_tests {
 
     #[tokio::test]
     async fn key_filter_identities_answer_re_encodes_to_allowed_only() {
-        let fx = fixture(&[KEY_A_FINGERPRINT], vec![Reply::Answer(both_keys_answer())]);
+        let fx = fixture(
+            &[KEY_A_FINGERPRINT],
+            vec![Reply::Answer(both_keys_answer())],
+        );
         let (replies, trailing) = exchange(&fx, vec![frame(&request_identities())]).await;
         let expected = frame(&identities_answer(&[(&key_a(), "allowed@test")]));
         assert_eq!(replies, vec![Some(expected.clone())]);
@@ -702,7 +1348,11 @@ mod broker_tests {
         let (replies, trailing) = exchange(&fx, vec![frame(&sign_request(&key_b()))]).await;
         assert_eq!(replies, vec![Some(FAILURE_FRAME.to_vec())]);
         assert!(trailing.is_empty(), "{trailing:?}");
-        assert_eq!(fx.upstream.calls(), 0, "a filtered key's sign request stays local");
+        assert_eq!(
+            fx.upstream.calls(),
+            0,
+            "a filtered key's sign request stays local"
+        );
     }
 
     #[tokio::test]
@@ -724,7 +1374,17 @@ mod broker_tests {
         let (replies, trailing) = exchange(&fx, vec![frame(&request_identities())]).await;
         assert_eq!(
             replies,
-            vec![Some(vec![0, 0, 0, 5, SSH_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 0])]
+            vec![Some(vec![
+                0,
+                0,
+                0,
+                5,
+                SSH_AGENT_IDENTITIES_ANSWER,
+                0,
+                0,
+                0,
+                0
+            ])]
         );
         assert!(trailing.is_empty(), "{trailing:?}");
     }
@@ -758,7 +1418,10 @@ mod broker_tests {
         .await;
         assert_eq!(
             replies,
-            vec![Some(frame(&both_keys_answer())), Some(frame(&sign_response()))]
+            vec![
+                Some(frame(&both_keys_answer())),
+                Some(frame(&sign_response()))
+            ]
         );
         assert!(trailing.is_empty(), "{trailing:?}");
         assert_eq!(
@@ -779,7 +1442,12 @@ mod broker_tests {
         assert_eq!(fx.upstream.calls(), 1);
         let lines = logs.agent_lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(log_field(&lines[0], "decision"), "upstream_unreachable", "{}", lines[0]);
+        assert_eq!(
+            log_field(&lines[0], "decision"),
+            "upstream_unreachable",
+            "{}",
+            lines[0]
+        );
     }
 
     // --- Session death (Tests-first bullet 6)
@@ -804,7 +1472,10 @@ mod broker_tests {
         })
         .await;
         assert_eq!(first, Some(frame(&answer)));
-        assert!(received.is_empty(), "no bytes after the revoke: {received:?}");
+        assert!(
+            received.is_empty(),
+            "no bytes after the revoke: {received:?}"
+        );
         assert!(
             elapsed < REVOKE_LIMIT,
             "closed {elapsed:?} after the revoke (poll is 50 ms)"
@@ -831,7 +1502,11 @@ mod broker_tests {
             while fx_ref.upstream.calls() == 0 && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            assert_eq!(fx_ref.upstream.calls(), 1, "the request is in flight upstream");
+            assert_eq!(
+                fx_ref.upstream.calls(),
+                1,
+                "the request is in flight upstream"
+            );
             assert!(fx_ref.sessions.revoke(&fx_ref.session_id));
             let revoked_at = Instant::now();
             let mut received = Vec::new();
@@ -839,13 +1514,20 @@ mod broker_tests {
             (revoked_at.elapsed(), received)
         })
         .await;
-        assert!(received.is_empty(), "no late reply after the revoke: {received:?}");
+        assert!(
+            received.is_empty(),
+            "no late reply after the revoke: {received:?}"
+        );
         assert!(
             elapsed < REVOKE_LIMIT,
             "closed {elapsed:?} after the revoke (poll is 50 ms)"
         );
         let lines = logs.agent_lines();
-        assert_eq!(lines.len(), 1, "one line for the canceled request: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line for the canceled request: {lines:?}"
+        );
         assert_eq!(log_field(&lines[0], "outcome"), "canceled", "{}", lines[0]);
     }
 
@@ -860,7 +1542,10 @@ mod broker_tests {
             received
         })
         .await;
-        assert!(received.is_empty(), "a dead session answers nothing: {received:?}");
+        assert!(
+            received.is_empty(),
+            "a dead session answers nothing: {received:?}"
+        );
         assert_eq!(fx.upstream.calls(), 0);
     }
 
@@ -901,7 +1586,11 @@ mod broker_tests {
         assert_eq!(lines.len(), 2, "one line per request: {lines:?}");
         let identities = &lines[0];
         assert_common_shape(identities, &fx.session_id, SSH_AGENTC_REQUEST_IDENTITIES);
-        assert_eq!(log_field(identities, "op_name"), "request_identities", "{identities}");
+        assert_eq!(
+            log_field(identities, "op_name"),
+            "request_identities",
+            "{identities}"
+        );
         assert_eq!(log_field(identities, "decision"), "allow", "{identities}");
         assert_eq!(log_field(identities, "key"), "-", "{identities}");
         assert_eq!(log_field(identities, "outcome"), "complete", "{identities}");
@@ -933,7 +1622,11 @@ mod broker_tests {
         assert_eq!(lines.len(), 2, "one line per request: {lines:?}");
         let refused_op = &lines[0];
         assert_common_shape(refused_op, &fx.session_id, SSH_AGENTC_ADD_IDENTITY);
-        assert_eq!(log_field(refused_op, "op_name"), "refused:17", "{refused_op}");
+        assert_eq!(
+            log_field(refused_op, "op_name"),
+            "refused:17",
+            "{refused_op}"
+        );
         assert_eq!(log_field(refused_op, "decision"), "refuse", "{refused_op}");
         assert_eq!(log_field(refused_op, "key"), "-", "{refused_op}");
         assert_eq!(log_field(refused_op, "outcome"), "complete", "{refused_op}");
@@ -960,7 +1653,11 @@ mod broker_tests {
         let line = &lines[0];
         assert_common_shape(line, &fx.session_id, SSH_AGENTC_REQUEST_IDENTITIES);
         assert_eq!(log_field(line, "op_name"), "request_identities", "{line}");
-        assert_eq!(log_field(line, "decision"), "upstream_unreachable", "{line}");
+        assert_eq!(
+            log_field(line, "decision"),
+            "upstream_unreachable",
+            "{line}"
+        );
         assert_eq!(log_field(line, "key"), "-", "{line}");
         assert_eq!(log_field(line, "outcome"), "complete", "{line}");
     }
@@ -978,7 +1675,10 @@ mod broker_tests {
             })
             .collect();
         assert!(budget.try_acquire().is_none(), "the 9th is refused");
-        assert!(budget.try_acquire().is_none(), "and stays refused while 8 are live");
+        assert!(
+            budget.try_acquire().is_none(),
+            "and stays refused while 8 are live"
+        );
         drop(permits);
     }
 
@@ -990,7 +1690,9 @@ mod broker_tests {
             .collect();
         assert!(budget.try_acquire().is_none());
         drop(permits.pop());
-        let again = budget.try_acquire().expect("a dropped permit frees its slot");
+        let again = budget
+            .try_acquire()
+            .expect("a dropped permit frees its slot");
         assert!(budget.try_acquire().is_none(), "exactly one slot was freed");
         drop(again);
         drop(permits);
@@ -1010,10 +1712,19 @@ mod broker_tests {
             let source = if i % 2 == 0 { &budget } else { &clone };
             permits.push(source.try_acquire().expect("within the shared limit"));
         }
-        assert!(budget.try_acquire().is_none(), "the original sees the clone's permits");
-        assert!(clone.try_acquire().is_none(), "the clone sees the original's permits");
+        assert!(
+            budget.try_acquire().is_none(),
+            "the original sees the clone's permits"
+        );
+        assert!(
+            clone.try_acquire().is_none(),
+            "the clone sees the original's permits"
+        );
         drop(permits.pop());
-        assert!(clone.try_acquire().is_some(), "a slot freed through either is free in both");
+        assert!(
+            clone.try_acquire().is_some(),
+            "a slot freed through either is free in both"
+        );
     }
 
     /// Acceptor modelled on the pipe server (addendum G1): one `try_acquire`
@@ -1039,15 +1750,26 @@ mod broker_tests {
                     let session_id = fx.session_id.clone();
                     tasks.push(tokio::spawn(async move {
                         let _permit = permit;
-                        broker_connection(server, &upstream, &policy, &sessions, &session_id, LAUNCH_ID)
-                            .await
+                        broker_connection(
+                            server,
+                            &upstream,
+                            &policy,
+                            &sessions,
+                            &session_id,
+                            LAUNCH_ID,
+                        )
+                        .await
                     }));
                 }
                 None => drop(server),
             }
             clients.push(client);
         }
-        assert_eq!(tasks.len(), MAX_AGENT_CONNECTIONS, "exactly the cap is admitted");
+        assert_eq!(
+            tasks.len(),
+            MAX_AGENT_CONNECTIONS,
+            "exactly the cap is admitted"
+        );
 
         let mut ninth = clients.pop().unwrap();
         let mut received = Vec::new();
@@ -1068,7 +1790,10 @@ mod broker_tests {
                 .unwrap_or_else(|_| panic!("connection {i} answers"));
             assert_eq!(reply, Some(frame(&both_keys_answer())), "connection {i}");
         }
-        assert!(budget.try_acquire().is_none(), "8 live connections hold all slots");
+        assert!(
+            budget.try_acquire().is_none(),
+            "8 live connections hold all slots"
+        );
 
         // Closing one admitted connection frees its slot.
         let mut first = clients.remove(0);
@@ -1081,7 +1806,10 @@ mod broker_tests {
             .expect("the closed connection's broker returns")
             .expect("the broker task does not panic")
             .ok();
-        assert!(budget.try_acquire().is_some(), "a closed connection frees its slot");
+        assert!(
+            budget.try_acquire().is_some(),
+            "a closed connection frees its slot"
+        );
 
         drop(clients);
         for task in tasks {
@@ -1134,7 +1862,13 @@ mod broker_tests {
         };
         let (result, _, trailing) = timeout(EXCHANGE_LIMIT, async {
             tokio::join!(
-                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                pump_leg(
+                    client_daemon,
+                    upstream_daemon,
+                    permit,
+                    &fx.sessions,
+                    &fx.session_id
+                ),
                 echo(far),
                 script
             )
@@ -1143,7 +1877,10 @@ mod broker_tests {
         .expect("the pump ends once both directions reach EOF");
         assert!(trailing.is_empty(), "{trailing:?}");
         assert!(result.is_ok(), "{result:?}");
-        assert!(budget.try_acquire().is_some(), "the permit is released when the pump returns");
+        assert!(
+            budget.try_acquire().is_some(),
+            "the permit is released when the pump returns"
+        );
     }
 
     #[tokio::test]
@@ -1162,14 +1899,24 @@ mod broker_tests {
         };
         let far_side = async {
             let mut received = Vec::new();
-            far.read_to_end(&mut received).await.expect("EOF reaches the upstream");
-            far.write_all(b"answer after eof").await.expect("write after the client's EOF");
+            far.read_to_end(&mut received)
+                .await
+                .expect("EOF reaches the upstream");
+            far.write_all(b"answer after eof")
+                .await
+                .expect("write after the client's EOF");
             far.shutdown().await.expect("upstream half-close");
             received
         };
         let (_result, to_client, to_upstream) = timeout(EXCHANGE_LIMIT, async {
             tokio::join!(
-                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                pump_leg(
+                    client_daemon,
+                    upstream_daemon,
+                    permit,
+                    &fx.sessions,
+                    &fx.session_id
+                ),
                 client_side,
                 far_side
             )
@@ -1177,7 +1924,10 @@ mod broker_tests {
         .await
         .expect("both directions finish");
         assert_eq!(to_upstream, b"request", "the client's bytes, then EOF");
-        assert_eq!(to_client, b"answer after eof", "the half-closed leg still carries the answer");
+        assert_eq!(
+            to_client, b"answer after eof",
+            "the half-closed leg still carries the answer"
+        );
     }
 
     #[tokio::test]
@@ -1195,14 +1945,26 @@ mod broker_tests {
         };
         let client_side = async {
             let mut received = Vec::new();
-            client.read_to_end(&mut received).await.expect("EOF reaches the client");
-            client.write_all(b"reply after eof").await.expect("write after the upstream's EOF");
+            client
+                .read_to_end(&mut received)
+                .await
+                .expect("EOF reaches the client");
+            client
+                .write_all(b"reply after eof")
+                .await
+                .expect("write after the upstream's EOF");
             client.shutdown().await.expect("client half-close");
             received
         };
         let (_result, to_upstream, to_client) = timeout(EXCHANGE_LIMIT, async {
             tokio::join!(
-                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                pump_leg(
+                    client_daemon,
+                    upstream_daemon,
+                    permit,
+                    &fx.sessions,
+                    &fx.session_id
+                ),
                 far_side,
                 client_side
             )
@@ -1210,7 +1972,10 @@ mod broker_tests {
         .await
         .expect("both directions finish");
         assert_eq!(to_client, b"banner", "the upstream's bytes, then EOF");
-        assert_eq!(to_upstream, b"reply after eof", "the half-closed leg still carries the reply");
+        assert_eq!(
+            to_upstream, b"reply after eof",
+            "the half-closed leg still carries the reply"
+        );
     }
 
     #[tokio::test]
@@ -1223,7 +1988,10 @@ mod broker_tests {
         let client_side = async {
             client.write_all(b"ping").await.expect("write");
             let mut pong = [0u8; 4];
-            client.read_exact(&mut pong).await.expect("echo before the revoke");
+            client
+                .read_exact(&mut pong)
+                .await
+                .expect("echo before the revoke");
             assert!(fx_ref.sessions.revoke(&fx_ref.session_id));
             let revoked_at = Instant::now();
             let mut received = Vec::new();
@@ -1243,16 +2011,31 @@ mod broker_tests {
         };
         let (_result, (elapsed, received), _) = timeout(EXCHANGE_LIMIT, async {
             tokio::join!(
-                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                pump_leg(
+                    client_daemon,
+                    upstream_daemon,
+                    permit,
+                    &fx.sessions,
+                    &fx.session_id
+                ),
                 client_side,
                 far_side
             )
         })
         .await
         .expect("revocation ends the pump and closes the upstream side");
-        assert!(received.is_empty(), "no bytes after the revoke: {received:?}");
-        assert!(elapsed < REVOKE_LIMIT, "closed {elapsed:?} after the revoke (poll is 50 ms)");
-        assert!(budget.try_acquire().is_some(), "the permit is released on teardown");
+        assert!(
+            received.is_empty(),
+            "no bytes after the revoke: {received:?}"
+        );
+        assert!(
+            elapsed < REVOKE_LIMIT,
+            "closed {elapsed:?} after the revoke (poll is 50 ms)"
+        );
+        assert!(
+            budget.try_acquire().is_some(),
+            "the permit is released on teardown"
+        );
     }
 
     #[tokio::test]
@@ -1268,11 +2051,21 @@ mod broker_tests {
             let session_id = fx.session_id.clone();
             tokio::spawn(echo(far));
             pumps.push(tokio::spawn(async move {
-                pump_leg(client_daemon, upstream_daemon, permit, &sessions, &session_id).await
+                pump_leg(
+                    client_daemon,
+                    upstream_daemon,
+                    permit,
+                    &sessions,
+                    &session_id,
+                )
+                .await
             }));
             clients.push(client);
         }
-        assert!(budget.try_acquire().is_none(), "a 9th leg connection is refused");
+        assert!(
+            budget.try_acquire().is_none(),
+            "a 9th leg connection is refused"
+        );
 
         for (i, client) in clients.iter_mut().enumerate() {
             client.write_all(b"ping").await.expect("write");
@@ -1309,7 +2102,11 @@ mod broker_tests {
                 .ok();
         }
         let all: Vec<ConnectionPermit> = (0..MAX_LEG_CONNECTIONS)
-            .map(|_| budget.try_acquire().expect("every slot is free after teardown"))
+            .map(|_| {
+                budget
+                    .try_acquire()
+                    .expect("every slot is free after teardown")
+            })
             .collect();
         drop(all);
         drop(clients);

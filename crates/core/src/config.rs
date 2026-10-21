@@ -190,7 +190,9 @@ pub struct GitConfig {
     /// Static git credentials for allowed hosts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<GitCredentialEntry>,
-    /// SSH remote access configuration.
+    /// Git over ssh: the box's ssh signs through a filtered agent proxy (the
+    /// key never enters the box) and reaches each host through a loopback
+    /// leg the daemon originates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<GitSshConfig>,
 }
@@ -200,10 +202,17 @@ pub struct GitConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitSshConfig {
-    /// Bare hostnames (port fixed at 22) the box may access via ssh.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "deserialize_lowercase_hosts")]
+    /// Bare hostnames (port fixed at 22) the box may fetch from and push to
+    /// over ssh; host-granular. Empty or absent: no ssh at all.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_lowercase_hosts"
+    )]
     pub hosts: Vec<String>,
-    /// SHA256 key fingerprints or literal "*" for all keys.
+    /// SHA256 fingerprints (`SHA256:...`, as `ssh-add -l` prints them) of the
+    /// agent keys offered to the box. Empty or absent: no key is offered.
+    /// The literal `"*"` offers every key in the agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
 }
@@ -363,7 +372,11 @@ pub fn validate_containment_startup(
 
             // Validate hosts: bare hostname only (no scheme, path, port)
             for (idx, host) in ssh_config.hosts.iter().enumerate() {
-                if host.is_empty() || host.contains('/') || host.contains(':') || host.starts_with("http") {
+                if host.is_empty()
+                    || host.contains('/')
+                    || host.contains(':')
+                    || host.starts_with("http")
+                {
                     return Err(format!(
                         "daemon.containment.git.ssh.hosts[{}] must be a bare hostname (no scheme, path, or port)",
                         idx
@@ -3395,10 +3408,7 @@ programs:
             error.contains("with egressUpstream set, ssh egress is not available"),
             "error: {error}"
         );
-        assert!(
-            error.contains("L7 https only"),
-            "error: {error}"
-        );
+        assert!(error.contains("L7 https only"), "error: {error}");
     }
 
     #[test]

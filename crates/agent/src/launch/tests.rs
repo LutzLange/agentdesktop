@@ -931,6 +931,9 @@ fn launch_input<'a>(
         relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
         pairing: "test-pairing-value".into(),
         base_env: base_env(),
+        // The snapshot scenario has no ssh hosts (G5: the writer defines the
+        // ssh additions to `plan()`'s input; ledgered).
+        ssh_enabled: false,
         exists,
         is_dir,
     }
@@ -2087,8 +2090,34 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
     }
 }
 
+/// Keeps two process-lifetime dispatchers registered so tracing-core never
+/// enters its single-dispatcher mode, for log-capture tests that run beside
+/// launches on other threads.
+///
+/// With at most one registered dispatcher, tracing-core 0.1 computes a
+/// callsite's first-hit interest from the CALLING thread's default
+/// subscriber, without the dispatcher lock, and caches it globally. A
+/// concurrent launch test with no subscriber could then cache
+/// `Interest::never` for a callsite another test is capturing (the
+/// `launch_logs_posture_error_as_warning` flake). With two or more
+/// dispatchers always registered, callsite registration takes the read lock
+/// and sees every live dispatcher, and `set_default` (write lock) re-computes
+/// every callsite: the two are serialized, so a capture installed before an
+/// event always sees it. Called from `Harness::start`, so every launch
+/// happens after the pins exist.
+fn pin_tracing_dispatchers() {
+    static PINS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        [
+            tracing::Dispatch::new(tracing_subscriber::registry()),
+            tracing::Dispatch::new(tracing_subscriber::registry()),
+        ]
+    });
+}
+
 impl Harness {
     async fn start(setup: Setup) -> Self {
+        pin_tracing_dispatchers();
         let dir = tempfile::tempdir().unwrap();
         let root = strip_verbatim(std::fs::canonicalize(dir.path()).unwrap());
         let home = root.join("home").join("dev");
@@ -3255,7 +3284,10 @@ async fn launch_logs_posture_error_as_warning() {
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
 
-    // Capture logs in a shared buffer
+    // Capture logs in a shared buffer. The dispatcher pins go first, so no
+    // concurrent launch on another thread can cache the posture callsite as
+    // disabled (see `pin_tracing_dispatchers`).
+    pin_tracing_dispatchers();
     let logs = Arc::new(Mutex::new(Vec::new()));
     let logs_writer = logs.clone();
 
@@ -3912,6 +3944,7 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
         relay_base_url: "http://127.0.0.1:4000/sandbox".into(),
         pairing: "test-pairing-value".into(),
         base_env: BTreeMap::new(),
+        ssh_enabled: false,
         exists: &exists_c,
         is_dir: &is_dir_c,
     };
@@ -4153,12 +4186,9 @@ fn the_profile_window_title_equals_the_replaced_command_line_title() {
 const SSH_HOST_A: &str = "git.example.com";
 const SSH_HOST_B: &str = "code.example.org";
 const HTTPS_ONLY_HOST: &str = "other.example.net";
-const SEED_A: &str =
-    "git.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
-const SEED_B: &str =
-    "code.example.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC";
-const SEED_OTHER: &str =
-    "other.example.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD";
+const SEED_A: &str = "git.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+const SEED_B: &str = "code.example.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC";
+const SEED_OTHER: &str = "other.example.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMD";
 
 fn ssh_git_config(ssh: Option<(&[&str], &[&str])>) -> agentdesktop_core::config::GitConfig {
     agentdesktop_core::config::GitConfig {
@@ -4229,7 +4259,9 @@ fn capture_at_spawn(h: &Harness) -> Arc<Mutex<Option<SpawnTimeFiles>>> {
     let slot = captured.clone();
     let launches = h.state_dir.join("launches");
     *h.executor.on_spawn.lock().unwrap() = Some(Box::new(move || {
-        let Some(Ok(entry)) = std::fs::read_dir(&launches).ok().and_then(|mut dir| dir.next())
+        let Some(Ok(entry)) = std::fs::read_dir(&launches)
+            .ok()
+            .and_then(|mut dir| dir.next())
         else {
             return;
         };
@@ -4392,7 +4424,11 @@ async fn ssh_config_and_known_hosts_are_generated_for_a_two_host_fixture() {
         "exactly the seeded entries of the ssh hosts: {known_hosts}"
     );
     if cfg!(unix) {
-        assert_eq!(files.modes, (Some(0o600), Some(0o600)), "both files are 0600");
+        assert_eq!(
+            files.modes,
+            (Some(0o600), Some(0o600)),
+            "both files are 0600"
+        );
     }
 }
 
@@ -4411,17 +4447,26 @@ async fn the_gitconfig_drops_the_ssh_refusal_mapping_only_for_ssh_hosts() {
         format!("insteadOf = ssh://{SSH_HOST_A}/"),
         format!("insteadOf = git@{SSH_HOST_A}:"),
     ] {
-        assert!(!git_config.contains(&absent), "{absent} must be gone: {git_config}");
+        assert!(
+            !git_config.contains(&absent),
+            "{absent} must be gone: {git_config}"
+        );
     }
     // Its https mapping is untouched.
-    assert!(git_config.contains(&format!("git/{SSH_HOST_A}/org/")), "{git_config}");
+    assert!(
+        git_config.contains(&format!("git/{SSH_HOST_A}/org/")),
+        "{git_config}"
+    );
     // A git.allow host that is not an ssh host keeps the refusal route.
     for present in [
         format!("git-ssh/{HTTPS_ONLY_HOST}/"),
         format!("insteadOf = ssh://{HTTPS_ONLY_HOST}/"),
         format!("insteadOf = git@{HTTPS_ONLY_HOST}:"),
     ] {
-        assert!(git_config.contains(&present), "{present} must stay: {git_config}");
+        assert!(
+            git_config.contains(&present),
+            "{present} must stay: {git_config}"
+        );
     }
 }
 
@@ -4459,7 +4504,10 @@ async fn ssh_env_names_the_launch_pipe_and_the_generated_ssh_config() {
         "known_hosts is granted read-write, exactly the file: {:?}",
         readwrite(&request)
     );
-    assert!(!readwrite(&request).contains(&ssh_config), "ssh_config is not writable");
+    assert!(
+        !readwrite(&request).contains(&ssh_config),
+        "ssh_config is not writable"
+    );
 }
 
 /// A request with the per-harness parts (temp root, launch id, pairing)
@@ -4530,7 +4578,10 @@ async fn an_ssh_setup_failure_fails_the_launch_stops_the_box_and_closes_the_legs
     );
     // The legs bound before spawn close with the launch.
     let files = spawn_time_files(&captured);
-    assert!(!files.ports_in_use.is_empty(), "a leg was bound before spawn");
+    assert!(
+        !files.ports_in_use.is_empty(),
+        "a leg was bound before spawn"
+    );
     for (port, _) in &files.ports_in_use {
         let mut closed = false;
         for _ in 0..100 {
