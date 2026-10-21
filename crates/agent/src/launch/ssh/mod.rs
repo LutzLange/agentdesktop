@@ -92,6 +92,48 @@ where
     todo!("PR 5: broker_connection implementation");
 }
 
+/// Shared count of live connections against a fixed limit (the per-launch
+/// pipe cap, or one TCP leg's cap). Clones share one count; a permit holds
+/// one slot until it is dropped.
+#[derive(Clone)]
+pub(crate) struct ConnectionBudget {
+    _private: (),
+}
+
+/// One slot of a `ConnectionBudget`, released on drop.
+pub(crate) struct ConnectionPermit {
+    _private: (),
+}
+
+impl ConnectionBudget {
+    /// A budget admitting at most `limit` live connections.
+    pub(crate) fn new(_limit: usize) -> Self {
+        todo!("PR 5: ConnectionBudget::new implementation");
+    }
+
+    /// A slot, or `None` when `limit` permits are live.
+    pub(crate) fn try_acquire(&self) -> Option<ConnectionPermit> {
+        todo!("PR 5: ConnectionBudget::try_acquire implementation");
+    }
+}
+
+/// Pumps bytes between an accepted leg connection and its upstream until
+/// both directions reach EOF, or the session is revoked or expires (then
+/// both sides are closed). Holds `permit` for the connection's lifetime.
+pub(crate) async fn pump_leg<C, U>(
+    _client: C,
+    _upstream: U,
+    _permit: ConnectionPermit,
+    _sessions: &SessionRegistry,
+    _session_id: &str,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    todo!("PR 5: pump_leg implementation");
+}
+
 /// Compute SHA256 fingerprint of an ssh key blob.
 pub(crate) fn key_fingerprint(_blob: &[u8]) -> String {
     todo!("PR 5: key_fingerprint implementation");
@@ -921,6 +963,356 @@ mod broker_tests {
         assert_eq!(log_field(line, "decision"), "upstream_unreachable", "{line}");
         assert_eq!(log_field(line, "key"), "-", "{line}");
         assert_eq!(log_field(line, "outcome"), "complete", "{line}");
+    }
+
+    // --- Connection cap (Tests-first bullet 7, addendum G1: ConnectionBudget)
+
+    #[test]
+    fn connection_budget_grants_up_to_the_limit_then_refuses() {
+        let budget = ConnectionBudget::new(MAX_AGENT_CONNECTIONS);
+        let permits: Vec<ConnectionPermit> = (0..MAX_AGENT_CONNECTIONS)
+            .map(|i| {
+                budget
+                    .try_acquire()
+                    .unwrap_or_else(|| panic!("permit {i} within the limit"))
+            })
+            .collect();
+        assert!(budget.try_acquire().is_none(), "the 9th is refused");
+        assert!(budget.try_acquire().is_none(), "and stays refused while 8 are live");
+        drop(permits);
+    }
+
+    #[test]
+    fn connection_budget_dropping_a_permit_frees_a_slot() {
+        let budget = ConnectionBudget::new(MAX_AGENT_CONNECTIONS);
+        let mut permits: Vec<ConnectionPermit> = (0..MAX_AGENT_CONNECTIONS)
+            .map(|_| budget.try_acquire().expect("within the limit"))
+            .collect();
+        assert!(budget.try_acquire().is_none());
+        drop(permits.pop());
+        let again = budget.try_acquire().expect("a dropped permit frees its slot");
+        assert!(budget.try_acquire().is_none(), "exactly one slot was freed");
+        drop(again);
+        drop(permits);
+        let all: Vec<ConnectionPermit> = (0..MAX_AGENT_CONNECTIONS)
+            .map(|_| budget.try_acquire().expect("every slot is free again"))
+            .collect();
+        assert!(budget.try_acquire().is_none());
+        drop(all);
+    }
+
+    #[test]
+    fn connection_budget_clones_share_one_count() {
+        let budget = ConnectionBudget::new(MAX_LEG_CONNECTIONS);
+        let clone = budget.clone();
+        let mut permits = Vec::new();
+        for i in 0..MAX_LEG_CONNECTIONS {
+            let source = if i % 2 == 0 { &budget } else { &clone };
+            permits.push(source.try_acquire().expect("within the shared limit"));
+        }
+        assert!(budget.try_acquire().is_none(), "the original sees the clone's permits");
+        assert!(clone.try_acquire().is_none(), "the clone sees the original's permits");
+        drop(permits.pop());
+        assert!(clone.try_acquire().is_some(), "a slot freed through either is free in both");
+    }
+
+    /// Acceptor modelled on the pipe server (addendum G1): one `try_acquire`
+    /// per accepted connection, the connection's task holds the permit, a
+    /// refused connection is closed at once. The close and its log line are
+    /// the caller's (not pinned here: the seam returns `Option`).
+    #[tokio::test]
+    async fn connection_cap_ninth_concurrent_duplex_connection_closed_immediately() {
+        let replies = (0..MAX_AGENT_CONNECTIONS)
+            .map(|_| Reply::Answer(both_keys_answer()))
+            .collect();
+        let fx = fixture(&["*"], replies);
+        let budget = ConnectionBudget::new(MAX_AGENT_CONNECTIONS);
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..=MAX_AGENT_CONNECTIONS {
+            let (client, server) = duplex(1 << 16);
+            match budget.try_acquire() {
+                Some(permit) => {
+                    let upstream = fx.upstream.clone();
+                    let policy = fx.policy.clone();
+                    let sessions = fx.sessions.clone();
+                    let session_id = fx.session_id.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let _permit = permit;
+                        broker_connection(server, &upstream, &policy, &sessions, &session_id, LAUNCH_ID)
+                            .await
+                    }));
+                }
+                None => drop(server),
+            }
+            clients.push(client);
+        }
+        assert_eq!(tasks.len(), MAX_AGENT_CONNECTIONS, "exactly the cap is admitted");
+
+        let mut ninth = clients.pop().unwrap();
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(1), ninth.read_to_end(&mut received))
+            .await
+            .expect("the 9th connection is closed at once")
+            .ok();
+        assert!(received.is_empty(), "the 9th gets no bytes: {received:?}");
+
+        // All 8 admitted connections are served concurrently.
+        for (i, client) in clients.iter_mut().enumerate() {
+            client
+                .write_all(&frame(&request_identities()))
+                .await
+                .expect("write request");
+            let reply = timeout(EXCHANGE_LIMIT, read_frame(client))
+                .await
+                .unwrap_or_else(|_| panic!("connection {i} answers"));
+            assert_eq!(reply, Some(frame(&both_keys_answer())), "connection {i}");
+        }
+        assert!(budget.try_acquire().is_none(), "8 live connections hold all slots");
+
+        // Closing one admitted connection frees its slot.
+        let mut first = clients.remove(0);
+        first.shutdown().await.expect("half-close");
+        let mut trailing = Vec::new();
+        let _ = timeout(EXCHANGE_LIMIT, first.read_to_end(&mut trailing)).await;
+        let finished = tasks.remove(0);
+        timeout(EXCHANGE_LIMIT, finished)
+            .await
+            .expect("the closed connection's broker returns")
+            .expect("the broker task does not panic")
+            .ok();
+        assert!(budget.try_acquire().is_some(), "a closed connection frees its slot");
+
+        drop(clients);
+        for task in tasks {
+            let _ = timeout(EXCHANGE_LIMIT, task).await;
+        }
+    }
+
+    // --- Leg pump (Tests-first bullet 9, addendum G2: pump_leg)
+
+    /// `(box side, daemon side of the client, daemon side of the upstream,
+    /// far upstream end)`.
+    fn leg_ends() -> (DuplexStream, DuplexStream, DuplexStream, DuplexStream) {
+        let (client, client_daemon) = duplex(1 << 20);
+        let (upstream_daemon, far) = duplex(1 << 20);
+        (client, client_daemon, upstream_daemon, far)
+    }
+
+    /// An echo server on the far end: writes back what it reads, and shuts
+    /// its write side down when its read side reaches EOF.
+    async fn echo(far: DuplexStream) {
+        let (mut read, mut write) = tokio::io::split(far);
+        let _ = tokio::io::copy(&mut read, &mut write).await;
+        let _ = write.shutdown().await;
+    }
+
+    fn leg_budget() -> ConnectionBudget {
+        ConnectionBudget::new(MAX_LEG_CONNECTIONS)
+    }
+
+    #[tokio::test]
+    async fn leg_pump_echoes_bytes_both_ways() {
+        let fx = fixture(&["*"], vec![]);
+        let budget = leg_budget();
+        let permit = budget.try_acquire().expect("a slot");
+        let (mut client, client_daemon, upstream_daemon, far) = leg_ends();
+        let bulk: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let script = async {
+            client.write_all(b"SSH-2.0-test\r\n").await.expect("write");
+            let mut banner = [0u8; 14];
+            client.read_exact(&mut banner).await.expect("echoed banner");
+            assert_eq!(&banner, b"SSH-2.0-test\r\n");
+            client.write_all(&bulk).await.expect("write bulk");
+            let mut back = vec![0u8; bulk.len()];
+            client.read_exact(&mut back).await.expect("echoed bulk");
+            assert!(back == bulk, "64 KiB come back unchanged");
+            client.shutdown().await.expect("half-close");
+            let mut trailing = Vec::new();
+            let _ = client.read_to_end(&mut trailing).await;
+            trailing
+        };
+        let (result, _, trailing) = timeout(EXCHANGE_LIMIT, async {
+            tokio::join!(
+                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                echo(far),
+                script
+            )
+        })
+        .await
+        .expect("the pump ends once both directions reach EOF");
+        assert!(trailing.is_empty(), "{trailing:?}");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(budget.try_acquire().is_some(), "the permit is released when the pump returns");
+    }
+
+    #[tokio::test]
+    async fn leg_pump_propagates_eof_from_client_to_upstream() {
+        let fx = fixture(&["*"], vec![]);
+        let budget = leg_budget();
+        let permit = budget.try_acquire().expect("a slot");
+        let (mut client, client_daemon, upstream_daemon, mut far) = leg_ends();
+        let client_side = async {
+            client.write_all(b"request").await.expect("write");
+            client.shutdown().await.expect("half-close");
+            // The upstream can still answer after the client's EOF.
+            let mut received = Vec::new();
+            let _ = client.read_to_end(&mut received).await;
+            received
+        };
+        let far_side = async {
+            let mut received = Vec::new();
+            far.read_to_end(&mut received).await.expect("EOF reaches the upstream");
+            far.write_all(b"answer after eof").await.expect("write after the client's EOF");
+            far.shutdown().await.expect("upstream half-close");
+            received
+        };
+        let (_result, to_client, to_upstream) = timeout(EXCHANGE_LIMIT, async {
+            tokio::join!(
+                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                client_side,
+                far_side
+            )
+        })
+        .await
+        .expect("both directions finish");
+        assert_eq!(to_upstream, b"request", "the client's bytes, then EOF");
+        assert_eq!(to_client, b"answer after eof", "the half-closed leg still carries the answer");
+    }
+
+    #[tokio::test]
+    async fn leg_pump_propagates_eof_from_upstream_to_client() {
+        let fx = fixture(&["*"], vec![]);
+        let budget = leg_budget();
+        let permit = budget.try_acquire().expect("a slot");
+        let (mut client, client_daemon, upstream_daemon, mut far) = leg_ends();
+        let far_side = async {
+            far.write_all(b"banner").await.expect("write");
+            far.shutdown().await.expect("upstream half-close");
+            let mut received = Vec::new();
+            let _ = far.read_to_end(&mut received).await;
+            received
+        };
+        let client_side = async {
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.expect("EOF reaches the client");
+            client.write_all(b"reply after eof").await.expect("write after the upstream's EOF");
+            client.shutdown().await.expect("client half-close");
+            received
+        };
+        let (_result, to_upstream, to_client) = timeout(EXCHANGE_LIMIT, async {
+            tokio::join!(
+                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                far_side,
+                client_side
+            )
+        })
+        .await
+        .expect("both directions finish");
+        assert_eq!(to_client, b"banner", "the upstream's bytes, then EOF");
+        assert_eq!(to_upstream, b"reply after eof", "the half-closed leg still carries the reply");
+    }
+
+    #[tokio::test]
+    async fn leg_pump_revocation_tears_down_without_further_bytes() {
+        let fx = fixture(&["*"], vec![]);
+        let budget = leg_budget();
+        let permit = budget.try_acquire().expect("a slot");
+        let (mut client, client_daemon, upstream_daemon, mut far) = leg_ends();
+        let fx_ref = &fx;
+        let client_side = async {
+            client.write_all(b"ping").await.expect("write");
+            let mut pong = [0u8; 4];
+            client.read_exact(&mut pong).await.expect("echo before the revoke");
+            assert!(fx_ref.sessions.revoke(&fx_ref.session_id));
+            let revoked_at = Instant::now();
+            let mut received = Vec::new();
+            let _ = client.read_to_end(&mut received).await;
+            (revoked_at.elapsed(), received)
+        };
+        let far_side = async {
+            let mut ping = [0u8; 4];
+            far.read_exact(&mut ping).await.expect("read");
+            far.write_all(&ping).await.expect("echo");
+            // Well after the revoke: these bytes must never reach the box.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = far.write_all(b"late bytes").await;
+            let mut rest = Vec::new();
+            let _ = far.read_to_end(&mut rest).await;
+            rest
+        };
+        let (_result, (elapsed, received), _) = timeout(EXCHANGE_LIMIT, async {
+            tokio::join!(
+                pump_leg(client_daemon, upstream_daemon, permit, &fx.sessions, &fx.session_id),
+                client_side,
+                far_side
+            )
+        })
+        .await
+        .expect("revocation ends the pump and closes the upstream side");
+        assert!(received.is_empty(), "no bytes after the revoke: {received:?}");
+        assert!(elapsed < REVOKE_LIMIT, "closed {elapsed:?} after the revoke (poll is 50 ms)");
+        assert!(budget.try_acquire().is_some(), "the permit is released on teardown");
+    }
+
+    #[tokio::test]
+    async fn leg_pump_per_leg_cap_via_the_budget() {
+        let fx = fixture(&["*"], vec![]);
+        let budget = leg_budget();
+        let mut clients = Vec::new();
+        let mut pumps = Vec::new();
+        for _ in 0..MAX_LEG_CONNECTIONS {
+            let permit = budget.try_acquire().expect("within the leg cap");
+            let (client, client_daemon, upstream_daemon, far) = leg_ends();
+            let sessions = fx.sessions.clone();
+            let session_id = fx.session_id.clone();
+            tokio::spawn(echo(far));
+            pumps.push(tokio::spawn(async move {
+                pump_leg(client_daemon, upstream_daemon, permit, &sessions, &session_id).await
+            }));
+            clients.push(client);
+        }
+        assert!(budget.try_acquire().is_none(), "a 9th leg connection is refused");
+
+        for (i, client) in clients.iter_mut().enumerate() {
+            client.write_all(b"ping").await.expect("write");
+            let mut pong = [0u8; 4];
+            timeout(EXCHANGE_LIMIT, client.read_exact(&mut pong))
+                .await
+                .unwrap_or_else(|_| panic!("leg {i} pumps"))
+                .unwrap_or_else(|error| panic!("leg {i}: {error}"));
+            assert_eq!(&pong, b"ping", "leg {i}");
+        }
+
+        // One leg finishing frees exactly its slot.
+        let mut first = clients.remove(0);
+        first.shutdown().await.expect("half-close");
+        let mut trailing = Vec::new();
+        let _ = timeout(EXCHANGE_LIMIT, first.read_to_end(&mut trailing)).await;
+        timeout(EXCHANGE_LIMIT, pumps.remove(0))
+            .await
+            .expect("the finished leg's pump returns")
+            .expect("the pump task does not panic")
+            .ok();
+        let freed = budget.try_acquire().expect("a finished leg frees its slot");
+        assert!(budget.try_acquire().is_none(), "exactly one slot was freed");
+        drop(freed);
+
+        // Revocation ends the remaining legs (their clients stay open) and
+        // releases every slot.
+        assert!(fx.sessions.revoke(&fx.session_id));
+        for pump in pumps {
+            timeout(REVOKE_LIMIT, pump)
+                .await
+                .expect("revocation ends every live leg")
+                .expect("the pump task does not panic")
+                .ok();
+        }
+        let all: Vec<ConnectionPermit> = (0..MAX_LEG_CONNECTIONS)
+            .map(|_| budget.try_acquire().expect("every slot is free after teardown"))
+            .collect();
+        drop(all);
+        drop(clients);
     }
 
     #[test]
