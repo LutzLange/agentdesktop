@@ -193,7 +193,7 @@ pub struct GitConfig {
 }
 
 /// Git credential entry for a URL prefix.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitCredentialEntry {
@@ -204,6 +204,18 @@ pub struct GitCredentialEntry {
     /// Secret (password or token) for HTTP basic auth (never serialized).
     #[serde(skip_serializing)]
     pub secret: String,
+}
+
+// The secret never reaches a log or error through `{:?}` (the containing
+// configs derive Debug over this).
+impl std::fmt::Debug for GitCredentialEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitCredentialEntry")
+            .field("url_prefix", &self.url_prefix)
+            .field("username", &self.username)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Checks `daemon.containment`. With `windows == true` the executor must be an
@@ -269,10 +281,13 @@ pub fn validate_containment_startup(
         }
     }
 
-    // Validate git allow/pushAllow URLs must be https://
+    // Validate git allow/pushAllow URLs must be https:// (and parse, with a
+    // host: the relay reparses them on every request).
     if let Some(git) = &cfg.git {
         for (idx, url_str) in git.allow.iter().enumerate() {
-            if !url_str.starts_with("https://") {
+            if !Url::parse(url_str)
+                .is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
+            {
                 return Err(format!(
                     "daemon.containment.git.allow[{}] must be an https:// URL",
                     idx
@@ -280,11 +295,35 @@ pub fn validate_containment_startup(
             }
         }
         for (idx, url_str) in git.push_allow.iter().enumerate() {
-            if !url_str.starts_with("https://") {
+            if !Url::parse(url_str)
+                .is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
+            {
                 return Err(format!(
                     "daemon.containment.git.pushAllow[{}] must be an https:// URL",
                     idx
                 ));
+            }
+        }
+        // With egressUpstream the relay sends only the path to the egress
+        // endpoint, so a second host could never be told apart there: refuse
+        // more than one distinct (host, port) across both lists (DV-8).
+        if cfg.egress_upstream.is_some() {
+            let mut hosts: Vec<(String, Option<u16>)> = Vec::new();
+            for url_str in git.allow.iter().chain(&git.push_allow) {
+                if let Ok(url) = Url::parse(url_str)
+                    && let Some(host) = url.host_str()
+                {
+                    let key = (host.to_ascii_lowercase(), url.port_or_known_default());
+                    if !hosts.contains(&key) {
+                        hosts.push(key);
+                    }
+                }
+            }
+            if hosts.len() > 1 {
+                return Err(
+                    "daemon.containment.git: with egressUpstream set, git.allow and git.pushAllow must name a single host (the egress endpoint routes by path only)"
+                        .to_owned(),
+                );
             }
         }
     }
@@ -2899,5 +2938,123 @@ programs:
             json.get("engine").is_none(),
             "default engine is not serialized"
         );
+    }
+
+    /// DV-8: with egressUpstream set, git.allow + git.pushAllow must name a
+    /// single (host, port) — the egress endpoint routes by path only.
+    #[test]
+    fn containment_git_single_host_with_egress_upstream() {
+        let upstream = || {
+            Some(super::EgressUpstreamConfig {
+                url: url::Url::parse("https://egress.example.com").unwrap(),
+                authentication: None,
+            })
+        };
+        let cfg = |upstream, allow: &[&str], push_allow: &[&str]| super::ContainmentStartupConfig {
+            executor: std::path::PathBuf::from("C:\\mxc\\wxc-exec.exe"),
+            egress: super::ContainmentEgress::default(),
+            engine: super::ContainmentEngine::default(),
+            egress_upstream: upstream,
+            git: Some(super::GitConfig {
+                allow: allow.iter().map(|s| (*s).to_owned()).collect(),
+                push_allow: push_allow.iter().map(|s| (*s).to_owned()).collect(),
+                credentials: vec![],
+            }),
+        };
+        // Two hosts in allow: refused.
+        let result = super::validate_containment_startup(
+            &cfg(
+                upstream(),
+                &["https://github.com/org/", "https://gitlab.com/org/"],
+                &[],
+            ),
+            true,
+        );
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("single host")),
+            "{result:?}"
+        );
+        // A second host via pushAllow: refused too.
+        assert!(
+            super::validate_containment_startup(
+                &cfg(
+                    upstream(),
+                    &["https://github.com/org/"],
+                    &["https://gitlab.com/x/"]
+                ),
+                true,
+            )
+            .is_err()
+        );
+        // Case-insensitive host, default port: one key.
+        assert_eq!(
+            super::validate_containment_startup(
+                &cfg(
+                    upstream(),
+                    &["https://github.com/a/", "https://GitHub.com:443/b/"],
+                    &[]
+                ),
+                true,
+            ),
+            Ok(())
+        );
+        // Same host, different ports: two keys, refused.
+        assert!(
+            super::validate_containment_startup(
+                &cfg(
+                    upstream(),
+                    &["https://git.corp/", "https://git.corp:8443/"],
+                    &[]
+                ),
+                true,
+            )
+            .is_err()
+        );
+        // Without egressUpstream, two hosts stay allowed.
+        assert_eq!(
+            super::validate_containment_startup(
+                &cfg(
+                    None,
+                    &["https://github.com/org/", "https://gitlab.com/org/"],
+                    &[]
+                ),
+                true,
+            ),
+            Ok(())
+        );
+        // An entry without a host never passes (with or without upstream).
+        assert!(
+            super::validate_containment_startup(&cfg(upstream(), &["https://"], &[]), true)
+                .is_err()
+        );
+    }
+
+    /// The credential secret never reaches a `{:?}` rendering (manual Debug).
+    #[test]
+    fn git_credential_entry_debug_redacts_secret() {
+        let entry = super::GitCredentialEntry {
+            url_prefix: "https://github.com/org/".to_owned(),
+            username: "x-access-token".to_owned(),
+            secret: "sup3rs3cret-PAT".to_owned(),
+        };
+        let rendered = format!("{entry:?}");
+        assert!(!rendered.contains("sup3rs3cret-PAT"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        let containment = super::ContainmentStartupConfig {
+            executor: std::path::PathBuf::from("C:\\mxc\\wxc-exec.exe"),
+            egress: super::ContainmentEgress::default(),
+            engine: super::ContainmentEngine::default(),
+            egress_upstream: None,
+            git: Some(super::GitConfig {
+                allow: vec!["https://github.com/org/".to_owned()],
+                push_allow: vec![],
+                credentials: vec![entry],
+            }),
+        };
+        let rendered = format!("{containment:?}");
+        assert!(!rendered.contains("sup3rs3cret-PAT"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }

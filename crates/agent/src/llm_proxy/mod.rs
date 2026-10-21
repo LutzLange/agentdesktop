@@ -1779,6 +1779,15 @@ fn git_prefix_matches(prefix: &str, url: &url::Url) -> bool {
     got.len() >= wanted.len() && got[..wanted.len()] == wanted[..]
 }
 
+/// Whether a redirect target stays inside the allow entry: same scheme as the
+/// entry (a Location may not downgrade the credentialed leg, e.g.
+/// `http://host:443/…`, which the port-aware prefix match admits) and under
+/// its prefix.
+fn git_redirect_stays_in(allow_entry: &str, next: &url::Url) -> bool {
+    url::Url::parse(allow_entry).is_ok_and(|entry| entry.scheme() == next.scheme())
+        && git_prefix_matches(allow_entry, next)
+}
+
 /// How specific a configured prefix is: its path-element count, then its
 /// length (the longest-prefix rule for credential selection).
 fn git_prefix_specificity(prefix: &str) -> (usize, usize) {
@@ -2189,11 +2198,14 @@ async fn handle_git_request(
                 if !config.sessions.live(&session.id, now_unix()) {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(REVOCATION_POLL).await;
             }
         };
+        // `biased` with the revoked arm first: the revoked future checks
+        // `sessions.live` on its first poll, so a session revoked during body
+        // collect or between hops never sends anything upstream.
         let response = tokio::select! {
-            sent = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, client.request(attempt)) => sent,
+            biased;
             () = revoked => {
                 if let Some(sandbox) = log.sandbox.take() {
                     sandbox
@@ -2202,6 +2214,7 @@ async fn handle_git_request(
                 }
                 return Err(ProxyError::session_invalid());
             }
+            sent = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, client.request(attempt)) => sent,
         };
         let response = response
             .map_err(|_| {
@@ -2219,17 +2232,20 @@ async fn handle_git_request(
                 )
             })?;
         // A 503 from the egress upstream is retried exactly once (observed
-        // once in validation, assumed transient); the second surfaces.
+        // once in validation, assumed transient), except a push RPC, which
+        // is not replayed (DV-7: a replayed push is not idempotent); the
+        // second — or a push's first — surfaces.
         if config.egress_upstream.is_some()
             && response.status() == StatusCode::SERVICE_UNAVAILABLE
             && !retried_503
+            && !matches!(endpoint, GitEndpoint::PushRpc)
         {
             retried_503 = true;
             continue;
         }
         // Redirects are never relayed to the box: followed here, at most
-        // GIT_REDIRECT_HOPS hops, only while the target still matches the
-        // same allow entry.
+        // GIT_REDIRECT_HOPS hops, only while the target keeps the allow
+        // entry's scheme and prefix.
         if response.status().is_redirection() {
             let location = response
                 .headers()
@@ -2246,7 +2262,7 @@ async fn handle_git_request(
                     "agentdesktop proxy: {authority} redirected more than {GIT_REDIRECT_HOPS} times"
                 ));
             }
-            if !git_prefix_matches(allow_entry, &next) {
+            if !git_redirect_stays_in(allow_entry, &next) {
                 return refuse(format!(
                     "agentdesktop proxy: {authority} redirected outside the allowed prefix"
                 ));
@@ -4509,6 +4525,7 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
     struct Upstreamed {
         uri: String,
         headers: HeaderMap,
@@ -6637,12 +6654,13 @@ mod tests {
         ];
         let contents = crate::launch::gitconfig_contents("pairing-x", 4000, &allow, &[]);
         // One rewrite per allow entry, onto GIT_ROUTE on the loopback
-        // listener; the authority is verbatim (port only when configured).
+        // listener; the authority is verbatim (port only when configured),
+        // the value in git's quoted form.
         assert!(contents.contains(&format!(
-            "[url \"http://127.0.0.1:4000{GIT_ROUTE}/github.com/org/\"]\n\tinsteadOf = https://github.com/org/\n"
+            "[url \"http://127.0.0.1:4000{GIT_ROUTE}/github.com/org/\"]\n\tinsteadOf = \"https://github.com/org/\"\n"
         )), "{contents}");
         assert!(contents.contains(&format!(
-            "[url \"http://127.0.0.1:4000{GIT_ROUTE}/git.example.com:8443/team\"]\n\tinsteadOf = https://git.example.com:8443/team\n"
+            "[url \"http://127.0.0.1:4000{GIT_ROUTE}/git.example.com:8443/team\"]\n\tinsteadOf = \"https://git.example.com:8443/team\"\n"
         )), "{contents}");
         // ssh-form remotes of allowlisted hosts map to the refusal route.
         assert!(contents.contains(&format!(
@@ -6735,20 +6753,20 @@ mod tests {
         ];
         let contents = crate::launch::gitconfig_contents("p", 4000, &[], &identity);
         assert!(
-            contents.contains("[user]\n\tname = Dev User\n"),
+            contents.contains("[user]\n\tname = \"Dev User\"\n"),
             "{contents}"
         );
         assert!(
-            contents.contains("[user]\n\temail = dev@example.com\n"),
+            contents.contains("[user]\n\temail = \"dev@example.com\"\n"),
             "{contents}"
         );
         assert!(
-            contents.contains("[commit]\n\tgpgsign = true\n"),
+            contents.contains("[commit]\n\tgpgsign = \"true\"\n"),
             "{contents}"
         );
         // Every value of the multi-valued key is kept.
         assert!(
-            contents.contains("[safe]\n\tdirectory = C:/ws/a\n\tdirectory = C:/ws/b\n"),
+            contents.contains("[safe]\n\tdirectory = \"C:/ws/a\"\n\tdirectory = \"C:/ws/b\"\n"),
             "{contents}"
         );
         // A value that could break out of its line is dropped, not written.
@@ -6891,7 +6909,8 @@ mod tests {
                 response.into_body().collect().await.unwrap().to_bytes(),
                 "ok"
             );
-            assert_eq!(seen.lock().unwrap().len(), 4, "{:?}", seen.lock().unwrap());
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 4, "{seen:?}");
             proxy.abort();
             upstream_task.abort();
             drop(dir);
@@ -6926,7 +6945,8 @@ mod tests {
                 (status, code.as_str()),
                 (StatusCode::FORBIDDEN, "git_host_not_allowed")
             );
-            assert_eq!(seen.lock().unwrap().len(), 4, "{:?}", seen.lock().unwrap());
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 4, "{seen:?}");
             proxy.abort();
             upstream_task.abort();
             drop(dir);
@@ -6961,7 +6981,8 @@ mod tests {
                 (status, code.as_str()),
                 (StatusCode::FORBIDDEN, "git_host_not_allowed")
             );
-            assert_eq!(seen.lock().unwrap().len(), 1, "{:?}", seen.lock().unwrap());
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{seen:?}");
             proxy.abort();
             upstream_task.abort();
             drop(dir);
@@ -6996,7 +7017,8 @@ mod tests {
                 response.into_body().collect().await.unwrap().to_bytes(),
                 "ok"
             );
-            assert_eq!(seen.lock().unwrap().len(), 2, "{:?}", seen.lock().unwrap());
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{seen:?}");
             proxy.abort();
             upstream_task.abort();
             drop(dir);
@@ -7324,5 +7346,563 @@ mod tests {
                 "{prefix}"
             );
         }
+    }
+    // Delta fix-round tests (2026-10-21)
+
+    // T1a (F1): a redirect may not change the allow entry's scheme.
+    #[test]
+    fn git_redirect_stays_in_requires_same_scheme() {
+        let url = |text: &str| url::Url::parse(text).unwrap();
+        assert!(!git_redirect_stays_in(
+            "https://github.com/org/",
+            &url("http://github.com:443/org/r.git/info/refs")
+        ));
+        assert!(!git_redirect_stays_in(
+            "https://git.corp:8443/org/",
+            &url("http://git.corp:8443/org/r")
+        ));
+        assert!(git_redirect_stays_in(
+            "https://github.com/org/",
+            &url("https://github.com/org/r.git/info/refs")
+        ));
+        assert!(!git_redirect_stays_in(
+            "https://github.com/org/",
+            &url("https://github.com/other/r.git")
+        ));
+    }
+
+    // T1b (F1): a scheme-changing redirect is refused end to end, never
+    // followed (at 833e878c it was followed: 502 with the https hop attempted).
+    #[tokio::test]
+    async fn git_redirect_scheme_change_refused() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stub = upstream.local_addr().unwrap();
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = hits.clone();
+            let upstream_task = tokio::spawn(async move {
+                loop {
+                    let (socket, _) = upstream.accept().await.unwrap();
+                    let counter = counter.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(socket),
+                                service_fn(move |_request: Request<Incoming>| {
+                                    let counter = counter.clone();
+                                    async move {
+                                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        Ok::<_, Infallible>(
+                                            Response::builder()
+                                                .status(StatusCode::FOUND)
+                                                .header(
+                                                    "location",
+                                                    format!("https://{stub}/org/r.git/info/refs?service=git-upload-pack"),
+                                                )
+                                                .body(Full::new(Bytes::new()))
+                                                .unwrap(),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+            let (dir, proxy_address, _sessions, session, proxy) =
+                git_proxy(vec![format!("http://{stub}/org/")], None).await;
+            let client = http_client();
+            let response = client
+                .request(git_get(
+                    proxy_address,
+                    &format!("{stub}/org/r.git/info/refs?service=git-upload-pack"),
+                    &session.pairing,
+                ))
+                .await
+                .unwrap();
+            let (status, code, _) = refusal(response).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::FORBIDDEN, "git_host_not_allowed")
+            );
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T2a (F3, adv M3): a push to a fetch-only remote answers git's own
+    // pkt-line ERR envelope on both legs, and nothing reaches the upstream.
+    #[tokio::test]
+    async fn push_to_fetch_only_remote_answers_pkt_line_err() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, proxy_address, _sessions, session, proxy) =
+                git_proxy(vec![format!("http://{up}/org/")], None).await;
+            let client = http_client();
+            let line =
+                format!("ERR push to {up} is not allowed by daemon.containment.git.pushAllow\n");
+            let expected = format!("{:04x}{line}", line.len() + 4);
+            // Discovery leg.
+            let response = client
+                .request(git_get(
+                    proxy_address,
+                    &format!("{up}/org/r.git/info/refs?service=git-receive-pack"),
+                    &session.pairing,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "application/x-git-receive-pack-advertisement"
+            );
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                expected.as_bytes()
+            );
+            // RPC leg.
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{GIT_ROUTE}/{up}/org/r.git/git-receive-pack"
+                ))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::from_static(b"0000")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "application/x-git-receive-pack-result"
+            );
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                expected.as_bytes()
+            );
+            assert_eq!(seen.lock().unwrap().len(), 0);
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T2b (F3): a pushAllow-listed remote's push RPC reaches the upstream.
+    #[tokio::test]
+    async fn push_allowed_remote_reaches_upstream() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = request_source_state(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+            let mut config = default_config();
+            config.git = Some(agentdesktop_core::config::GitConfig {
+                allow: vec![format!("http://{up}/org/")],
+                push_allow: vec![format!("http://{up}/org/")],
+                credentials: vec![],
+            });
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "test-client");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{GIT_ROUTE}/{up}/org/r.git/git-receive-pack"
+                ))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::from_static(b"0000")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                seen.len(),
+                1,
+                "{:?}",
+                seen.iter().map(|s| &s.uri).collect::<Vec<_>>()
+            );
+            assert_eq!(seen[0].uri, "/org/r.git/git-receive-pack");
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T3 (F2, adv M1): gitconfig values are written in git's quoted form, so
+    // Windows paths, `;` and `"` survive git's value parser.
+    #[test]
+    fn gitconfig_values_are_quoted() {
+        let identity = vec![
+            (
+                "user.signingkey".to_owned(),
+                vec![r"C:\Users\dev\.ssh\id.pub".to_owned()],
+            ),
+            ("user.name".to_owned(), vec!["Max ; Mustermann".to_owned()]),
+            ("user.email".to_owned(), vec![r#"a"b@x"#.to_owned()]),
+        ];
+        let contents = crate::launch::gitconfig_contents("p", 4000, &[], &identity);
+        assert!(
+            contents.contains(r#"signingkey = "C:\\Users\\dev\\.ssh\\id.pub""#),
+            "{contents}"
+        );
+        assert!(
+            contents.contains(r#"name = "Max ; Mustermann""#),
+            "{contents}"
+        );
+        assert!(contents.contains(r#"email = "a\"b@x""#), "{contents}");
+    }
+
+    // T4 (F4, adv minor 8): a host-only allow entry maps without a `//` path.
+    #[test]
+    fn gitconfig_host_only_entry_has_no_double_slash() {
+        let allow = vec!["https://github.com".to_owned()];
+        let contents = crate::launch::gitconfig_contents("p", 4000, &allow, &[]);
+        assert!(
+            contents.contains(&format!(
+                "[url \"http://127.0.0.1:4000{GIT_ROUTE}/github.com\"]\n\tinsteadOf = \"https://github.com\"\n"
+            )),
+            "{contents}"
+        );
+        assert!(
+            !contents.contains(&format!("{GIT_ROUTE}/github.com/\"")),
+            "{contents}"
+        );
+    }
+
+    // T7 (M5b): the longest-prefix credential is selected per destination,
+    // end to end on the chained leg.
+    #[tokio::test]
+    async fn credential_selected_per_prefix_end_to_end() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, state) = request_source_state(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+            let mut config = default_config();
+            config.git = Some(agentdesktop_core::config::GitConfig {
+                allow: vec![
+                    "https://github.com/org/".to_owned(),
+                    "https://github.com/team/".to_owned(),
+                ],
+                push_allow: vec![],
+                credentials: vec![
+                    agentdesktop_core::config::GitCredentialEntry {
+                        url_prefix: "https://github.com/org/".to_owned(),
+                        username: "u1".to_owned(),
+                        secret: "s1".to_owned(),
+                    },
+                    agentdesktop_core::config::GitCredentialEntry {
+                        url_prefix: "https://github.com/org/deep/".to_owned(),
+                        username: "u2".to_owned(),
+                        secret: "s2".to_owned(),
+                    },
+                ],
+            });
+            config.egress_upstream = Some(url::Url::parse(&format!("http://{up}/")).unwrap());
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "test-client");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            for path in [
+                "github.com/team/r.git/info/refs?service=git-upload-pack",
+                "github.com/org/r.git/info/refs?service=git-upload-pack",
+                "github.com/org/deep/r.git/info/refs?service=git-upload-pack",
+            ] {
+                let response = client
+                    .request(git_get(proxy_address, path, &session.pairing))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+            }
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3);
+            let basic = |user: &str, secret: &str| {
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"))
+                )
+            };
+            assert!(
+                !seen[0].headers.contains_key(AUTHORIZATION),
+                "no entry matches /team/"
+            );
+            assert_eq!(seen[1].headers[AUTHORIZATION], basic("u1", "s1").as_str());
+            assert_eq!(seen[2].headers[AUTHORIZATION], basic("u2", "s2").as_str());
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T8 (M7b): a redirect into ANOTHER allow entry's prefix is still
+    // refused — the gate is the matched entry, not the whole allowlist.
+    #[tokio::test]
+    async fn redirect_refuses_other_allow_entry() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = redirect_upstream(1, true).await;
+            let (dir, proxy_address, _sessions, session, proxy) = git_proxy(
+                vec![
+                    format!("http://{up}/org/"),
+                    format!("http://{up}/elsewhere/"),
+                ],
+                None,
+            )
+            .await;
+            let client = http_client();
+            let response = client
+                .request(git_get(
+                    proxy_address,
+                    &format!("{up}/org/hop0/info/refs?service=git-upload-pack"),
+                    &session.pairing,
+                ))
+                .await
+                .unwrap();
+            let (status, code, _) = refusal(response).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::FORBIDDEN, "git_host_not_allowed")
+            );
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T9 (M14): an Authorization header the box sends is never forwarded.
+    #[tokio::test]
+    async fn box_authorization_never_forwarded() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, proxy_address, _sessions, session, proxy) =
+                git_proxy(vec![format!("http://{up}/org/")], None).await;
+            let client = http_client();
+            let mut request = git_get(
+                proxy_address,
+                &format!("{up}/org/r.git/info/refs?service=git-upload-pack"),
+                &session.pairing,
+            );
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                HeaderValue::from_static("Basic Ym94OmNyZWQ="),
+            );
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            assert!(
+                !seen[0].headers.contains_key(AUTHORIZATION),
+                "{:?}",
+                seen[0].headers
+            );
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T10 (M27): the loopback Host gate still guards the git route.
+    #[tokio::test]
+    async fn git_route_keeps_host_loopback_gate() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, proxy_address, _sessions, session, proxy) =
+                git_proxy(vec![format!("http://{up}/org/")], None).await;
+            let client = http_client();
+            let mut request = git_get(
+                proxy_address,
+                &format!("{up}/org/r.git/info/refs?service=git-upload-pack"),
+                &session.pairing,
+            );
+            request
+                .headers_mut()
+                .insert(HOST, HeaderValue::from_static("evil.example"));
+            let response = client.request(request).await.unwrap();
+            let (status, code, _) = refusal(response).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::FORBIDDEN, "host_not_allowed")
+            );
+            assert_eq!(seen.lock().unwrap().len(), 0);
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T11 (M28b): a git request body over the cap is refused before any
+    // upstream contact.
+    #[tokio::test]
+    async fn git_body_over_cap_refused() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, proxy_address, _sessions, session, proxy) =
+                git_proxy(vec![format!("http://{up}/org/")], None).await;
+            let client = http_client();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{GIT_ROUTE}/{up}/org/r.git/git-upload-pack"
+                ))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::from(vec![b'0'; MAX_REQUEST_BODY + 1])))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            let (status, code, _) = refusal(response).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::PAYLOAD_TOO_LARGE, "body_too_large")
+            );
+            assert_eq!(seen.lock().unwrap().len(), 0);
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T12 (M23): DV-6 — a smart-HTTP path with the wrong method is refused.
+    #[tokio::test]
+    async fn git_wrong_method_refused() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, proxy_address, _sessions, session, proxy) =
+                git_proxy(vec![format!("http://{up}/org/")], None).await;
+            let client = http_client();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{GIT_ROUTE}/{up}/org/r.git/info/refs?service=git-upload-pack"
+                ))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::from_static(b"0000")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            let (status, code, _) = refusal(response).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::FORBIDDEN, "git_host_not_allowed")
+            );
+            assert_eq!(seen.lock().unwrap().len(), 0);
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T13 (F7, DV-7): a push RPC's 503 is never retried — it surfaces on the
+    // first answer and the upstream saw exactly one request.
+    #[tokio::test]
+    async fn push_rpc_503_is_not_retried() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, hits, upstream_task) = scripted_upstream(vec![503, 200]).await;
+            let (dir, state) = request_source_state(SocketAddr::from(([127, 0, 0, 1], 0))).await;
+            let mut config = default_config();
+            config.git = Some(agentdesktop_core::config::GitConfig {
+                allow: vec!["https://github.com/org/".to_owned()],
+                push_allow: vec!["https://github.com/org/".to_owned()],
+                credentials: vec![],
+            });
+            config.egress_upstream = Some(url::Url::parse(&format!("http://{up}/")).unwrap());
+            let sessions = config.sessions.clone();
+            let session = new_session(&sessions, "test-client");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(serve(listener, state, config));
+            let client = http_client();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{GIT_ROUTE}/github.com/org/r.git/git-receive-pack"
+                ))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(Full::new(Bytes::from_static(b"0000")))
+                .unwrap();
+            let response = client.request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
+    }
+
+    // T14 (F6, adv minor 10): a session revoked while the request body is
+    // still being collected sends nothing upstream (biased select, revoked
+    // arm first).
+    /// A request body streamed from an mpsc channel (T14).
+    type ChannelBody = StreamBody<ReceiverStream<Result<Frame<Bytes>, Infallible>>>;
+
+    #[tokio::test]
+    async fn revocation_during_body_upload_sends_nothing_upstream() {
+        let (logs, _guard) = capture_logs();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (up, seen, upstream_task) = recording_upstream().await;
+            let (dir, proxy_address, sessions, session, proxy) =
+                git_proxy(vec![format!("http://{up}/org/")], None).await;
+            let client: Client<HttpConnector, ChannelBody> =
+                Client::builder(TokioExecutor::new()).build_http();
+            let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(2);
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "http://{proxy_address}{GIT_ROUTE}/{up}/org/r.git/git-upload-pack"
+                ))
+                .header(PAIRING_HEADER, &*session.pairing)
+                .body(StreamBody::new(ReceiverStream::new(rx)))
+                .unwrap();
+            let pending = tokio::spawn({
+                let client = client.clone();
+                async move { client.request(request).await.unwrap() }
+            });
+            tx.send(Ok(Frame::data(Bytes::from_static(b"0032want "))))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(sessions.revoke(&session.id));
+            let _ = tx.send(Ok(Frame::data(Bytes::from_static(b"0000")))).await;
+            drop(tx);
+            let response = pending.await.unwrap();
+            let (status, code, _) = refusal(response).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::FORBIDDEN, "pairing_invalid")
+            );
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                0,
+                "nothing reached the upstream"
+            );
+            let lines = logs.wait_for_lines(1).await;
+            let line = lines.last().unwrap();
+            assert_eq!(log_field(line, "outcome"), "canceled", "{line}");
+            proxy.abort();
+            upstream_task.abort();
+            drop(dir);
+        })
+        .await
+        .unwrap();
     }
 }

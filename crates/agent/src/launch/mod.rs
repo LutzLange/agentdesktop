@@ -994,12 +994,20 @@ async fn start_launch(
         .as_ref()
         .map(|git| git.allow.clone())
         .unwrap_or_default();
+    // The identity read spawns up to a handful of `git config` processes:
+    // off the async runtime, like the posture snapshot below.
+    let identity = {
+        let host = host.clone();
+        tokio::task::spawn_blocking(move || host.git_identity())
+            .await
+            .unwrap_or_default()
+    };
     if let Err(error) = generate_gitconfig(
         &launch_dir,
         &session.pairing,
         input.proxy_address.port(),
         &git_allow,
-        &host.git_identity(),
+        &identity,
     ) {
         return fail(&launch_dir, format!("prepare launch: {error:#}"));
     }
@@ -1420,8 +1428,14 @@ fn split_prefix_authority(entry: &str) -> Option<(&str, &str)> {
         .or_else(|| entry.strip_prefix("http://"))?;
     Some(match rest.find('/') {
         Some(index) => (&rest[..index], &rest[index..]),
-        None => (rest, "/"),
+        None => (rest, ""),
     })
+}
+
+/// A git config value in git's quoted form: `\` and `"` escaped, so `;`, `#`
+/// and Windows paths survive git's value parser.
+fn git_config_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Renders the per-launch gitconfig (AC 6): insteadOf rewrites of every
@@ -1453,7 +1467,8 @@ pub(crate) fn gitconfig_contents(
             continue;
         };
         contents.push_str(&format!(
-            "[url \"{loopback}git/{authority}{path}\"]\n\tinsteadOf = {entry}\n",
+            "[url \"{loopback}git/{authority}{path}\"]\n\tinsteadOf = {}\n",
+            git_config_quote(entry),
         ));
         let host = authority.split(':').next().unwrap_or(authority);
         if !host.is_empty() && !ssh_hosts.contains(&host) {
@@ -1474,7 +1489,7 @@ pub(crate) fn gitconfig_contents(
             if value.chars().any(char::is_control) {
                 continue;
             }
-            contents.push_str(&format!("\t{name} = {value}\n"));
+            contents.push_str(&format!("\t{name} = {}\n", git_config_quote(value)));
         }
     }
     contents

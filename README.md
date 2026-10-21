@@ -272,7 +272,8 @@ LLM clients display the message. Codes: `host_not_allowed`, `pairing_invalid`,
 `client_credential_missing`, `upgrade_not_supported`, `body_too_large`,
 `body_invalid`, `agentdesktop_credential` (no gateway credential for this device: not enrolled,
 revoked, controller unreachable or slow), `agentdesktop_unavailable`,
-`gateway_unreachable`, `gateway_timeout`.
+`gateway_unreachable`, `gateway_timeout`, and on the git/egress routes
+`git_host_not_allowed`, `git_upstream_unreachable`, `egress_not_supported`.
 
 To attach the local user's GitHub App OAuth token as well, add the App's client ID
 to the gateway configuration (keep the existing `authentication` block):
@@ -648,7 +649,7 @@ daemon:
     # engine: mxc    # the sandbox engine; `mxc` is the only value
     # git:           # git over the relay (https remotes only)
     #   allow: [https://github.com/your-org/]
-    #   pushAllow: [https://github.com/your-org/team-repo]
+    #   pushAllow: [https://github.com/your-org/team-repo.git]
     #   credentials:
     #     - urlPrefix: https://github.com/your-org/
     #       username: x-access-token
@@ -673,15 +674,25 @@ served; a remote outside `git.allow` gets `403 git_host_not_allowed`, a push to
 a remote outside `git.pushAllow` gets git's `fatal: remote error: ...`, and
 upstream redirects are followed by the daemon (at most 3, only within the same
 allow prefix). Allow entries are matched case-sensitively on the path and per
-path element; write them exactly as the remote URLs are configured. ssh remotes
+path element, so `team-repo` does not cover `team-repo.git`; use the remote
+URL exactly as cloned, or an org prefix. Request bodies on the git route are
+buffered (redirects and the retry resend them) and capped at 32 MiB; a larger
+push fails with `413 body_too_large`. ssh remotes
 of allowed hosts get a clear refusal (ssh is not available in the box yet).
 With `egressUpstream` set the relay sends the git requests to that endpoint
-(path case preserved, `Host` = the egress host, a `503` retried once) instead
+(path case preserved, `Host` = the egress host, a `503` retried once, except
+on a push) instead
 of to the remote; the central gateway's routes are then the allowlist too.
+With `egressUpstream` set, `git.allow` and `git.pushAllow` must name a single
+host: the relay sends only the path to the egress endpoint, so the gateway's
+routes for those paths must lead to that host. The daemon refuses to start
+otherwise.
 CONNECT and proxy-form requests to the listener are always refused
 (`403 egress_not_supported`); there is no generic outbound egress. The
 generated gitconfig carries the launch's session pairing and is removed with
-the launch directory.
+the launch directory. The generated gitconfig applies under `egress: allow`
+too: credentials kept in `~\.gitconfig` or a credential manager are not used
+in the box; configure `git.credentials` for private remotes.
 
 `run` needs the local LLM proxy: without `daemon.llmProxy.listen` it answers
 `409`.
