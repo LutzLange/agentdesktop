@@ -167,9 +167,11 @@ enum RevocableWrite {
 }
 
 /// Writes `bytes` to `client`, racing the write against the revocation
-/// poll: liveness is checked before the first byte (`biased`, the first tick
-/// is immediate), and a box that stops reading cannot hold the connection
-/// past a revoke.
+/// poll, so a box that stops reading cannot hold the connection past a
+/// revoke. This does NOT gate the first byte on liveness: a write that
+/// completes immediately is not interrupted — the pre-write liveness gate
+/// for secret-carrying replies is the post-round-trip check at the call
+/// site (M1 fix), which runs with no await between it and this write.
 async fn write_revocable<C>(
     client: &mut C,
     bytes: &[u8],
