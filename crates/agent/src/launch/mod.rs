@@ -504,11 +504,27 @@ pub(crate) fn plan(input: &LaunchInput, profile: &profile::ClaudeCodeProfile) ->
     }
     // AC 6: both real git user-configuration paths are denied, not granted
     // (the box reads the generated file via GIT_CONFIG_GLOBAL). Under MXC an
-    // ungranted home path is unreachable anyway, but deny explicitly,
-    // matching the denied-secrets posture; the parent (`$HOME`) always
-    // exists, so the MXC denied-path parent rule (0x80070003) is satisfied.
+    // ungranted home path is unreachable by default, but we deny explicitly,
+    // matching the denied-secrets posture. MXC's denied-path rule requires
+    // the parent directory to exist at launch time (CreateProcessSecurityEnvironment
+    // 0x80070003), else launch fails. `~/.gitconfig`'s parent ($HOME) always
+    // exists; the XDG path's parent (`~/.config/git`) may not, so we only
+    // deny it when the parent is present. Skipping the XDG deny when the
+    // parent is absent is safe: under MXC that home path is unreachable anyway.
     denied.push(join(&home, profile.git_user_config));
-    denied.push(join(&home, profile.git_xdg_config));
+    let xdg_config_path = join(&home, profile.git_xdg_config);
+    // The XDG config path's parent directory may not exist on Windows hosts
+    // without `~/.config/git`. MXC's denied-path rule requires the parent to
+    // exist (CreateProcessSecurityEnvironment 0x80070003), so we only deny
+    // the XDG config when the parent exists. Extract the parent by finding
+    // the last backslash (these are Windows `\`-joined paths, even when
+    // tested on Linux).
+    if let Some(last_sep) = xdg_config_path.rfind('\\') {
+        let parent = &xdg_config_path[..last_sep];
+        if exists(parent) {
+            denied.push(xdg_config_path);
+        }
+    }
 
     plan::LaunchPlan {
         program: input.executable.clone(),

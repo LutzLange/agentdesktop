@@ -457,8 +457,8 @@ mod handler {
             "~\\.gitconfig is denied; got {denied:?}"
         );
         assert!(
-            denied.contains(&r"C:\Users\dev\.config\git\config".to_owned()),
-            "~\\.config\\git\\config is denied whether or not it exists; got {denied:?}"
+            !denied.contains(&r"C:\Users\dev\.config\git\config".to_owned()),
+            "~\\.config\\git\\config is not denied when parent does not exist (MXC parent rule); got {denied:?}"
         );
         assert!(
             readonly.contains(

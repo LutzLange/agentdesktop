@@ -1006,7 +1006,8 @@ fn the_integrity_roots_are_protected_in_the_request() {
         r"C:\lab\agentdesktop".into(),
         r"C:\Program Files\ClaudeCode".into(),
         r"C:\Users\dev\.gitconfig".into(),
-        r"C:\Users\dev\.config\git\config".into(),
+        // XDG config is conditionally denied (only when parent exists); it's
+        // not in the default snapshot's denied list.
         format!(r"{LAUNCH_DIR}\credential"),
         format!(r"{LAUNCH_DIR}\git_config"),
         r"C:\Users\dev\.claude\.credentials.json".into(),
@@ -1367,6 +1368,47 @@ fn credential_and_ssh_style_paths_are_denied_whether_or_not_they_exist() {
             assert!(!readonly(&request).contains(&path.to_owned()), "{path}");
         }
     }
+}
+
+#[test]
+fn git_user_config_always_denied_and_xdg_config_denied_only_when_parent_exists() {
+    // PR 4 AC 6: `~/.gitconfig` is always denied (parent `$HOME` always exists).
+    // The XDG path `~/.config/git/config` is denied only when its parent
+    // `~/.config/git` exists, to satisfy MXC's denied-path parent rule.
+    let gitconfig = r"C:\Users\dev\.gitconfig";
+    let xdg_config = r"C:\Users\dev\.config\git\config";
+    let xdg_parent = r"C:\Users\dev\.config\git";
+
+    // Case 1: XDG parent directory exists.
+    let mut existing_with_parent = snapshot_existing();
+    existing_with_parent.insert(xdg_parent.to_owned());
+    let mut dirs_with_parent = snapshot_directories();
+    dirs_with_parent.insert(xdg_parent.to_owned());
+    let request_parent_exists = request_json(&existing_with_parent, &dirs_with_parent, |_| {});
+
+    assert!(
+        denied(&request_parent_exists).contains(&gitconfig.to_owned()),
+        "~/.gitconfig is always denied"
+    );
+    assert!(
+        denied(&request_parent_exists).contains(&xdg_config.to_owned()),
+        "XDG config is denied when parent exists; got {:?}",
+        denied(&request_parent_exists)
+    );
+
+    // Case 2: XDG parent directory does not exist.
+    let existing_no_parent = snapshot_existing();
+    let dirs_no_parent = snapshot_directories();
+    let request_parent_absent = request_json(&existing_no_parent, &dirs_no_parent, |_| {});
+
+    assert!(
+        denied(&request_parent_absent).contains(&gitconfig.to_owned()),
+        "~/.gitconfig is always denied even when XDG parent absent"
+    );
+    assert!(
+        !denied(&request_parent_absent).contains(&xdg_config.to_owned()),
+        "XDG config is not denied when parent does not exist (MXC parent rule)"
+    );
 }
 
 #[test]
@@ -3718,8 +3760,7 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Users\\dev\\.aws",
       "C:\\Users\\dev\\.azure",
       "C:\\Users\\dev\\.kube",
-      "C:\\Users\\dev\\.gitconfig",
-      "C:\\Users\\dev\\.config\\git\\config"
+      "C:\\Users\\dev\\.gitconfig"
     ]
   },
   "network": {
@@ -3789,8 +3830,7 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
       "C:\\Users\\dev\\.aws",
       "C:\\Users\\dev\\.azure",
       "C:\\Users\\dev\\.kube",
-      "C:\\Users\\dev\\.gitconfig",
-      "C:\\Users\\dev\\.config\\git\\config"
+      "C:\\Users\\dev\\.gitconfig"
     ]
   },
   "network": {
@@ -3805,16 +3845,22 @@ fn the_engine_reproduces_the_baseline_request_bytes() {
 }"#;
 
     // Fixture (a): both git user-configuration files exist, so the oracle
-    // covers their positions among the read-only grants.
+    // covers their positions among the read-only grants. The XDG config's
+    // parent directory also exists (required for MXC denied-path rule).
     let existing_a = {
         let mut existing = snapshot_existing();
         existing.insert(r"C:\Users\dev\.gitconfig".to_owned());
+        existing.insert(r"C:\Users\dev\.config\git".to_owned());
         existing.insert(r"C:\Users\dev\.config\git\config".to_owned());
         existing
     };
+    let directories_a = {
+        let mut dirs = snapshot_directories();
+        dirs.insert(r"C:\Users\dev\.config\git".to_owned());
+        dirs
+    };
     let exists_a = |path: &Path| existing_a.contains(path.to_str().expect("UTF-8 path"));
-    let is_dir_a =
-        |path: &Path| snapshot_directories().contains(path.to_str().expect("UTF-8 path"));
+    let is_dir_a = |path: &Path| directories_a.contains(path.to_str().expect("UTF-8 path"));
     let input_a = launch_input(&exists_a, &is_dir_a);
     let plan_a = plan(&input_a, &CLAUDE_CODE);
     let bytes_a = MxcEngine.request(&plan_a, LAUNCH_ID).unwrap();

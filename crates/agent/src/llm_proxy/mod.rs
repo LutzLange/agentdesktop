@@ -6847,7 +6847,8 @@ mod tests {
 
     #[test]
     fn gitconfig_real_paths_denied() {
-        // Denied whether or not they exist; never granted.
+        // `~/.gitconfig` is always denied (parent $HOME always exists); never granted.
+        // XDG config is only denied when its parent exists (MXC parent rule).
         for existing in [
             vec![],
             vec![
@@ -6859,19 +6860,32 @@ mod tests {
                 agentdesktop_core::config::ContainmentEgress::Deny,
                 &existing,
             );
-            for real in [
-                r"C:\Users\dev\.gitconfig",
-                r"C:\Users\dev\.config\git\config",
-            ] {
-                assert!(
-                    plan.denied.contains(&std::path::PathBuf::from(real)),
-                    "{real} denied"
-                );
-                assert!(
-                    !plan.readonly.contains(&std::path::PathBuf::from(real)),
-                    "{real} not granted"
-                );
-            }
+            // `~/.gitconfig` is always denied.
+            assert!(
+                plan.denied
+                    .contains(&std::path::PathBuf::from(r"C:\Users\dev\.gitconfig")),
+                "~/.gitconfig denied"
+            );
+            assert!(
+                !plan
+                    .readonly
+                    .contains(&std::path::PathBuf::from(r"C:\Users\dev\.gitconfig")),
+                "~/.gitconfig not granted"
+            );
+            // XDG config is not denied when parent doesn't exist (pr4_plan has
+            // is_dir returning false, so `~/.config/git` never exists).
+            assert!(
+                !plan.denied.contains(&std::path::PathBuf::from(
+                    r"C:\Users\dev\.config\git\config"
+                )),
+                "XDG config not denied when parent absent"
+            );
+            assert!(
+                !plan.readonly.contains(&std::path::PathBuf::from(
+                    r"C:\Users\dev\.config\git\config"
+                )),
+                "XDG config not granted"
+            );
             // The generated file is granted read-only: exactly the file.
             let generated = std::path::PathBuf::from(
                 r"C:\Users\dev\state\launches\0123456789abcdef\git_config",
