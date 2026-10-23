@@ -525,7 +525,10 @@ function BrowserPacCard({ device }: { device: DeviceDetail }) {
             </div>
           )}
           {device.browser_pacs.map((browser) => (
-            <div className="event-row" key={browser.browser}>
+            <div
+              className="event-row"
+              key={`${browser.browser}:${browser.packaging}`}
+            >
               <span className="event-source">
                 <span>
                   <strong>{friendlyBrowser(browser.browser)}</strong>

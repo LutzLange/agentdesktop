@@ -7,7 +7,7 @@ CREATE TABLE browser_pacs (
     locked BIGINT NOT NULL DEFAULT 0,
     source TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (device_id, browser)
+    PRIMARY KEY (device_id, browser, packaging)
 );
 
 CREATE INDEX browser_pacs_device_id_idx ON browser_pacs(device_id);

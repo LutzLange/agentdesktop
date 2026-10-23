@@ -523,7 +523,7 @@ impl Database {
                 Some(device_id) => sqlx::query_as(
                     "SELECT device_id, browser, packaging, pac_url, recommended, locked, source,
                             detail
-                     FROM browser_pacs WHERE device_id = $1 ORDER BY browser",
+                     FROM browser_pacs WHERE device_id = $1 ORDER BY browser, packaging",
                 )
                 .bind(device_id)
                 .fetch_all(&self.pool)
@@ -531,7 +531,7 @@ impl Database {
                 None => sqlx::query_as(
                     "SELECT device_id, browser, packaging, pac_url, recommended, locked, source,
                             detail
-                     FROM browser_pacs ORDER BY device_id, browser",
+                     FROM browser_pacs ORDER BY device_id, browser, packaging",
                 )
                 .fetch_all(&self.pool)
                 .await,
@@ -774,7 +774,7 @@ impl Database {
                 "INSERT INTO browser_pacs
                     (device_id, browser, packaging, pac_url, recommended, locked, source, detail)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 ON CONFLICT (device_id, browser) DO NOTHING",
+                 ON CONFLICT (device_id, browser, packaging) DO NOTHING",
             )
             .bind(device_id)
             .bind(&browser.browser)

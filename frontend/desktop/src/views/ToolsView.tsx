@@ -159,7 +159,7 @@ export function ToolsView({ discovery, unavailable }: ToolsViewProps) {
                     </span>
                   ))}
                   {browserPacs.map((browser) => (
-                    <span key={browser.browser}>
+                    <span key={`${browser.browser}:${browser.packaging ?? ""}`}>
                       {friendlyBrowser(browser.browser)}:{" "}
                       {browser.pacUrl ?? browser.detail ?? "no PAC in policy"}
                       {browser.recommended

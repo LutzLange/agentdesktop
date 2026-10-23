@@ -243,7 +243,7 @@ fn firefox_proxy(policies: &Value) -> Option<(Option<String>, bool)> {
 
 /// Chromium policy JSON: Chromium's loader accepts comments and trailing
 /// commas (`JSON_PARSE_CHROMIUM_EXTENSIONS | JSON_ALLOW_TRAILING_COMMAS`).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn read_chromium_json(file: &Path) -> Result<Value, String> {
     let contents = std::fs::read_to_string(file)
         .map_err(|error| format!("read {}: {error}", file.display()))?;
@@ -253,7 +253,7 @@ fn read_chromium_json(file: &Path) -> Result<Value, String> {
 
 /// Removes `//` and `/* */` comments, then trailing commas, outside
 /// strings, in two scans; a comma looks ahead only past whitespace.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn strip_jsonc(input: &str) -> String {
     let mut uncommented = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -338,82 +338,272 @@ fn read_json(file: &Path) -> Result<Value, String> {
 mod linux {
     use super::*;
 
-    /// A Chromium-family browser: install markers and policy roots, each with
-    /// `managed/` and `recommended/` subdirectories of JSON files.
+    /// Where one installation of a Chromium-family browser reads policy.
+    enum PolicyRoots {
+        /// Directories below the root, each with `managed/` and `recommended/`.
+        Etc(&'static [&'static str]),
+        /// A Flatpak sees no host `/etc`; policy comes from its
+        /// `<app>.Extension.*` extensions (installed or unmanaged).
+        FlatpakExtensions(&'static str),
+    }
+
+    struct ChromiumInstall {
+        marker: &'static str,
+        packaging: &'static str,
+        roots: PolicyRoots,
+    }
+
+    /// A Chromium-family browser: its installations, and every policy root
+    /// for a browser found only through its policy.
     struct Chromium {
         name: &'static str,
-        installs: &'static [(&'static str, &'static str)],
-        policy_roots: &'static [&'static str],
+        installs: &'static [ChromiumInstall],
+        all_roots: &'static [&'static str],
     }
 
     const CHROMIUM_FAMILY: &[Chromium] = &[
         Chromium {
             name: "chrome",
-            installs: &[("opt/google/chrome/chrome", "system")],
-            policy_roots: &["etc/opt/chrome/policies"],
+            installs: &[ChromiumInstall {
+                marker: "opt/google/chrome/chrome",
+                packaging: "system",
+                roots: PolicyRoots::Etc(&["etc/opt/chrome/policies"]),
+            }],
+            all_roots: &["etc/opt/chrome/policies"],
         },
         Chromium {
             name: "edge",
-            installs: &[("opt/microsoft/msedge/msedge", "system")],
-            policy_roots: &["etc/opt/edge/policies"],
+            installs: &[ChromiumInstall {
+                marker: "opt/microsoft/msedge/msedge",
+                packaging: "system",
+                roots: PolicyRoots::Etc(&["etc/opt/edge/policies"]),
+            }],
+            all_roots: &["etc/opt/edge/policies"],
         },
         Chromium {
             name: "chromium",
             installs: &[
-                ("snap/bin/chromium", "snap"),
-                ("var/lib/flatpak/app/org.chromium.Chromium", "flatpak"),
-                ("usr/bin/chromium", "system"),
-                ("usr/bin/chromium-browser", "system"),
+                // The snap's system-files interface exposes only this root.
+                ChromiumInstall {
+                    marker: "snap/bin/chromium",
+                    packaging: "snap",
+                    roots: PolicyRoots::Etc(&["etc/chromium-browser/policies"]),
+                },
+                ChromiumInstall {
+                    marker: "var/lib/flatpak/app/org.chromium.Chromium",
+                    packaging: "flatpak",
+                    roots: PolicyRoots::FlatpakExtensions("org.chromium.Chromium"),
+                },
+                // Debian, Arch.
+                ChromiumInstall {
+                    marker: "usr/bin/chromium",
+                    packaging: "system",
+                    roots: PolicyRoots::Etc(&["etc/chromium/policies"]),
+                },
+                // The root differs by distribution (Fedora /etc/chromium, older
+                // Ubuntu packages /etc/chromium-browser); on current Ubuntu this
+                // binary only launches the snap and is skipped next to it.
+                ChromiumInstall {
+                    marker: "usr/bin/chromium-browser",
+                    packaging: "system",
+                    roots: PolicyRoots::Etc(&[
+                        "etc/chromium/policies",
+                        "etc/chromium-browser/policies",
+                    ]),
+                },
             ],
-            // The snap reads /etc/chromium-browser/policies.
-            policy_roots: &["etc/chromium/policies", "etc/chromium-browser/policies"],
+            all_roots: &["etc/chromium/policies", "etc/chromium-browser/policies"],
         },
     ];
 
-    const FIREFOX_INSTALLS: &[(&str, &str)] = &[
-        ("snap/bin/firefox", "snap"),
-        ("var/lib/flatpak/app/org.mozilla.firefox", "flatpak"),
-        ("usr/lib/firefox/firefox", "system"),
-        ("usr/lib64/firefox/firefox", "system"),
-        ("opt/firefox/firefox", "system"),
+    /// Where one installation of Firefox reads `policies.json`.
+    enum FirefoxPolicy {
+        /// `/etc/firefox/policies/policies.json` when it exists, otherwise
+        /// the installation's `distribution/` file, never both (Firefox's
+        /// `_getLocalConfigurationFile`).
+        Files { distribution: Option<&'static str> },
+        /// Not read: a Flatpak doesn't see the host's policy files.
+        NotRead,
+    }
+
+    struct FirefoxInstall {
+        marker: &'static str,
+        packaging: &'static str,
+        policy: FirefoxPolicy,
+    }
+
+    const FIREFOX_INSTALLS: &[FirefoxInstall] = &[
+        FirefoxInstall {
+            marker: "snap/bin/firefox",
+            packaging: "snap",
+            policy: FirefoxPolicy::Files { distribution: None },
+        },
+        FirefoxInstall {
+            marker: "var/lib/flatpak/app/org.mozilla.firefox",
+            packaging: "flatpak",
+            policy: FirefoxPolicy::NotRead,
+        },
+        FirefoxInstall {
+            marker: "usr/lib/firefox/firefox",
+            packaging: "system",
+            policy: FirefoxPolicy::Files {
+                distribution: Some("usr/lib/firefox/distribution/policies.json"),
+            },
+        },
+        FirefoxInstall {
+            marker: "usr/lib64/firefox/firefox",
+            packaging: "system",
+            policy: FirefoxPolicy::Files {
+                distribution: Some("usr/lib64/firefox/distribution/policies.json"),
+            },
+        },
+        FirefoxInstall {
+            marker: "opt/firefox/firefox",
+            packaging: "tarball",
+            policy: FirefoxPolicy::Files {
+                distribution: Some("opt/firefox/distribution/policies.json"),
+            },
+        },
     ];
 
-    /// Firefox policy files in Firefox's own order: it uses
-    /// `/etc/firefox/policies/policies.json` when that file exists (read by
-    /// the deb and the snap) and otherwise the install's `distribution/`
-    /// file, never both.
-    const FIREFOX_POLICY_FILES: &[&str] = &[
-        "etc/firefox/policies/policies.json",
-        "usr/lib/firefox/distribution/policies.json",
-        "usr/lib64/firefox/distribution/policies.json",
-        "opt/firefox/distribution/policies.json",
-    ];
+    const FIREFOX_SYSTEM_POLICY: &str = "etc/firefox/policies/policies.json";
 
+    /// One row per installation found; a browser with policy but no
+    /// installation found gets one row from all its policy locations.
     pub(super) fn discover(root: &Path) -> Vec<BrowserPac> {
-        let mut browsers: Vec<BrowserPac> = CHROMIUM_FAMILY
-            .iter()
-            .filter_map(|browser| chromium(root, browser))
-            .collect();
-        browsers.extend(firefox(root));
+        let mut browsers = Vec::new();
+        for browser in CHROMIUM_FAMILY {
+            let mut installs = installed(root, browser.installs, |install| install.marker);
+            // On current Ubuntu /usr/bin/chromium-browser just launches the snap.
+            if installs.iter().any(|install| install.packaging == "snap") {
+                installs.retain(|install| install.marker != "usr/bin/chromium-browser");
+            }
+            dedupe_packaging(&mut installs, |install| install.packaging);
+            if installs.is_empty() {
+                let roots = browser
+                    .all_roots
+                    .iter()
+                    .map(|roots| root.join(roots))
+                    .collect();
+                browsers.extend(chromium(browser.name, "", roots, true));
+            }
+            for install in installs {
+                let roots = match &install.roots {
+                    PolicyRoots::Etc(roots) => roots.iter().map(|roots| root.join(roots)).collect(),
+                    PolicyRoots::FlatpakExtensions(app) => flatpak_policy_roots(root, app),
+                };
+                browsers.extend(chromium(browser.name, install.packaging, roots, false));
+            }
+        }
+        let mut installs = installed(root, FIREFOX_INSTALLS, |install| install.marker);
+        dedupe_packaging(&mut installs, |install| install.packaging);
+        if installs.is_empty() {
+            browsers.extend(firefox(
+                root,
+                "",
+                &FirefoxPolicy::Files { distribution: None },
+                true,
+            ));
+        }
+        for install in installs {
+            browsers.extend(firefox(root, install.packaging, &install.policy, false));
+        }
         browsers
+    }
+
+    fn installed<'a, T>(root: &Path, installs: &'a [T], marker: impl Fn(&T) -> &str) -> Vec<&'a T> {
+        installs
+            .iter()
+            .filter(|install| root.join(marker(install)).exists())
+            .collect()
+    }
+
+    /// The first installation per packaging label (one row each).
+    fn dedupe_packaging<T>(installs: &mut Vec<&T>, packaging: impl Fn(&T) -> &str) {
+        let mut seen = Vec::new();
+        installs.retain(|install| {
+            let label = packaging(install).to_owned();
+            if seen.contains(&label) {
+                return false;
+            }
+            seen.push(label);
+            true
+        });
+    }
+
+    /// `<extension>/policies` directories of a Flatpak app's
+    /// `<app>.Extension.*` extensions: installed ones under
+    /// `var/lib/flatpak/runtime/<id>/<arch>/<branch>/active/files` and
+    /// unmanaged ones under `var/lib/flatpak/extension/<id>/<arch>/<version>`.
+    fn flatpak_policy_roots(root: &Path, app: &str) -> Vec<PathBuf> {
+        let prefix = format!("{app}.Extension.");
+        let children = |directory: &Path| -> Vec<PathBuf> {
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            paths.sort();
+            paths
+        };
+        let extensions = |base: &str| -> Vec<PathBuf> {
+            children(&root.join(base))
+                .into_iter()
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&prefix))
+                })
+                .collect()
+        };
+        let mut roots = Vec::new();
+        for extension in extensions("var/lib/flatpak/runtime") {
+            for arch in children(&extension) {
+                for branch in children(&arch) {
+                    roots.push(branch.join("active/files/policies"));
+                }
+            }
+        }
+        for extension in extensions("var/lib/flatpak/extension") {
+            for arch in children(&extension) {
+                for version in children(&arch) {
+                    roots.push(version.join("policies"));
+                }
+            }
+        }
+        roots
     }
 
     pub(super) fn policy_directories(root: &Path) -> Vec<PathBuf> {
         let mut directories: Vec<PathBuf> = CHROMIUM_FAMILY
             .iter()
-            .flat_map(|browser| browser.policy_roots.iter())
-            .flat_map(|policies| {
-                ["managed", "recommended"].map(|level| root.join(policies).join(level))
-            })
+            .flat_map(|browser| browser.all_roots.iter())
+            .map(|roots| root.join(roots))
+            .chain(flatpak_policy_roots(root, "org.chromium.Chromium"))
+            .flat_map(|policies| ["managed", "recommended"].map(|level| policies.join(level)))
             .collect();
+        directories.push(root.join("var/lib/flatpak/extension"));
         directories.extend(
-            FIREFOX_POLICY_FILES
+            FIREFOX_INSTALLS
                 .iter()
+                .filter_map(|install| match install.policy {
+                    FirefoxPolicy::Files { distribution } => distribution,
+                    FirefoxPolicy::NotRead => None,
+                })
+                .chain([FIREFOX_SYSTEM_POLICY])
                 .filter_map(|file| root.join(file).parent().map(Path::to_path_buf)),
         );
-        // A directory an MDM creates later is caught through its nearest
-        // existing parent below /etc; the rescan then watches it directly.
-        let stop = [root.join("etc"), root.to_path_buf()];
+        // A directory created later is caught through its nearest existing
+        // parent; the rescan then watches it directly. Directories as broad
+        // as /etc, /var/lib or the root are never watched.
+        let stop = [
+            root.join("etc"),
+            root.join("var/lib"),
+            root.join("var"),
+            root.to_path_buf(),
+        ];
         let mut watched: Vec<PathBuf> = directories
             .into_iter()
             .filter_map(|directory| {
@@ -429,29 +619,24 @@ mod linux {
         watched
     }
 
-    fn packaging(root: &Path, installs: &[(&str, &'static str)]) -> Option<&'static str> {
-        installs
-            .iter()
-            .find(|(path, _)| root.join(path).exists())
-            .map(|(_, packaging)| *packaging)
-    }
-
-    fn chromium(root: &Path, browser: &Chromium) -> Option<BrowserPac> {
-        let packaging = packaging(root, browser.installs);
+    /// One row for one installation (or `policy_only`: a row only when some
+    /// policy is found), reading `roots`.
+    fn chromium(
+        name: &str,
+        packaging: &str,
+        roots: Vec<PathBuf>,
+        policy_only: bool,
+    ) -> Option<BrowserPac> {
         let mut row = BrowserPac {
-            browser: browser.name.to_owned(),
-            packaging: packaging.unwrap_or_default().to_owned(),
+            browser: name.to_owned(),
+            packaging: packaging.to_owned(),
             ..BrowserPac::default()
         };
         // Managed policy wins; recommended policy is user-overridable.
         let mut found_policy = false;
         let mut unreadable = Vec::new();
         for (level, recommended) in [("managed", false), ("recommended", true)] {
-            let directories: Vec<PathBuf> = browser
-                .policy_roots
-                .iter()
-                .map(|policies| root.join(policies).join(level))
-                .collect();
+            let directories: Vec<PathBuf> = roots.iter().map(|roots| roots.join(level)).collect();
             match chromium_level(&directories, &mut unreadable) {
                 Ok(None) => continue,
                 Ok(Some((policy, source))) => {
@@ -471,7 +656,7 @@ mod linux {
             found_policy = true;
         }
         row.detail = row.detail.map(crate::reconcile::truncate_detail);
-        (packaging.is_some() || found_policy).then_some(row)
+        (!policy_only || found_policy).then_some(row)
     }
 
     /// Reads every `*.json` in the directories of one level and merges the
@@ -558,18 +743,32 @@ mod linux {
         Ok(chromium_proxy(&policy).map(|policy| (policy, source)))
     }
 
-    fn firefox(root: &Path) -> Option<BrowserPac> {
-        let packaging = packaging(root, FIREFOX_INSTALLS);
+    /// One row for one installation (or `policy_only`: a row only when a
+    /// Proxy policy is found).
+    fn firefox(
+        root: &Path,
+        packaging: &str,
+        policy: &FirefoxPolicy,
+        policy_only: bool,
+    ) -> Option<BrowserPac> {
         let mut row = BrowserPac {
             browser: "firefox".to_owned(),
-            packaging: packaging.unwrap_or_default().to_owned(),
+            packaging: packaging.to_owned(),
             ..BrowserPac::default()
+        };
+        let distribution = match policy {
+            FirefoxPolicy::NotRead => {
+                row.detail = Some("policy of the Flatpak build is not read".to_owned());
+                return Some(row);
+            }
+            FirefoxPolicy::Files { distribution } => distribution,
         };
         let mut found_policy = false;
         // Only the file Firefox uses; a Proxy section in a file it ignores
         // must not count.
-        if let Some(file) = FIREFOX_POLICY_FILES
-            .iter()
+        if let Some(file) = [Some(FIREFOX_SYSTEM_POLICY), *distribution]
+            .into_iter()
+            .flatten()
             .map(|file| root.join(file))
             .find(|file| file.is_file())
         {
@@ -588,7 +787,7 @@ mod linux {
                 }
             }
         }
-        (packaging.is_some() || found_policy).then_some(row)
+        (!policy_only || found_policy).then_some(row)
     }
 
     #[cfg(test)]
@@ -924,6 +1123,118 @@ mod linux {
         }
 
         #[test]
+        fn each_installation_reads_only_its_own_policy() {
+            let pac = |url: &str| {
+                format!(r#"{{"ProxySettings":{{"ProxyMode":"pac_script","ProxyPacUrl":"{url}"}}}}"#)
+            };
+            let firefox = |url: &str| {
+                format!(
+                    r#"{{"policies":{{"Proxy":{{"Mode":"autoConfig","AutoConfigURL":"{url}","Locked":true}}}}}}"#
+                )
+            };
+            let root = temp_root("installs");
+            // Snap Chromium with stale policy from an earlier system package.
+            write(&root, "snap/bin/chromium", "");
+            write(
+                &root,
+                "etc/chromium-browser/policies/managed/p.json",
+                &pac(PAC),
+            );
+            write(
+                &root,
+                "etc/chromium/policies/managed/old.json",
+                &pac("http://stale/p.pac"),
+            );
+            // Ubuntu's chromium-browser wrapper launches the snap: no row.
+            write(&root, "usr/bin/chromium-browser", "");
+            // Flatpak Chromium: host /etc is not visible, only its extensions.
+            write(
+                &root,
+                "var/lib/flatpak/app/org.chromium.Chromium/current",
+                "",
+            );
+            write(
+                &root,
+                "var/lib/flatpak/extension/org.chromium.Chromium.Extension.corp/x86_64/1/policies/managed/p.json",
+                &pac("http://flatpak/p.pac"),
+            );
+            // Tarball Firefox in /opt, with a leftover file of a removed package.
+            write(&root, "opt/firefox/firefox", "");
+            write(
+                &root,
+                "opt/firefox/distribution/policies.json",
+                &firefox(PAC),
+            );
+            write(
+                &root,
+                "usr/lib/firefox/distribution/policies.json",
+                &firefox("http://stale/p.pac"),
+            );
+            // Flatpak Firefox is reported, its policy not read.
+            write(&root, "var/lib/flatpak/app/org.mozilla.firefox/current", "");
+
+            let rows: Vec<(String, String, Option<String>)> = discover(&root)
+                .into_iter()
+                .map(|row| (row.browser, row.packaging, row.pac_url))
+                .collect();
+            let row = |browser: &str, packaging: &str, url: Option<&str>| {
+                (
+                    browser.to_owned(),
+                    packaging.to_owned(),
+                    url.map(str::to_owned),
+                )
+            };
+            assert_eq!(
+                rows,
+                vec![
+                    row("chromium", "snap", Some(PAC)),
+                    row("chromium", "flatpak", Some("http://flatpak/p.pac")),
+                    row("firefox", "flatpak", None),
+                    row("firefox", "tarball", Some(PAC)),
+                ]
+            );
+            let flatpak_firefox = discover(&root)
+                .into_iter()
+                .find(|row| row.browser == "firefox" && row.packaging == "flatpak")
+                .unwrap();
+            assert_eq!(
+                flatpak_firefox.detail.as_deref(),
+                Some("policy of the Flatpak build is not read")
+            );
+
+            // /etc/firefox/policies overrides every installation's own file.
+            write(
+                &root,
+                "etc/firefox/policies/policies.json",
+                &firefox("http://global/p.pac"),
+            );
+            let tarball = discover(&root)
+                .into_iter()
+                .find(|row| row.packaging == "tarball")
+                .unwrap();
+            assert_eq!(tarball.pac_url.as_deref(), Some("http://global/p.pac"));
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn policy_without_an_installation_is_one_row_from_all_locations() {
+            let root = temp_root("policyonly");
+            write(
+                &root,
+                "etc/chromium/policies/managed/p.json",
+                &format!(
+                    r#"{{"ProxySettings":{{"ProxyMode":"pac_script","ProxyPacUrl":"{PAC}"}}}}"#
+                ),
+            );
+            let browsers = discover(&root);
+            assert_eq!(browsers.len(), 1);
+            assert_eq!(browsers[0].browser, "chromium");
+            assert_eq!(browsers[0].packaging, "");
+            assert_eq!(browsers[0].pac_url.as_deref(), Some(PAC));
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn policy_directories_are_the_existing_ones() {
             let root = temp_root("dirs");
             write(&root, "etc/opt/chrome/policies/managed/a.json", "{}");
@@ -1106,21 +1417,33 @@ mod windows_policy {
         },
     ];
 
-    const FIREFOX_INSTALLS: &[KnownPath] = &[
-        ("ProgramFiles", r"Mozilla Firefox\firefox.exe"),
-        ("ProgramFiles(x86)", r"Mozilla Firefox\firefox.exe"),
+    /// A Firefox installation: its binary, the `policies.json` it reads, and
+    /// its packaging label (one row each).
+    struct FirefoxInstall {
+        binary: KnownPath,
+        policy_file: KnownPath,
+        packaging: &'static str,
+    }
+
+    const FIREFOX_INSTALLS: &[FirefoxInstall] = &[
+        FirefoxInstall {
+            binary: ("ProgramFiles", r"Mozilla Firefox\firefox.exe"),
+            policy_file: (
+                "ProgramFiles",
+                r"Mozilla Firefox\distribution\policies.json",
+            ),
+            packaging: "system",
+        },
+        FirefoxInstall {
+            binary: ("ProgramFiles(x86)", r"Mozilla Firefox\firefox.exe"),
+            policy_file: (
+                "ProgramFiles(x86)",
+                r"Mozilla Firefox\distribution\policies.json",
+            ),
+            packaging: "x86",
+        },
     ];
     const FIREFOX_POLICY_KEY: &str = r"SOFTWARE\Policies\Mozilla\Firefox\Proxy";
-    const FIREFOX_POLICY_FILES: &[KnownPath] = &[
-        (
-            "ProgramFiles",
-            r"Mozilla Firefox\distribution\policies.json",
-        ),
-        (
-            "ProgramFiles(x86)",
-            r"Mozilla Firefox\distribution\policies.json",
-        ),
-    ];
 
     /// Machine policy first, then user policy; managed before recommended
     /// (the `Recommended` subkey is user-overridable).
@@ -1154,7 +1477,31 @@ mod windows_policy {
             .iter()
             .filter_map(|browser| chromium(registry, &existing, hives, browser))
             .collect();
-        browsers.extend(firefox(registry, &existing, hives));
+        let installs: Vec<&FirefoxInstall> = FIREFOX_INSTALLS
+            .iter()
+            .filter(|install| existing(install.binary).is_some())
+            .collect();
+        if installs.is_empty() {
+            // Policy without an installation found: one row, only when some
+            // policy is set.
+            let files: Vec<KnownPath> = FIREFOX_INSTALLS
+                .iter()
+                .map(|install| install.policy_file)
+                .collect();
+            browsers.extend(
+                firefox(registry, &existing, hives, "", &files)
+                    .filter(|row| row.source.is_some() || row.detail.is_some()),
+            );
+        }
+        for install in installs {
+            browsers.extend(firefox(
+                registry,
+                &existing,
+                hives,
+                install.packaging,
+                &[install.policy_file],
+            ));
+        }
         browsers
     }
 
@@ -1227,22 +1574,18 @@ mod windows_policy {
         Ok(chromium_proxy(&policy))
     }
 
-    /// Registry policy first, then `policies.json` in the install directory.
+    /// Registry policy first (it wins over `policies.json` per top-level
+    /// policy), then the installation's own `policies.json`.
     fn firefox(
         registry: &impl Registry,
         existing: &impl Fn(KnownPath) -> Option<PathBuf>,
         hives: &[Hive],
+        packaging: &str,
+        policy_files: &[KnownPath],
     ) -> Option<BrowserPac> {
-        let installed = FIREFOX_INSTALLS
-            .iter()
-            .any(|known| existing(*known).is_some());
         let mut row = BrowserPac {
             browser: "firefox".to_owned(),
-            packaging: if installed {
-                "system".to_owned()
-            } else {
-                String::new()
-            },
+            packaging: packaging.to_owned(),
             ..BrowserPac::default()
         };
         for &hive in hives {
@@ -1269,10 +1612,7 @@ mod windows_policy {
             )));
             return Some(row);
         }
-        for file in FIREFOX_POLICY_FILES
-            .iter()
-            .filter_map(|known| existing(*known))
-        {
+        for file in policy_files.iter().filter_map(|known| existing(*known)) {
             match read_json(&file) {
                 Ok(value) => {
                     let Some((pac_url, locked)) = firefox_proxy(&value) else {
@@ -1286,7 +1626,7 @@ mod windows_policy {
             row.source = Some(file);
             return Some(row);
         }
-        installed.then_some(row)
+        Some(row)
     }
 
     #[cfg(test)]
@@ -1461,6 +1801,55 @@ mod windows_policy {
             assert_eq!(chrome.pac_url, None);
             assert!(chrome.detail.as_deref().unwrap().contains("ProxySettings"));
             assert!(browsers.iter().all(|row| row.browser != "firefox"));
+        }
+
+        #[test]
+        fn firefox_rows_per_installation_with_registry_precedence() {
+            let json = |url: &str| {
+                format!(
+                    r#"{{"policies":{{"Proxy":{{"Mode":"autoConfig","AutoConfigURL":"{url}","Locked":true}}}}}}"#
+                )
+            };
+            let dir = std::env::temp_dir()
+                .join(format!("agentdesktop-win-firefox-{}", std::process::id()));
+            let x64 = dir.join("x64.json");
+            let x86 = dir.join("x86.json");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&x64, json("http://stale/p.pac")).unwrap();
+            std::fs::write(&x86, json(PAC)).unwrap();
+            // Only the x86 install exists; the 64-bit directory holds a
+            // leftover policies.json.
+            let existing = |known: KnownPath| match known {
+                ("ProgramFiles(x86)", path) if path.ends_with("firefox.exe") => {
+                    Some(PathBuf::from(path))
+                }
+                ("ProgramFiles(x86)", path) if path.ends_with("policies.json") => Some(x86.clone()),
+                ("ProgramFiles", path) if path.ends_with("policies.json") => Some(x64.clone()),
+                _ => None,
+            };
+            let rows = discover(&FakeRegistry::default(), existing, false);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].packaging, "x86");
+            assert_eq!(rows[0].pac_url.as_deref(), Some(PAC));
+            assert_eq!(rows[0].source.as_deref(), Some(x86.as_path()));
+
+            // Registry policy wins over the installation's file.
+            let registry = FakeRegistry::default()
+                .set(
+                    Hive::LocalMachine,
+                    FIREFOX_POLICY_KEY,
+                    "Mode",
+                    s("autoConfig"),
+                )
+                .set(
+                    Hive::LocalMachine,
+                    FIREFOX_POLICY_KEY,
+                    "AutoConfigURL",
+                    s("http://gpo/p.pac"),
+                );
+            let rows = discover(&registry, existing, false);
+            assert_eq!(rows[0].pac_url.as_deref(), Some("http://gpo/p.pac"));
+            std::fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]

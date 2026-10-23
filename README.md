@@ -856,17 +856,24 @@ with its URL, one value per device (`differs` when browsers disagree).
 `agentdesktop discover`, the desktop app and the controller's device pages show
 it.
 
-It reads:
+It reports one row per browser installation found, each read from the policy
+that installation uses:
 
-- Linux: Chrome, Edge and Chromium policy JSON under `/etc/opt/chrome`,
-  `/etc/opt/edge`, `/etc/chromium` and `/etc/chromium-browser` (`managed/` and
-  `recommended/`), and Firefox `policies.json` under `/etc/firefox/policies`
-  and the install's `distribution/` directory.
+- Linux: Chrome and Edge policy JSON under `/etc/opt/chrome` and `/etc/opt/edge`
+  (`managed/` and `recommended/`). Chromium per packaging: the snap reads
+  `/etc/chromium-browser`, `/usr/bin/chromium` `/etc/chromium`, a native
+  `/usr/bin/chromium-browser` both (the path varies by distribution), the
+  Flatpak only its
+  `org.chromium.Chromium.Extension.*` extensions. Firefox reads
+  `/etc/firefox/policies/policies.json` when it exists, otherwise the
+  installation's `distribution/policies.json`; the Flatpak's policy is not read.
 - Windows: Chrome and Edge policy under `HKLM\SOFTWARE\Policies\…` (`ProxySettings`,
   or the legacy `ProxyMode` and `ProxyPacUrl`; the `Recommended` subkey counts as
-  user-overridable), Firefox under `HKLM\SOFTWARE\Policies\Mozilla\Firefox\Proxy`
-  or the install's `distribution\policies.json`. Per-user policy (`HKCU`) is
-  read only when the daemon runs as the user (`--user`).
+  user-overridable), Firefox under `HKLM\SOFTWARE\Policies\Mozilla\Firefox\Proxy`,
+  otherwise each installation's `distribution\policies.json`. Per-user policy
+  (`HKCU`) is read only when the daemon runs as the user (`--user`).
+- A browser with policy but no installation found is one row from all its
+  policy locations.
 - macOS: not yet.
 
 It sends the browser name, packaging, PAC URL, whether the value is
