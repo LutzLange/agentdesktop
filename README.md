@@ -861,10 +861,9 @@ that installation uses:
 
 - Linux: Chrome and Edge policy JSON under `/etc/opt/chrome` and `/etc/opt/edge`
   (`managed/` and `recommended/`). Chromium per packaging: the snap reads
-  `/etc/chromium-browser`, `/usr/bin/chromium` `/etc/chromium`, a native
+  `/etc/chromium-browser`, `/usr/bin/chromium` reads `/etc/chromium`, a native
   `/usr/bin/chromium-browser` both (the path varies by distribution), the
-  Flatpak only its
-  `org.chromium.Chromium.Extension.*` extensions. Firefox reads
+  Flatpak only its `org.chromium.Chromium.Extension.*` extensions. Firefox reads
   `/etc/firefox/policies/policies.json` when it exists, otherwise the
   installation's `distribution/policies.json`; the Flatpak's policy is not read.
 - Windows: Chrome and Edge policy under `HKLM\SOFTWARE\Policies\…` (`ProxySettings`,
