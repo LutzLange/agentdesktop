@@ -90,7 +90,7 @@ impl Provider for ClaudeDesktop {
 ///
 /// On Windows Claude Desktop reads its managed configuration from the
 /// `HKLM\SOFTWARE\Policies\Claude` registry key, never from a file, so the
-/// reconciler targets that key and only removes what an earlier Agentdesktop
+/// reconciler targets that key and only removes what an earlier agentdesktop
 /// wrote at this path.
 #[cfg(not(target_os = "macos"))]
 pub fn default_claude_desktop_managed_settings_path() -> PathBuf {

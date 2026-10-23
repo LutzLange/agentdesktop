@@ -147,7 +147,7 @@ pub struct UsageStartupConfig {
 pub struct ClaudeDesktopStartupConfig {
     /// Configuration file. On Windows the managed settings live in the
     /// policy registry key instead, and this file is only removed when an
-    /// earlier Agentdesktop wrote it.
+    /// earlier agentdesktop wrote it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<PathBuf>,
     /// Credential helper path.

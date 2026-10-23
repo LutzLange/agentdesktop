@@ -209,6 +209,7 @@ impl Reconciler {
                 inactive: None,
                 paths: Vec::new(),
                 operations: 0..0,
+                registry_operations: 0..0,
             };
             match provider.plan(&self.context, &config) {
                 Err(error) => {
@@ -222,6 +223,7 @@ impl Reconciler {
                     entry.inactive = summary.inactive;
                     entry.paths = summary.paths;
                     let start = plan.operation_count();
+                    let registry_start = plan.registry_operation_count();
                     if let Err((error, path)) = plan.append_attributed(own) {
                         // Both programs of the disagreement fail.
                         for other in entries
@@ -234,6 +236,7 @@ impl Reconciler {
                         first_error.get_or_insert(error);
                     }
                     entry.operations = start..plan.operation_count();
+                    entry.registry_operations = registry_start..plan.registry_operation_count();
                 }
             }
             entries.push(entry);
@@ -503,6 +506,9 @@ struct ProgramEntry {
     inactive: Option<String>,
     paths: Vec<PathBuf>,
     operations: std::ops::Range<usize>,
+    /// This program's registry key plans within the appended plan, applied
+    /// after every program's file operations.
+    registry_operations: std::ops::Range<usize>,
 }
 
 impl ProgramEntry {
@@ -554,16 +560,18 @@ impl AttributedPlan {
             match plan.apply_tracked() {
                 Ok(()) => (Ok(()), Stop::Completed),
                 Err((error, at)) => {
+                    // Registry changes apply after every file operation.
+                    let (written_files, written_registry) = match &at {
+                        plan::ApplyStop::Operation(index) => (*index, 0),
+                        #[cfg(windows)]
+                        plan::ApplyStop::Registry(index, _) => (usize::MAX, *index),
+                        _ => (0, 0),
+                    };
                     let stop = Stop::Failed {
                         owners: owners_of(&entries, &at),
                         detail: format!("{error:#}"),
-                        written: match at {
-                            plan::ApplyStop::Operation(index) => index,
-                            // Registry changes apply after every file operation.
-                            #[cfg(windows)]
-                            plan::ApplyStop::Registry(_) => usize::MAX,
-                            _ => 0,
-                        },
+                        written_files,
+                        written_registry,
                     };
                     (Err(error), stop)
                 }
@@ -601,7 +609,14 @@ impl AttributedPlan {
                     let written = match &stop {
                         Stop::Completed => true,
                         Stop::BeforeWrites => false,
-                        Stop::Failed { written, .. } => entry.operations.end <= *written,
+                        Stop::Failed {
+                            written_files,
+                            written_registry,
+                            ..
+                        } => {
+                            entry.operations.end <= *written_files
+                                && entry.registry_operations.end <= *written_registry
+                        }
                     };
                     entry.settled(written, &blocked_by)?
                 };
@@ -624,12 +639,14 @@ enum Stop {
     Completed,
     /// Refused before any write (a failed plan or a conflict).
     BeforeWrites,
-    /// Stopped while applying: `owners` failed, the first `written`
-    /// operations reached the disk.
+    /// Stopped while applying: `owners` failed, the first `written_files`
+    /// file operations and the first `written_registry` registry key plans
+    /// were applied.
     Failed {
         owners: Vec<&'static str>,
         detail: String,
-        written: usize,
+        written_files: usize,
+        written_registry: usize,
     },
 }
 
@@ -641,7 +658,7 @@ fn owners_of(entries: &[ProgramEntry], at: &plan::ApplyStop) -> Vec<&'static str
             plan::ApplyStop::Conflict => false,
             plan::ApplyStop::Observed(path) => entry.paths.contains(path),
             #[cfg(windows)]
-            plan::ApplyStop::Registry(path) => entry.paths.contains(path),
+            plan::ApplyStop::Registry(_, path) => entry.paths.contains(path),
             plan::ApplyStop::PrivateDir(dir) => {
                 entry.paths.iter().any(|path| path.starts_with(dir))
             }
@@ -1411,16 +1428,14 @@ programs:
         );
     }
 
-    /// A registry write failure after the file operations: the failure is
-    /// attributed to Claude Desktop through `ApplyStop::Registry`, and the
-    /// file operations — all applied before the registry changes — stay.
+    /// A registry value name the registry itself would refuse fails at
+    /// planning (`registry_values` validation), before anything anywhere is
+    /// written: Claude Desktop is Failed and the other programs Blocked.
     #[cfg(windows)]
     #[test]
-    fn registry_write_failure_is_attributed_to_claude_desktop() {
+    fn registry_name_past_the_limit_fails_the_plan_before_any_write() {
         let fixture = Fixture::new();
-        // A value name past the registry's 16,383-character limit makes
-        // `RegSetValueExW` refuse after every file operation was written.
-        // Measured on Windows: 16,383 chars ok / 16,384+ returns rc 87 ERROR_INVALID_PARAMETER.
+        // One past the registry's 16,383-character value-name limit.
         let long_name = "a".repeat(16_384);
         let mut claude_desktop_settings = serde_json::Map::new();
         claude_desktop_settings.insert(long_name, serde_json::json!("boom"));
@@ -1434,8 +1449,13 @@ programs:
 
         let (report, result) = fixture.reconciler.apply_with_report(&config);
 
-        let error = result.expect_err("the registry write must fail");
-        assert!(error.to_string().contains("HKCU"), "{error}");
+        let error = result.expect_err("the plan must fail validation");
+        assert!(
+            error
+                .to_string()
+                .contains("longer than a registry value name"),
+            "{error}"
+        );
         let outcome = |program: &str| {
             report
                 .programs
@@ -1444,14 +1464,167 @@ programs:
                 .expect("program reported")
         };
         assert_eq!(outcome("claude-desktop").state, ProgramState::Failed);
+        assert_eq!(outcome("claude-code").state, ProgramState::Blocked);
         assert!(
-            outcome("claude-desktop").detail.contains("HKCU"),
+            !fixture.root.join("claude/settings.json").exists(),
+            "a failed plan must write nothing"
+        );
+        assert!(
+            !super::registry::key_exists(&fixture.policy_key.0).unwrap(),
+            "a failed plan must write no registry value"
+        );
+    }
+
+    /// A registry apply failure after the file operations, at the
+    /// `AttributedPlan` accounting layer (the planners can no longer produce
+    /// an invalid name, so the failing key plan is constructed directly):
+    /// the failure is attributed to Claude Desktop through
+    /// `ApplyStop::Registry`, and the file operations — all applied before
+    /// the registry changes — stay and count as written.
+    #[cfg(windows)]
+    #[test]
+    fn registry_apply_failure_is_attributed_and_keeps_earlier_file_writes() {
+        use super::registry::{RegistryKeyPlan, RegistryValues, TestPolicyKey};
+        let key = TestPolicyKey::new();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+
+        let plan = super::ReconcilePlan::default();
+        plan.write_file(&settings, b"{}", 0o644).unwrap();
+        plan.plan_registry_key(RegistryKeyPlan {
+            key: key.0.clone(),
+            observed: RegistryValues::new(),
+            // Past the registry's value-name limit: rc 87 at write time.
+            changes: vec![("z".repeat(16_384), Some("boom".to_owned()))],
+            delete_key_when_empty: false,
+        });
+        let entries = vec![
+            super::ProgramEntry {
+                program: "claude-code",
+                configured: true,
+                opted_out: false,
+                failed: None,
+                changes: true,
+                conflicts: Vec::new(),
+                inactive: None,
+                paths: vec![settings.clone()],
+                operations: 0..1,
+                registry_operations: 0..0,
+            },
+            super::ProgramEntry {
+                program: "claude-desktop",
+                configured: true,
+                opted_out: false,
+                failed: None,
+                changes: true,
+                conflicts: Vec::new(),
+                inactive: None,
+                paths: vec![key.0.display_path()],
+                operations: 1..1,
+                registry_operations: 0..1,
+            },
+        ];
+        let (report, result) = super::AttributedPlan {
+            plan,
+            entries,
+            first_error: None,
+        }
+        .apply();
+
+        result.expect_err("the registry write must fail");
+        let outcome = |program: &str| {
+            report
+                .programs
+                .iter()
+                .find(|outcome| outcome.program == program)
+                .expect("program reported")
+        };
+        assert_eq!(outcome("claude-desktop").state, ProgramState::Failed);
+        assert_eq!(outcome("claude-code").state, ProgramState::Applied);
+        assert!(settings.is_file(), "earlier file writes stay");
+    }
+
+    /// A later provider's file write fails while Claude Desktop has pending
+    /// registry changes: registry changes run after every file operation, so
+    /// Claude Desktop's part never ran and must report Blocked, not Applied,
+    /// although its (empty) file range completed. The accounting is
+    /// platform-independent; the write failure is provoked through a
+    /// read-only directory, hence Unix.
+    #[cfg(unix)]
+    #[test]
+    fn pending_registry_work_blocks_completion_when_a_later_file_write_fails() {
+        use super::registry::{RegistryKey, RegistryKeyPlan, RegistryValues};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        let target = locked.join("config.toml");
+
+        let plan = super::ReconcilePlan::default();
+        plan.plan_registry_key(RegistryKeyPlan {
+            key: RegistryKey::local_machine(r"SOFTWARE\Policies\Claude"),
+            observed: RegistryValues::new(),
+            changes: vec![("inferenceProvider".to_owned(), Some("gateway".to_owned()))],
+            delete_key_when_empty: false,
+        });
+        plan.write_file(&target, b"managed", 0o644).unwrap();
+        // Planned fine; the write fails at apply time.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let entries = vec![
+            super::ProgramEntry {
+                program: "claude-desktop",
+                configured: true,
+                opted_out: false,
+                failed: None,
+                changes: true,
+                conflicts: Vec::new(),
+                inactive: None,
+                paths: Vec::new(),
+                operations: 0..0,
+                registry_operations: 0..1,
+            },
+            super::ProgramEntry {
+                program: "codex",
+                configured: true,
+                opted_out: false,
+                failed: None,
+                changes: true,
+                conflicts: Vec::new(),
+                inactive: None,
+                paths: vec![target.clone()],
+                operations: 0..1,
+                registry_operations: 1..1,
+            },
+        ];
+        let (report, result) = super::AttributedPlan {
+            plan,
+            entries,
+            first_error: None,
+        }
+        .apply();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.expect_err("the file write must fail");
+        let outcome = |program: &str| {
+            report
+                .programs
+                .iter()
+                .find(|outcome| outcome.program == program)
+                .expect("program reported")
+        };
+        assert_eq!(outcome("codex").state, ProgramState::Failed);
+        assert_eq!(
+            outcome("claude-desktop").state,
+            ProgramState::Blocked,
+            "pending registry work must not count as applied: {}",
+            outcome("claude-desktop").detail
+        );
+        assert!(
+            outcome("claude-desktop").detail.contains("codex failed"),
             "{}",
             outcome("claude-desktop").detail
         );
-        // `written: usize::MAX`: Claude Code's files landed and stay.
-        assert_eq!(outcome("claude-code").state, ProgramState::Applied);
-        assert!(fixture.root.join("claude/settings.json").is_file());
     }
 
     #[test]

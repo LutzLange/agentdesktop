@@ -26,7 +26,7 @@ const OWNER_MARKER: &[u8] = b"Agentdesktop\n";
 #[cfg(any(windows, test))]
 pub(super) const POLICY_KEY: &str = r"SOFTWARE\Policies\Claude";
 
-/// The `REG_SZ` value under the policy key that marks what Agentdesktop
+/// The `REG_SZ` value under the policy key that marks what agentdesktop
 /// manages, like the `.owner` sidecar next to a managed file: its data is a
 /// JSON array of the value names this daemon wrote, so updates and removal
 /// touch nothing else. To Claude Desktop the marker is a policy value like
@@ -67,7 +67,7 @@ pub(super) fn plan(
             remove_owned(settings_path, &settings_owner, "managed settings", plan)?;
         }
         // On Windows the managed settings are machine policy registry
-        // values; the file above is only what an Agentdesktop without the
+        // values; the file above is only what an agentdesktop without the
         // registry target wrote. A user daemon never wrote the policy key.
         #[cfg(windows)]
         if !merge_existing {
@@ -147,7 +147,7 @@ fn plan_managed_settings(
     )
 }
 
-/// Removes the managed-settings file an Agentdesktop without the registry
+/// Removes the managed-settings file an agentdesktop without the registry
 /// target wrote at the path. Claude Desktop never read a file on Windows,
 /// so when no owned file is there nothing is recorded — recording would
 /// count the obsolete path as "unchanged" in every dry run.
@@ -190,31 +190,55 @@ fn registry_values(settings: &Value) -> anyhow::Result<BTreeMap<String, String>>
     let Value::Object(settings) = settings else {
         anyhow::bail!("Claude Desktop managed settings serialize to an object");
     };
-    // Value names are case-insensitive to the registry, so every case
-    // variant of the marker's name is reserved.
-    if settings
-        .keys()
-        .any(|name| name.eq_ignore_ascii_case(REGISTRY_OWNER_VALUE))
-    {
-        anyhow::bail!(
-            "Claude Desktop setting name {REGISTRY_OWNER_VALUE} is reserved for Agentdesktop's ownership marker"
-        );
+    let mut values = BTreeMap::new();
+    let mut folded: BTreeMap<String, &str> = BTreeMap::new();
+    for (name, value) in settings {
+        // Value names are case-insensitive to the registry, so every case
+        // variant of the marker's name is reserved.
+        if name.eq_ignore_ascii_case(REGISTRY_OWNER_VALUE) {
+            anyhow::bail!(
+                "Claude Desktop setting name {REGISTRY_OWNER_VALUE} is reserved for agentdesktop's ownership marker"
+            );
+        }
+        // `RegSetValueExW` reads the name up to its first NUL: an embedded
+        // NUL would write a shorter name than conflict checking compared and
+        // the ownership marker records.
+        if name.contains('\0') {
+            anyhow::bail!("Claude Desktop setting name {name:?} contains an embedded NUL");
+        }
+        // The registry's maximum value-name length (one less than the
+        // `read_values` name buffer). The registry refuses a longer name at
+        // write time; refused here instead, before anything is written.
+        if name.encode_utf16().count() > 16_383 {
+            anyhow::bail!(
+                "Claude Desktop setting name of {} characters is longer than a registry value name allows",
+                name.chars().count()
+            );
+        }
+        // Two names differing only in case address one registry value, so
+        // every reconciliation would rewrite it with whichever came later.
+        if let Some(previous) = folded.insert(name.to_ascii_lowercase(), name) {
+            anyhow::bail!(
+                "Claude Desktop setting names {previous} and {name} differ only in case and address the same registry value"
+            );
+        }
+        let data = match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        // `REG_SZ` data is NUL-terminated too; JSON-encoded data escapes
+        // every NUL, only a pass-through string can carry one.
+        if data.contains('\0') {
+            anyhow::bail!("Claude Desktop setting {name} contains an embedded NUL");
+        }
+        values.insert(name.clone(), data);
     }
-    Ok(settings
-        .iter()
-        .map(|(name, value)| {
-            let data = match value {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            };
-            (name.clone(), data)
-        })
-        .collect())
+    Ok(values)
 }
 
 /// Looks `name` up among the observed values the way the registry itself
 /// matches value names: case-insensitively. ASCII covers every name
-/// Agentdesktop writes; the registry's own folding is locale-invariant
+/// agentdesktop writes; the registry's own folding is locale-invariant
 /// Unicode, so a non-ASCII case variant is treated as a different name and
 /// errs on the side of writing it.
 #[cfg(any(windows, test))]
@@ -276,8 +300,10 @@ fn registry_report_desired(desired: &BTreeMap<String, String>) -> Vec<u8> {
 /// with the ownership semantics of `write_owned`: a value whose data already
 /// matches is claimed as ours, a differing value the marker does not claim
 /// is a conflict, and names the marker claims but `desired` dropped are
-/// deleted. The marker never claims anything the plan does not write. Value
-/// names match case-insensitively, as the registry stores them.
+/// deleted. The marker never claims anything the plan does not touch, and
+/// it is written before the values it claims (see the comment at the marker
+/// changes below). Value names match case-insensitively, as the registry
+/// stores them.
 ///
 /// An empty `desired` plans like removal: the ownership marker alone would
 /// switch Claude Desktop to machine policy and away from the user's `HKCU`
@@ -320,19 +346,39 @@ fn plan_registry_settings(
             _ => changes.push((name.clone(), Some(data.clone()))),
         }
     }
-    for name in &owned {
-        if !desired.keys().any(|kept| kept.eq_ignore_ascii_case(name))
-            && observes_name(&observed, name)
-        {
-            changes.push((name.clone(), None));
+    let stale: Vec<&String> = owned
+        .iter()
+        .filter(|name| !desired.keys().any(|kept| kept.eq_ignore_ascii_case(name)))
+        .collect();
+    for name in &stale {
+        if observes_name(&observed, name) {
+            changes.push(((*name).clone(), None));
         }
     }
-    let marker =
+    // The marker brackets the writes so a partial apply stays recoverable:
+    // the first change claims every name this plan writes or deletes, so a
+    // failure midway leaves everything already touched claimed — removal
+    // still finds it and the next plan retries it. Once the stale names are
+    // gone the claim shrinks to exactly `desired`'s names, written last.
+    let full_claim = serde_json::to_string(
+        &desired
+            .keys()
+            .chain(stale.iter().copied())
+            .collect::<BTreeSet<_>>(),
+    )
+    .expect("value names serialize");
+    let final_claim =
         serde_json::to_string(&desired.keys().collect::<Vec<_>>()).expect("value names serialize");
     if observed_value(&observed, REGISTRY_OWNER_VALUE).and_then(|data| data.as_deref())
-        != Some(marker.as_str())
+        != Some(full_claim.as_str())
     {
-        changes.push((REGISTRY_OWNER_VALUE.to_owned(), Some(marker)));
+        changes.insert(
+            0,
+            (REGISTRY_OWNER_VALUE.to_owned(), Some(full_claim.clone())),
+        );
+    }
+    if final_claim != full_claim {
+        changes.push((REGISTRY_OWNER_VALUE.to_owned(), Some(final_claim)));
     }
     let action = if changes.iter().any(|(name, _)| name != REGISTRY_OWNER_VALUE) {
         if observed.is_empty() {
@@ -809,6 +855,96 @@ programs:
     }
 
     #[test]
+    fn registry_values_reject_an_embedded_nul() {
+        // `RegSetValueExW` would truncate the name at the NUL and overwrite
+        // the value called `foreign`, which conflict checking compared
+        // against the full name and removal could never find again.
+        let error = super::registry_values(&serde_json::json!({ "foreign\0suffix": "x" }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("embedded NUL"), "{error}");
+
+        // `REG_SZ` data is NUL-terminated the same way.
+        let error = super::registry_values(&serde_json::json!({ "name": "trun\0cated" }))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("embedded NUL"), "{error}");
+    }
+
+    #[test]
+    fn registry_values_reject_a_name_past_the_registry_limit() {
+        // 16,383 UTF-16 units is the registry's maximum value-name length;
+        // one more would make `RegSetValueExW` refuse at apply time, after
+        // earlier values of the plan were already written.
+        let at_limit = "a".repeat(16_383);
+        assert!(super::registry_values(&serde_json::json!({ at_limit: "x" })).is_ok());
+        let past = "a".repeat(16_384);
+        let error = super::registry_values(&serde_json::json!({ past: "x" }))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("longer than a registry value name"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn registry_values_reject_names_differing_only_in_case() {
+        // Both names address the same registry value, so the reconciler
+        // would rewrite it on every tick with whichever came later and
+        // never converge. The realistic pair: a pass-through
+        // `inferenceprovider` next to the generated `inferenceProvider`.
+        let config = parse_daemon(
+            r#"
+llmGateway:
+  url: https://gateway.example.com
+  authentication:
+    type: controllerJwt
+    audience: agentgateway
+    allowedClientIds: [claude-desktop]
+programs:
+  claudeDesktop:
+    inferenceprovider: direct
+"#,
+        )
+        .unwrap();
+        let desktop = config.programs.claude_desktop.as_ref().unwrap();
+        let settings =
+            managed_settings(desktop, config.llm_gateway.as_ref(), Path::new("/helper")).unwrap();
+        let error = super::registry_values(&settings).unwrap_err().to_string();
+        assert!(error.contains("differ only in case"), "{error}");
+        assert!(error.contains("inferenceprovider"), "{error}");
+        assert!(error.contains("inferenceProvider"), "{error}");
+    }
+
+    #[test]
+    fn registry_plan_retries_a_write_the_marker_claims_but_the_key_lacks() {
+        // The state a partial apply leaves behind: the marker (written
+        // first) claims a name whose value never landed. The next plan
+        // writes the missing value without a conflict.
+        let observed = RegistryValues::from([
+            ("inferenceProvider".to_owned(), Some("gateway".to_owned())),
+            (
+                ".agentdesktop.owner".to_owned(),
+                Some(r#"["inferenceProvider","isLocalDevMcpEnabled"]"#.to_owned()),
+            ),
+        ]);
+        let desired = BTreeMap::from([
+            ("inferenceProvider".to_owned(), "gateway".to_owned()),
+            ("isLocalDevMcpEnabled".to_owned(), "true".to_owned()),
+        ]);
+        let key = RegistryKey::local_machine(super::POLICY_KEY);
+        let plan = ReconcilePlan::default();
+        super::plan_registry_settings(&key, observed, &desired, &plan);
+
+        assert!(!plan.has_conflicts());
+        assert_eq!(
+            plan.registry_key_plans()[0].changes,
+            vec![("isLocalDevMcpEnabled".to_owned(), Some("true".to_owned()))]
+        );
+    }
+
+    #[test]
     fn registry_plan_creates_values_and_the_ownership_marker() {
         let desired = BTreeMap::from([
             ("inferenceProvider".to_owned(), "gateway".to_owned()),
@@ -821,15 +957,17 @@ programs:
         let plans = plan.registry_key_plans();
         assert_eq!(plans.len(), 1);
         assert!(!plans[0].delete_key_when_empty);
+        // The marker comes first: a create that fails midway leaves every
+        // value already written claimed, so removal still finds it.
         assert_eq!(
             plans[0].changes,
             vec![
-                ("inferenceProvider".to_owned(), Some("gateway".to_owned())),
-                ("isLocalDevMcpEnabled".to_owned(), Some("true".to_owned())),
                 (
                     ".agentdesktop.owner".to_owned(),
                     Some(r#"["inferenceProvider","isLocalDevMcpEnabled"]"#.to_owned())
                 ),
+                ("inferenceProvider".to_owned(), Some("gateway".to_owned())),
+                ("isLocalDevMcpEnabled".to_owned(), Some("true".to_owned())),
             ]
         );
         let rendered = plan.render();
@@ -1119,5 +1257,44 @@ programs:
                 .to_string()
                 .contains("changed since reconciliation was planned")
         );
+    }
+
+    /// A registry apply that fails after some writes landed: the marker was
+    /// written first and claims them, so removal cleans the key back up.
+    /// Constructed directly — `registry_values` refuses such a name at
+    /// planning, and the registry itself refuses it at write time
+    /// (measured on Windows: 16,383-character names ok, 16,384+ returns
+    /// rc 87 ERROR_INVALID_PARAMETER).
+    #[test]
+    #[cfg(windows)]
+    fn registry_partial_apply_failure_stays_recoverable() {
+        use crate::reconcile::registry::{RegistryKeyPlan, key_exists, read_values};
+        let key = TestPolicyKey::new();
+        let error = crate::reconcile::registry::apply(&RegistryKeyPlan {
+            key: key.0.clone(),
+            observed: RegistryValues::new(),
+            changes: vec![
+                (
+                    ".agentdesktop.owner".to_owned(),
+                    Some(r#"["inferenceProvider"]"#.to_owned()),
+                ),
+                ("inferenceProvider".to_owned(), Some("gateway".to_owned())),
+                ("z".repeat(16_384), Some("boom".to_owned())),
+            ],
+            delete_key_when_empty: false,
+        })
+        .expect_err("the overlong name must fail the apply");
+        assert!(error.to_string().contains("write"), "{error}");
+
+        // The write before the failure landed, claimed by the marker.
+        let values = read_values(&key.0).unwrap();
+        assert_eq!(values["inferenceProvider"].as_deref(), Some("gateway"));
+        assert!(values.contains_key(".agentdesktop.owner"));
+
+        // Removal finds everything through the marker and leaves no key.
+        let plan = ReconcilePlan::default();
+        super::plan_registry_remove(&key.0, read_values(&key.0).unwrap(), &plan);
+        plan.apply().unwrap();
+        assert!(!key_exists(&key.0).unwrap());
     }
 }

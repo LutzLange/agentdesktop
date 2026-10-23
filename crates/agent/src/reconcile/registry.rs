@@ -55,7 +55,7 @@ impl RegistryKey {
 }
 
 /// The values observed under a key: the `REG_SZ` data by value name, or
-/// `None` for a value of any other type, which Agentdesktop never writes and
+/// `None` for a value of any other type, which agentdesktop never writes and
 /// never matches.
 pub(crate) type RegistryValues = BTreeMap<String, Option<String>>;
 

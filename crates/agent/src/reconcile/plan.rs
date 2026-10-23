@@ -51,10 +51,10 @@ pub(super) enum ApplyStop {
     PrivateDir(PathBuf),
     /// The operation at this index failed; the ones before it were written.
     Operation(usize),
-    /// The registry changes for this key failed; every file operation was
-    /// written before them.
+    /// The registry changes for the key at this index failed; every file
+    /// operation and the keys before it were applied.
     #[cfg(windows)]
-    Registry(PathBuf),
+    Registry(usize, PathBuf),
 }
 
 struct FileChange {
@@ -101,6 +101,21 @@ impl ReconcilePlan {
 
     pub(super) fn operation_count(&self) -> usize {
         self.operations.borrow().len()
+    }
+
+    /// How many registry key plans are queued, for per-program completion
+    /// accounting: registry changes apply after every file operation, so a
+    /// program with pending registry work is not complete when its file
+    /// range is.
+    pub(super) fn registry_operation_count(&self) -> usize {
+        #[cfg(any(windows, test))]
+        {
+            self.registry.borrow().len()
+        }
+        #[cfg(not(any(windows, test)))]
+        {
+            0
+        }
     }
 
     pub(super) fn summary(&self) -> PlanSummary {
@@ -231,10 +246,10 @@ impl ReconcilePlan {
             tracing::info!(path = %change.path.display(), "applied reconciliation change");
         }
         #[cfg(windows)]
-        for key_plan in self.registry.into_inner() {
+        for (index, key_plan) in self.registry.into_inner().into_iter().enumerate() {
             let key_path = key_plan.key.display_path();
             super::registry::apply(&key_plan)
-                .map_err(|error| (error, ApplyStop::Registry(key_path.clone())))?;
+                .map_err(|error| (error, ApplyStop::Registry(index, key_path.clone())))?;
             tracing::info!(path = %key_path.display(), "applied reconciliation change");
         }
         Ok(())
