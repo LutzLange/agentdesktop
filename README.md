@@ -56,6 +56,61 @@ corepack enable
 make install
 ```
 
+#### Linux without a desktop (RHEL 8, WSL, VDI)
+
+The `agentdesktop-linux-*` binaries include the desktop UI and need GTK,
+WebKitGTK 4.1, and glibc 2.34 or later. On hosts without them, such as RHEL 8,
+WSL, and virtual desktops, use `agentdesktop-headless-linux-*` instead. It runs
+the same daemon and command-line tools without the UI. It is statically linked,
+so it does not depend on the host's glibc or other system libraries:
+
+```sh
+curl -fLO https://github.com/agentdesktop-dev/agentdesktop/releases/latest/download/agentdesktop-headless-linux-amd64
+install -D -m 0755 agentdesktop-headless-linux-amd64 ~/.local/bin/agentdesktop
+agentdesktop --version
+```
+
+Every `agentdesktop` command in this guide works with the headless binary.
+`agentdesktop daemon --user` reads `~/.config/agentdesktop/config.yaml` (or
+`$XDG_CONFIG_HOME/agentdesktop/config.yaml`) and does not start without it.
+Create that file first, for example from
+[`examples/standalone/config.yaml`](examples/standalone/config.yaml):
+
+```sh
+mkdir -p ~/.config/agentdesktop
+curl -fL -o ~/.config/agentdesktop/config.yaml \
+  https://raw.githubusercontent.com/agentdesktop-dev/agentdesktop/main/examples/standalone/config.yaml
+```
+
+Edit it for your identity provider and gateway. To keep a user-mode daemon
+running, create a systemd user unit at
+`~/.config/systemd/user/agentdesktop.service` (on WSL, first set
+`systemd=true` under `[boot]` in `/etc/wsl.conf`):
+
+```ini
+[Unit]
+Description=Agentdesktop daemon
+
+[Service]
+ExecStart=%h/.local/bin/agentdesktop daemon --user
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now agentdesktop
+agentdesktop status
+agentdesktop enrollment
+```
+
+When the daemon cannot open a browser, it prints the sign-in URL. Open that URL
+in any browser on the same machine (on WSL, the Windows browser reaches the
+daemon's `localhost` callback). `agentdesktop login` uses device authorization
+and works from any device.
+
 ### 2. Preview the standalone example
 
 The repository includes a working standalone configuration for Claude Code,
