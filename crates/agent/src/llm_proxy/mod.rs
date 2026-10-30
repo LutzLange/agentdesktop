@@ -5821,7 +5821,6 @@ mod tests {
                     controller: None,
                     llm_proxy: None,
                     usage_receiver: None,
-                    intercept: None,
                     containment: None,
                 },
                 discovery,
@@ -5832,7 +5831,6 @@ mod tests {
                 logout: None,
                 usage: None,
                 programs: None,
-                intercept: None,
                 violation_ledger: None,
             };
             let config = default_config();
